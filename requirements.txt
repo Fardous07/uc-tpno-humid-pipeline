@@ -1,0 +1,12 @@
+numpy
+pandas
+pyyaml
+torch
+scipy
+scikit-learn
+matplotlib
+tqdm
+ase
+pyarrow
+torch-geometric
+e3nn
