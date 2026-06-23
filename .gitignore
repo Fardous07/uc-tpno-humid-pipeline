@@ -1,0 +1,31 @@
+# Raw and processed data — upload to Google Drive instead
+data/raw/
+data/intermediate/
+data/processed/
+data/*.parquet
+data/*.csv
+
+# Large runtime files
+simulation.log
+preprocessing.log
+*.log
+
+# Experiment outputs (keep splits and config only)
+experiments/*/checkpoints/
+experiments/*/tensorboard/
+experiments/*/final_model.pt
+experiments/*/metrics.csv
+
+# Python environment
+thesis_env/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# OS
+.DS_Store
+Thumbs.db
