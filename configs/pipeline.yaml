@@ -2,17 +2,14 @@ data:
   raw_dir: data/raw
   intermediate_dir: data/intermediate
   processed_dir: data/processed
-
   core_mof_dir: data/raw/core_mof_2019
   arc_mof_dir: data/raw/arc_mof_charges
   mofx_db_dir: data/raw/mofx_db
-
   sanitized_cif_dir: data/intermediate/cifs_sanitized
   graph_dir: data/processed/graphs
-  registry_parquet: data/processed/mof_registry.parquet
-  splits_file: data/processed/splits.json
+  registry_parquet: data/mof_registry.parquet
+  splits_file: experiments/run_001/splits.json
   adsorption_parquet: data/processed/adsorption/adsorption_training.parquet
-
   split_method: random
   test_size: 0.1
   val_size: 0.1
@@ -21,36 +18,38 @@ data:
 model:
   encoder: nequip
   n_species: 100
-  emb_dim: 128  #16
-  n_encoder_layers: 4 #2
+  emb_dim: 64
+  n_encoder_layers: 2
   lmax: 1
   cutoff: 6.0
   n_conditions: 4
   n_components: 3
-  hidden_dim: 256 #64
-  n_tpno_layers: 4 #2
+  hidden_dim: 128
+  n_tpno_layers: 3
   convex_constraint: softplus
   film_conditioning: true
-  dropout: 0.1
-
+  dropout: 0.15
+  use_layer_norm: true
 
 training:
   n_epochs: 500
-  batch_size: 64
-  lr: 5.0e-4
+  batch_size: 1
+  lr: 3.0e-4
   optimizer: adamw
-  weight_decay: 1.0e-5
+  weight_decay: 1.0e-4
   scheduler: cosine_warm_restarts
-  scheduler_T0: 20
+  scheduler_T0: 30
   scheduler_T_mult: 2
   grad_clip: 1.0
-  checkpoint_dir: results/runs/experiment_1/checkpoints
+  checkpoint_dir: experiments/run_001/checkpoints
   checkpoint_freq: 10
   early_stopping: true
-  patience: 20
-  lambda_hessian: 0.1
-  lambda_monotonic: 0.1
-  lambda_henry: 0.01
+  patience: 40
+  lambda_hessian: 0.01
+  lambda_monotonic: 0.05
+  lambda_henry: 0.005
+  lambda_competition: 0.05
+  lambda_gibbs_duhem: 0.0
 
 uq:
   alpha: 0.1
@@ -58,5 +57,5 @@ uq:
   n_bins: 5
 
 results:
-  run_dir: results/runs/experiment_1
+  run_dir: experiments/run_001
   figures_dir: results/figures
