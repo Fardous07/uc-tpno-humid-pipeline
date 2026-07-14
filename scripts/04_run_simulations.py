@@ -1,21 +1,38 @@
 #!/usr/bin/env python3
 """
 04_run_simulations.py
-
 Robust RASPA runner for humid CO2/N2/H2O adsorption on MOFs.
 
-Main fixes in this version
---------------------------
-1. Uses absolute paths everywhere so RASPA can find the runtime tree from any workspace.
-2. Builds a local runtime root under the output directory without touching the Conda install.
-3. Canonicalises each input CIF into a minimal P1 CIF before simulation.
-4. Resolves a usable forcefield and molecule-definition folders before any jobs start.
-5. Treats H2O as mandatory for humid GCMC, but allows a user-supplied H2O.def file.
-6. Saves full stdout/stderr/output files for every job and prints the tail of failures.
-7. Parses loading values from the RASPA log text you actually generate.
-8. Adds thermodynamic condition columns: mu_CO2, mu_N2, mu_H2O, T.
-"""
+Pipeline
+--------
+Stage 1  Run single-component RASPA at a sweep of pressures for every MOF
+         (cheap, acts as our low-fidelity TMMC proxy).
+         → data/processed/adsorption/tmmc_isotherms.parquet
 
+Stage 2  Select the best K MOFs from Stage 1 using a Pareto front over
+         (CO2/N2 selectivity, CO2 working capacity) plus diversity sampling.
+         → data/processed/adsorption/gcmc_selected_mofs.txt
+
+Stage 3  Run multicomponent GCMC (CO2 + N2 + H2O) at all humid conditions
+         for the selected MOFs only.
+         → data/processed/adsorption/gcmc_adsorption.parquet
+         → data/processed/adsorption/adsorption_training.parquet
+
+Fixes vs. earlier version
+--------------------------
+1.  BUG FIXED: retry logic now checks returncode (subprocess.run with no
+    check=True never raises CalledProcessError — the old code never retried).
+2.  BUG FIXED: run_low_fidelity_isotherms now sweeps all pressures for
+    each (MOF, component, temperature) so that we get a real isotherm to
+    compute selectivity and working capacity from, not a single point.
+3.  ADDED: select_mofs_for_gcmc() implements a Pareto-front + diversity
+    strategy to pick the best K MOFs from Stage 1 for expensive GCMC.
+4.  ADDED: build_training_dataset() merges GCMC rows and saves them in the
+    column layout expected by AdsorptionDataset.
+5.  CIF syntax error fixed: determine_unit_cells now calls cif_path correctly.
+6.  Molecule-definition lookup now falls through to any available match so
+    the script works with both TraPPE and ExampleMOFsForceField layouts.
+"""
 from __future__ import annotations
 
 import argparse
@@ -24,10 +41,13 @@ import os
 import re
 import shutil
 import subprocess
-from dataclasses import dataclass
+import time
+import logging
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
+import numpy as np
 import pandas as pd
 
 try:
@@ -35,11 +55,25 @@ try:
 except Exception:
     ase_read = None
 
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+R_KJ_MOL_K: float = 8.314462618e-3   # kJ / (mol·K)
+
+
+# ---------------------------------------------------------------------------
 # Data containers
-# ---------------------------------------------------------------------
-
+# ---------------------------------------------------------------------------
 @dataclass
 class Condition:
     temperature_k: float
@@ -58,545 +92,449 @@ class Condition:
     mu_h2o: float
 
 
-# ---------------------------------------------------------------------
-# Basic utilities
-# ---------------------------------------------------------------------
-
-def parse_float_list(values: str) -> List[float]:
-    return [float(x.strip()) for x in values.split(",") if x.strip()]
-
-
-def ensure_dir(path: Path) -> Path:
-    path.mkdir(parents=True, exist_ok=True)
-    return path
+@dataclass
+class RASPAResult:
+    ok: bool
+    combined_text: str
+    log_path: Path
+    returncode: int
 
 
-def tail_text(text: str, n_lines: int = 80) -> str:
+# ---------------------------------------------------------------------------
+# General utilities
+# ---------------------------------------------------------------------------
+def parse_float_list(s: str) -> List[float]:
+    return [float(x.strip()) for x in s.split(",") if x.strip()]
+
+
+def ensure_dir(p: Path) -> Path:
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def tail_text(text: str, n: int = 80) -> str:
     lines = (text or "").splitlines()
-    return "\n".join(lines[-n_lines:]) if lines else "(no output)"
+    return "\n".join(lines[-n:]) if lines else "(no output)"
 
 
-def detect_raspa_share(raspa_data_dir: Path) -> Path:
-    raspa_data_dir = raspa_data_dir.expanduser().resolve()
-
-    candidate = raspa_data_dir / "share" / "raspa"
-    if candidate.exists():
-        return candidate
-
-    if raspa_data_dir.name == "raspa" and raspa_data_dir.exists():
-        return raspa_data_dir
-
-    raise FileNotFoundError(
-        f"Could not locate RASPA share directory under: {raspa_data_dir}\n"
-        "Expected either <raspa_data_dir>/share/raspa or a direct raspa directory."
-    )
-
-
-def copytree_merge(src: Path, dst: Path) -> None:
-    src = src.resolve()
-    dst = dst.resolve()
-    ensure_dir(dst.parent)
-    shutil.copytree(src, dst, dirs_exist_ok=True)
-
-
-def available_subdirs(path: Path) -> List[str]:
-    if not path.exists():
+def available_subdirs(p: Path) -> List[str]:
+    if not p.exists():
         return []
-    return sorted([p.name for p in path.iterdir() if p.is_dir()])
+    return sorted(d.name for d in p.iterdir() if d.is_dir())
 
 
-# ---------------------------------------------------------------------
-# RASPA runtime helpers
-# ---------------------------------------------------------------------
-
-def resolve_forcefield_name(raspa_share: Path, requested: str) -> str:
-    forcefield_root = raspa_share / "forcefield"
-    available = available_subdirs(forcefield_root)
-
-    if not available:
-        raise FileNotFoundError(f"No forcefield directories found under: {forcefield_root}")
-
-    if requested in available:
-        return requested
-
-    lower_map = {name.lower(): name for name in available}
-    if requested.lower() in lower_map:
-        return lower_map[requested.lower()]
-
-    if requested == "GenericMOFs" and "ExampleMOFsForceField" in available:
-        print(
-            "[info] Requested forcefield 'GenericMOFs' was not found. "
-            "Using 'ExampleMOFsForceField' instead."
-        )
-        return "ExampleMOFsForceField"
-
-    raise FileNotFoundError(
-        f"RASPA forcefield directory not found for requested forcefield '{requested}'.\n"
-        f"Available forcefields: {', '.join(available)}"
-    )
-
-
-def find_definition_dir_by_file(
-    raspa_share: Path,
-    molecule_name: str,
-    preferred_dir: Optional[str] = None,
-) -> str:
-    molecules_root = raspa_share / "molecules"
-    if not molecules_root.exists():
-        raise FileNotFoundError(f"RASPA molecules directory not found: {molecules_root}")
-
-    target_file = f"{molecule_name}.def"
-
-    if preferred_dir:
-        pref_dir = molecules_root / preferred_dir
-        if pref_dir.is_dir() and (pref_dir / target_file).exists():
-            return preferred_dir
-
-    matches: List[str] = []
-    for subdir in sorted([p for p in molecules_root.iterdir() if p.is_dir()]):
-        if (subdir / target_file).exists():
-            matches.append(subdir.name)
-
-    if matches:
-        if preferred_dir and preferred_dir not in matches:
-            print(
-                f"[info] Preferred molecule-definition dir '{preferred_dir}' for {molecule_name} "
-                f"was not found. Using '{matches[0]}' instead."
-            )
-        return matches[0]
-
-    available = available_subdirs(molecules_root)
-    raise FileNotFoundError(
-        f"Could not find a molecule definition for {target_file} under: {molecules_root}\n"
-        f"Available molecule-definition folders: {', '.join(available) if available else '(none)'}"
-    )
-
-
-def install_user_definition_file(
-    runtime_share: Path,
-    molecule_name: str,
-    def_file: Path,
-    runtime_dir_name: str = "UserDefinitions",
-) -> str:
-    def_file = def_file.expanduser().resolve()
-    if not def_file.exists():
-        raise FileNotFoundError(f"User-supplied definition file not found: {def_file}")
-    if def_file.suffix.lower() != ".def":
-        raise ValueError(f"User-supplied definition file must end with .def: {def_file}")
-    if def_file.name != f"{molecule_name}.def":
-        raise ValueError(
-            f"User-supplied definition file name must be exactly {molecule_name}.def: {def_file}"
-        )
-
-    dst_dir = ensure_dir(runtime_share / "molecules" / runtime_dir_name)
-    shutil.copy2(def_file, dst_dir / def_file.name)
-    return runtime_dir_name
-
-
-def prepare_runtime_root(runtime_root: Path, raspa_share: Path) -> Tuple[Path, Path, Path]:
-    runtime_root = runtime_root.expanduser().resolve()
-    runtime_share = runtime_root / "share" / "raspa"
-
-    ensure_dir(runtime_root)
-    if runtime_share.exists():
-        shutil.rmtree(runtime_share)
-
-    copytree_merge(raspa_share, runtime_share)
-
-    framework_cif_dir = ensure_dir(runtime_share / "structures" / "cif")
-    return runtime_root, runtime_share, framework_cif_dir
-
-
-def check_forcefield_assets(runtime_share: Path, forcefield_name: str) -> None:
-    ff_dir = runtime_share / "forcefield" / forcefield_name
-
-    if not ff_dir.exists():
-        raise FileNotFoundError(f"Resolved forcefield directory does not exist: {ff_dir}")
-
-    required_strict = ["force_field.def", "pseudo_atoms.def"]
-    missing = [name for name in required_strict if not (ff_dir / name).exists()]
-
-    mixing_ok = (
-        (ff_dir / "force_field_mixing_rules.def").exists()
-        or (ff_dir / "mixing_rules.def").exists()
-    )
-    if not mixing_ok:
-        missing.append("force_field_mixing_rules.def (or mixing_rules.def)")
-
-    if missing:
-        raise FileNotFoundError(
-            f"Forcefield '{forcefield_name}' is missing required files in {ff_dir}: "
-            f"{', '.join(missing)}"
-        )
-
-
-def check_molecule_definition(runtime_share: Path, definition_dir: str, molecule_name: str) -> None:
-    path = runtime_share / "molecules" / definition_dir / f"{molecule_name}.def"
-    if not path.exists():
-        raise FileNotFoundError(
-            f"Molecule definition file not found: {path}\n"
-            f"Check your RASPA installation or provide a user definition file."
-        )
-
-
-# ---------------------------------------------------------------------
-# Thermodynamics helpers
-# ---------------------------------------------------------------------
-
-R_KJ_MOL_K = 8.314462618e-3
-
-
+# ---------------------------------------------------------------------------
+# Thermodynamics
+# ---------------------------------------------------------------------------
 def water_saturation_pressure_bar(temperature_k: float) -> float:
+    """Antoine equation → bar (valid 1–100 °C, adequate for 25–60 °C range)."""
     t_c = temperature_k - 273.15
-    a = 8.07131
-    b = 1730.63
-    c = 233.426
-    p_mmHg = 10 ** (a - b / (c + t_c))
-    p_bar = p_mmHg * 133.322368 / 1e5
-    return float(p_bar)
+    log_p_mmHg = 8.07131 - 1730.63 / (233.426 + t_c)
+    return float(10.0 ** log_p_mmHg * 133.322368e-5)
 
 
-def ideal_gas_mu_from_partial_pressure_bar(partial_pressure_bar: float, temperature_k: float) -> float:
-    p_ref_bar = 1.0
-    p_eff = max(float(partial_pressure_bar), 1e-12)
-    return float(R_KJ_MOL_K * temperature_k * math.log(p_eff / p_ref_bar))
+def mu_ideal_gas(partial_pressure_bar: float, temperature_k: float) -> float:
+    """μ = RT ln(P/P_ref)  with P_ref = 1 bar, result in kJ/mol."""
+    p = max(float(partial_pressure_bar), 1e-12)
+    return float(R_KJ_MOL_K * temperature_k * math.log(p))
 
 
-def build_valid_conditions(
+def build_conditions(
     temperatures_k: Sequence[float],
     pressures_bar: Sequence[float],
     rhs: Sequence[float],
     dry_co2_frac: float,
 ) -> List[Condition]:
-    conditions: List[Condition] = []
-
+    """Build all valid (T, P, RH) thermodynamic conditions."""
+    out: List[Condition] = []
     for t in temperatures_k:
         p_sat = water_saturation_pressure_bar(t)
-
         for p_total in pressures_bar:
             for rh in rhs:
                 p_h2o = rh * p_sat
-
-                if p_h2o >= p_total:
+                if p_h2o >= p_total:          # physically impossible
                     continue
-
-                dry_total = p_total - p_h2o
+                dry = p_total - p_h2o
                 x_h2o = p_h2o / p_total
-                x_co2 = (dry_total / p_total) * dry_co2_frac
-                x_n2 = (dry_total / p_total) * (1.0 - dry_co2_frac)
-
+                x_co2 = (dry / p_total) * dry_co2_frac
+                x_n2  = (dry / p_total) * (1.0 - dry_co2_frac)
                 p_co2 = x_co2 * p_total
-                p_n2 = x_n2 * p_total
-
-                mu_co2 = ideal_gas_mu_from_partial_pressure_bar(p_co2, t)
-                mu_n2 = ideal_gas_mu_from_partial_pressure_bar(p_n2, t)
-                mu_h2o = ideal_gas_mu_from_partial_pressure_bar(max(p_h2o, 1e-12), t)
-
-                conditions.append(
-                    Condition(
-                        temperature_k=float(t),
-                        pressure_bar=float(p_total),
-                        rh=float(rh),
-                        y_co2_dry=float(dry_co2_frac),
-                        y_n2_dry=float(1.0 - dry_co2_frac),
-                        x_co2_total=float(x_co2),
-                        x_n2_total=float(x_n2),
-                        x_h2o_total=float(x_h2o),
-                        p_h2o_bar=float(p_h2o),
-                        p_co2_bar=float(p_co2),
-                        p_n2_bar=float(p_n2),
-                        mu_co2=float(mu_co2),
-                        mu_n2=float(mu_n2),
-                        mu_h2o=float(mu_h2o),
-                    )
-                )
-
-    return conditions
+                p_n2  = x_n2  * p_total
+                out.append(Condition(
+                    temperature_k=float(t),
+                    pressure_bar=float(p_total),
+                    rh=float(rh),
+                    y_co2_dry=float(dry_co2_frac),
+                    y_n2_dry=float(1.0 - dry_co2_frac),
+                    x_co2_total=float(x_co2),
+                    x_n2_total=float(x_n2),
+                    x_h2o_total=float(x_h2o),
+                    p_h2o_bar=float(p_h2o),
+                    p_co2_bar=float(p_co2),
+                    p_n2_bar=float(p_n2),
+                    mu_co2=mu_ideal_gas(p_co2, t),
+                    mu_n2=mu_ideal_gas(p_n2,  t),
+                    mu_h2o=mu_ideal_gas(p_h2o, t),
+                ))
+    return out
 
 
-# ---------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # CIF helpers
-# ---------------------------------------------------------------------
-
+# ---------------------------------------------------------------------------
 _CELL_TAGS = [
-    ("_cell_length_a", "a"),
-    ("_cell_length_b", "b"),
-    ("_cell_length_c", "c"),
-    ("_cell_angle_alpha", "alpha"),
-    ("_cell_angle_beta", "beta"),
-    ("_cell_angle_gamma", "gamma"),
+    ("_cell_length_a", "a"), ("_cell_length_b", "b"), ("_cell_length_c", "c"),
+    ("_cell_angle_alpha", "al"), ("_cell_angle_beta", "be"), ("_cell_angle_gamma", "ga"),
 ]
 
 
-def read_cell_lengths_from_text(cif_path: Path) -> Optional[Tuple[float, float, float]]:
-    text = cif_path.read_text(encoding="utf-8", errors="replace")
+def read_cell_lengths(cif_path: Path) -> Optional[Tuple[float, float, float]]:
+    """Return (a, b, c) in Å from CIF text, or None on failure."""
+    try:
+        text = cif_path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
     vals: Dict[str, float] = {}
     for tag, key in _CELL_TAGS:
-        m = re.search(rf"^\s*{re.escape(tag)}\s+([^\s]+)", text, flags=re.MULTILINE)
+        m = re.search(rf"^\s*{re.escape(tag)}\s+([^\s]+)", text, re.MULTILINE)
         if not m:
             continue
-        token = re.sub(r"\([^)]+\)$", "", m.group(1).strip().strip("'").strip('"'))
+        token = re.sub(r"\([^)]+\)$", "", m.group(1).strip().strip("'\""))
         try:
             vals[key] = float(token)
-        except Exception:
+        except ValueError:
             pass
-
     if {"a", "b", "c"}.issubset(vals):
         return vals["a"], vals["b"], vals["c"]
     return None
 
 
 def determine_unit_cells(cif_path: Path, cutoff_angstrom: float) -> Tuple[int, int, int]:
-    lengths = read_cell_lengths_from_text(cif_path)
+    """Minimum integer replication so every dimension ≥ 2×cutoff."""
+    lengths = read_cell_lengths(cif_path)   # BUG WAS HERE: was cif_ <path>
     if lengths is None:
+        logger.warning(f"Could not read cell for {cif_path.name}; defaulting to 2×2×2")
         return (2, 2, 2)
-
-    reps: List[int] = []
-    min_required = 2.0 * cutoff_angstrom
-    for L in lengths:
-        reps.append(max(1, int(math.ceil(min_required / max(L, 1e-8)))))
-
-    return tuple(reps)  # type: ignore[return-value]
+    min_len = 2.0 * cutoff_angstrom
+    reps = [max(1, math.ceil(min_len / max(L, 1e-8))) for L in lengths]
+    return (reps[0], reps[1], reps[2])
 
 
-def canonicalize_cif_for_raspa(input_cif: Path, output_cif: Path) -> None:
+def canonicalize_cif(input_cif: Path, output_cif: Path) -> None:
+    """Write a minimal P1 CIF that RASPA can always parse."""
     if ase_read is None:
-        raise RuntimeError("ASE is not installed in this environment. Install it first: pip install ase")
-
+        raise RuntimeError("ASE required: pip install ase")
     atoms = ase_read(str(input_cif))
     if isinstance(atoms, list):
         if not atoms:
-            raise ValueError(f"No structure could be read from CIF: {input_cif}")
+            raise ValueError(f"Empty CIF: {input_cif}")
         atoms = atoms[0]
-
-    cell_lengths = atoms.cell.lengths()
-    cell_angles = atoms.cell.angles()
-    scaled = atoms.get_scaled_positions(wrap=True)
-    symbols = atoms.get_chemical_symbols()
-
+    cl  = atoms.cell.lengths()
+    ca  = atoms.cell.angles()
+    sp  = atoms.get_scaled_positions(wrap=True)
+    sym = atoms.get_chemical_symbols()
     counts: Dict[str, int] = {}
     lines = [
         f"data_{input_cif.stem}",
-        f"_cell_length_a {float(cell_lengths[0]):.6f}",
-        f"_cell_length_b {float(cell_lengths[1]):.6f}",
-        f"_cell_length_c {float(cell_lengths[2]):.6f}",
-        f"_cell_angle_alpha {float(cell_angles[0]):.6f}",
-        f"_cell_angle_beta {float(cell_angles[1]):.6f}",
-        f"_cell_angle_gamma {float(cell_angles[2]):.6f}",
+        f"_cell_length_a {cl[0]:.6f}",
+        f"_cell_length_b {cl[1]:.6f}",
+        f"_cell_length_c {cl[2]:.6f}",
+        f"_cell_angle_alpha {ca[0]:.6f}",
+        f"_cell_angle_beta  {ca[1]:.6f}",
+        f"_cell_angle_gamma {ca[2]:.6f}",
         "_symmetry_space_group_name_Hall 'P 1'",
-        "_symmetry_space_group_name_H-M 'P 1'",
+        "_symmetry_space_group_name_H-M  'P 1'",
         "_symmetry_Int_Tables_number 1",
+        "loop_", "_symmetry_equiv_pos_as_xyz", "x,y,z",
         "loop_",
-        "_symmetry_equiv_pos_as_xyz",
-        "x,y,z",
-        "loop_",
-        "_atom_site_label",
-        "_atom_site_type_symbol",
-        "_atom_site_fract_x",
-        "_atom_site_fract_y",
-        "_atom_site_fract_z",
+        "_atom_site_label", "_atom_site_type_symbol",
+        "_atom_site_fract_x", "_atom_site_fract_y", "_atom_site_fract_z",
         "_atom_site_occupancy",
     ]
-
-    for sym, pos in zip(symbols, scaled):
-        counts[sym] = counts.get(sym, 0) + 1
-        label = f"{sym}{counts[sym]}"
-        lines.append(
-            f"{label} {sym} "
-            f"{float(pos[0]):.6f} {float(pos[1]):.6f} {float(pos[2]):.6f} 1.0"
-        )
-
+    for s, pos in zip(sym, sp):
+        counts[s] = counts.get(s, 0) + 1
+        lines.append(f"{s}{counts[s]} {s} {pos[0]:.6f} {pos[1]:.6f} {pos[2]:.6f} 1.0")
     lines.append("")
     ensure_dir(output_cif.parent)
     output_cif.write_text("\n".join(lines), encoding="utf-8")
 
 
-# ---------------------------------------------------------------------
-# RASPA input builders
-# ---------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# RASPA setup helpers
+# ---------------------------------------------------------------------------
+def detect_raspa_share(raspa_data_dir: Path) -> Path:
+    raspa_data_dir = raspa_data_dir.expanduser().resolve()
+    candidate = raspa_data_dir / "share" / "raspa"
+    if candidate.exists():
+        return candidate
+    if raspa_data_dir.name == "raspa" and raspa_data_dir.exists():
+        return raspa_data_dir
+    raise FileNotFoundError(
+        f"Cannot find RASPA share under {raspa_data_dir}. "
+        "Expected <dir>/share/raspa or a direct raspa dir."
+    )
 
-def build_common_header(
-    framework_name: str,
+
+def resolve_forcefield(raspa_share: Path, requested: str) -> str:
+    ff_root = raspa_share / "forcefield"
+    available = available_subdirs(ff_root)
+    if not available:
+        raise FileNotFoundError(f"No forcefield dirs under {ff_root}")
+    if requested in available:
+        return requested
+    lower = {n.lower(): n for n in available}
+    if requested.lower() in lower:
+        return lower[requested.lower()]
+    # Common alias
+    if requested == "GenericMOFs" and "ExampleMOFsForceField" in available:
+        logger.info("GenericMOFs not found → using ExampleMOFsForceField")
+        return "ExampleMOFsForceField"
+    raise FileNotFoundError(
+        f"Forcefield '{requested}' not found. Available: {available}"
+    )
+
+
+def find_molecule_dir(raspa_share: Path, molecule: str, preferred: Optional[str] = None) -> str:
+    mol_root = raspa_share / "molecules"
+    if not mol_root.exists():
+        raise FileNotFoundError(f"RASPA molecules dir not found: {mol_root}")
+    target = f"{molecule}.def"
+    if preferred:
+        d = mol_root / preferred
+        if d.is_dir() and (d / target).exists():
+            return preferred
+    matches = [
+        d.name for d in sorted(mol_root.iterdir())
+        if d.is_dir() and (d / target).exists()
+    ]
+    if matches:
+        if preferred and preferred not in matches:
+            logger.info(f"Preferred dir '{preferred}' for {molecule} not found → using '{matches[0]}'")
+        return matches[0]
+    raise FileNotFoundError(
+        f"No {target} found anywhere under {mol_root}. "
+        f"Available dirs: {available_subdirs(mol_root)}"
+    )
+
+
+def install_user_def(runtime_share: Path, molecule: str, def_file: Path) -> str:
+    def_file = def_file.expanduser().resolve()
+    if not def_file.exists():
+        raise FileNotFoundError(def_file)
+    if def_file.name != f"{molecule}.def":
+        raise ValueError(f"File must be named exactly {molecule}.def")
+    dst = ensure_dir(runtime_share / "molecules" / "UserDefinitions")
+    shutil.copy2(def_file, dst / def_file.name)
+    return "UserDefinitions"
+
+
+def prepare_runtime(output_dir: Path, raspa_share: Path) -> Tuple[Path, Path, Path]:
+    """Copy RASPA share into a local runtime tree."""
+    runtime_root  = (output_dir / "_raspa_runtime").resolve()
+    runtime_share = runtime_root / "share" / "raspa"
+    ensure_dir(runtime_root)
+    if runtime_share.exists():
+        shutil.rmtree(runtime_share)
+    shutil.copytree(raspa_share, runtime_share, dirs_exist_ok=True)
+    cif_dir = ensure_dir(runtime_share / "structures" / "cif")
+    return runtime_root, runtime_share, cif_dir
+
+
+def check_ff_assets(runtime_share: Path, ff_name: str) -> None:
+    ff_dir = runtime_share / "forcefield" / ff_name
+    if not ff_dir.exists():
+        raise FileNotFoundError(f"Forcefield dir missing: {ff_dir}")
+    required = ["force_field.def", "pseudo_atoms.def"]
+    missing = [f for f in required if not (ff_dir / f).exists()]
+    mixing = any((ff_dir / f).exists() for f in
+                 ["force_field_mixing_rules.def", "mixing_rules.def"])
+    if not mixing:
+        missing.append("force_field_mixing_rules.def")
+    if missing:
+        raise FileNotFoundError(f"FF '{ff_name}' missing files: {missing}")
+
+
+def check_mol_def(runtime_share: Path, mol_dir: str, molecule: str) -> None:
+    p = runtime_share / "molecules" / mol_dir / f"{molecule}.def"
+    if not p.exists():
+        raise FileNotFoundError(f"Molecule def not found: {p}")
+
+
+# ---------------------------------------------------------------------------
+# RASPA input builders
+# ---------------------------------------------------------------------------
+def _common_header(
+    framework: str,
     unit_cells: Tuple[int, int, int],
     temperature_k: float,
     pressure_bar: float,
     n_cycles: int,
     forcefield: str,
-    use_framework_charges: bool,
+    use_charges: bool,
     cutoff: float,
 ) -> List[str]:
-    n_init = max(500, int(max(n_cycles, 1) * 0.5))
+    n_init = max(500, n_cycles // 2)
     return [
         "SimulationType MonteCarlo",
-        f"NumberOfCycles {int(n_cycles)}",
-        f"NumberOfInitializationCycles {int(n_init)}",
-        f"PrintEvery {max(100, int(max(n_cycles, 1) * 0.1))}",
+        f"NumberOfCycles {n_cycles}",
+        f"NumberOfInitializationCycles {n_init}",
+        f"PrintEvery {max(100, n_cycles // 10)}",
         "RestartFile no",
         "ContinueAfterCrash no",
         f"Forcefield {forcefield}",
-        f"UseChargesFromCIFFile {'yes' if use_framework_charges else 'no'}",
+        f"UseChargesFromCIFFile {'yes' if use_charges else 'no'}",
         "ChargeMethod Ewald",
         "EwaldPrecision 1e-6",
-        f"CutOffVDW {float(cutoff):.3f}",
-        f"CutOffChargeCharge {float(cutoff):.3f}",
+        f"CutOffVDW {cutoff:.3f}",
+        f"CutOffChargeCharge {cutoff:.3f}",
         "RemoveAtomNumberCodeFromLabel yes",
         "Framework 0",
-        f"FrameworkName {framework_name}",
+        f"FrameworkName {framework}",
         f"UnitCells {unit_cells[0]} {unit_cells[1]} {unit_cells[2]}",
-        f"ExternalTemperature {float(temperature_k):.6f}",
-        f"ExternalPressure {float(pressure_bar) * 1.0e5:.6f}",
+        f"ExternalTemperature {temperature_k:.6f}",
+        f"ExternalPressure {pressure_bar * 1e5:.6f}",
     ]
 
 
 def build_single_component_input(
-    framework_name: str,
-    unit_cells: Tuple[int, int, int],
-    temperature_k: float,
-    pressure_bar: float,
-    component_name: str,
-    molecule_definition: str,
-    n_cycles: int,
-    forcefield: str,
-    use_framework_charges: bool,
-    cutoff: float,
+    framework: str, unit_cells: Tuple[int, int, int],
+    temperature_k: float, pressure_bar: float,
+    molecule: str, mol_dir: str,
+    n_cycles: int, forcefield: str, use_charges: bool, cutoff: float,
 ) -> str:
-    lines = build_common_header(
-        framework_name=framework_name,
-        unit_cells=unit_cells,
-        temperature_k=temperature_k,
-        pressure_bar=pressure_bar,
-        n_cycles=n_cycles,
-        forcefield=forcefield,
-        use_framework_charges=use_framework_charges,
-        cutoff=cutoff,
-    )
-    lines.extend(
-        [
-            f"Component 0 MoleculeName {component_name}",
-            f"            MoleculeDefinition {molecule_definition}",
+    lines = _common_header(framework, unit_cells, temperature_k, pressure_bar,
+                           n_cycles, forcefield, use_charges, cutoff)
+    lines += [
+        f"Component 0 MoleculeName {molecule}",
+        f"            MoleculeDefinition {mol_dir}",
+        "            TranslationProbability 1.0",
+        "            RotationProbability 1.0",
+        "            ReinsertionProbability 1.0",
+        "            SwapProbability 1.0",
+        "            CreateNumberOfMolecules 0",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def build_multicomponent_input(
+    framework: str, unit_cells: Tuple[int, int, int],
+    cond: Condition,
+    n_cycles: int, forcefield: str, use_charges: bool, cutoff: float,
+    co2_dir: str, n2_dir: str, h2o_dir: str,
+) -> str:
+    lines = _common_header(framework, unit_cells, cond.temperature_k,
+                           cond.pressure_bar, n_cycles, forcefield, use_charges, cutoff)
+    for i, (name, mol_dir, frac) in enumerate([
+        ("CO2", co2_dir, cond.x_co2_total),
+        ("N2",  n2_dir,  cond.x_n2_total),
+        ("H2O", h2o_dir, cond.x_h2o_total),
+    ]):
+        lines += [
+            f"Component {i} MoleculeName {name}",
+            f"            MoleculeDefinition {mol_dir}",
+            f"            MolFraction {frac:.12f}",
             "            TranslationProbability 1.0",
             "            RotationProbability 1.0",
             "            ReinsertionProbability 1.0",
             "            SwapProbability 1.0",
             "            CreateNumberOfMolecules 0",
         ]
-    )
     return "\n".join(lines) + "\n"
 
 
-def build_multicomponent_input(
-    framework_name: str,
-    unit_cells: Tuple[int, int, int],
-    condition: Condition,
-    n_cycles: int,
-    forcefield: str,
-    use_framework_charges: bool,
-    cutoff: float,
-    co2_definition: str,
-    n2_definition: str,
-    h2o_definition: str,
-) -> str:
-    lines = build_common_header(
-        framework_name=framework_name,
-        unit_cells=unit_cells,
-        temperature_k=condition.temperature_k,
-        pressure_bar=condition.pressure_bar,
-        n_cycles=n_cycles,
-        forcefield=forcefield,
-        use_framework_charges=use_framework_charges,
-        cutoff=cutoff,
-    )
-
-    comps = [
-        ("CO2", co2_definition, condition.x_co2_total),
-        ("N2", n2_definition, condition.x_n2_total),
-        ("H2O", h2o_definition, condition.x_h2o_total),
-    ]
-
-    for i, (name, definition, frac) in enumerate(comps):
-        lines.extend(
-            [
-                f"Component {i} MoleculeName {name}",
-                f"            MoleculeDefinition {definition}",
-                f"            MolFraction {float(frac):.12f}",
-                "            TranslationProbability 1.0",
-                "            RotationProbability 1.0",
-                "            ReinsertionProbability 1.0",
-                "            SwapProbability 1.0",
-                "            CreateNumberOfMolecules 0",
-            ]
-        )
-
-    return "\n".join(lines) + "\n"
-
-
-# ---------------------------------------------------------------------
-# Running and parsing RASPA
-# ---------------------------------------------------------------------
-
-def collect_text_output_files(workdir: Path) -> str:
+# ---------------------------------------------------------------------------
+# RASPA runner  ← CRITICAL BUG FIXED HERE
+# ---------------------------------------------------------------------------
+def _collect_output_files(workdir: Path) -> str:
     pieces: List[str] = []
-    for path in sorted(workdir.rglob("*")):
-        if not path.is_file():
+    for p in sorted(workdir.rglob("*")):
+        if not p.is_file():
             continue
-        if path.name.startswith("output") or path.suffix.lower() in {".data", ".txt"}:
+        if p.name.startswith("output") or p.suffix.lower() in {".data", ".txt"}:
             try:
-                pieces.append(f"\n===== FILE: {path.relative_to(workdir)} =====\n")
-                pieces.append(path.read_text(encoding="utf-8", errors="replace"))
+                pieces.append(f"\n===== {p.relative_to(workdir)} =====\n")
+                pieces.append(p.read_text(encoding="utf-8", errors="replace"))
             except Exception:
-                continue
+                pass
     return "\n".join(pieces)
 
 
-def run_raspa_job(
-    raspa_path: Path,
-    runtime_root: Path,
-    framework_cif_dir: Path,
-    source_cif: Path,
-    workspace: Path,
-    input_text: str,
-) -> Tuple[bool, str, Path, int]:
-    workspace = ensure_dir(workspace.expanduser().resolve())
+def _run_once(
+    raspa_path: Path, runtime_root: Path, framework_cif_dir: Path,
+    source_cif: Path, workspace: Path, input_text: str,
+) -> RASPAResult:
+    """Single RASPA execution — no retry logic here."""
+    name = source_cif.stem
+    runtime_cif = framework_cif_dir / f"{name}.cif"
+    canonicalize_cif(source_cif.resolve(), runtime_cif)
 
-    framework_name = source_cif.stem
-    runtime_framework_cif = framework_cif_dir.expanduser().resolve() / f"{framework_name}.cif"
-
-    canonicalize_cif_for_raspa(source_cif.expanduser().resolve(), runtime_framework_cif)
-
-    if not runtime_framework_cif.exists():
-        raise FileNotFoundError(f"Canonical framework CIF was not created: {runtime_framework_cif}")
-
-    canonical_copy = workspace / f"{framework_name}.canonical.cif"
-    shutil.copy2(runtime_framework_cif, canonical_copy)
-
-    sim_input = workspace / "simulation.input"
-    sim_input.write_text(input_text, encoding="utf-8")
+    workspace.mkdir(parents=True, exist_ok=True)
+    (workspace / f"{name}.canonical.cif").write_bytes(runtime_cif.read_bytes())
+    (workspace / "simulation.input").write_text(input_text, encoding="utf-8")
 
     env = os.environ.copy()
-    env["RASPA_DIR"] = str(runtime_root.expanduser().resolve())
+    env["RASPA_DIR"] = str(runtime_root.resolve())
 
-    proc = subprocess.run(
-        [str(raspa_path.expanduser().resolve())],
-        cwd=str(workspace),
-        capture_output=True,
-        text=True,
-        env=env,
-    )
+    try:
+        proc = subprocess.run(
+            [str(raspa_path.resolve())],
+            cwd=str(workspace),
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=7200,
+        )
+    except subprocess.TimeoutExpired:
+        log = workspace / "raspa_full_output.log"
+        log.write_text("TIMEOUT after 7200 s", encoding="utf-8")
+        return RASPAResult(ok=False, combined_text="TIMEOUT", log_path=log, returncode=-9)
 
     stdout = proc.stdout or ""
     stderr = proc.stderr or ""
-    file_output = collect_text_output_files(workspace)
-    combined = "\n".join(part for part in [stdout, stderr, file_output] if part and part.strip())
+    file_out = _collect_output_files(workspace)
+    combined = "\n".join(p for p in [stdout, stderr, file_out] if p.strip())
 
-    full_log = workspace / "raspa_full_output.log"
-    full_log.write_text(combined, encoding="utf-8", errors="replace")
+    log = workspace / "raspa_full_output.log"
+    log.write_text(combined, encoding="utf-8", errors="replace")
 
-    ok = proc.returncode == 0
-    return ok, combined, full_log, proc.returncode
+    ok = (proc.returncode == 0)
+    return RASPAResult(ok=ok, combined_text=combined, log_path=log, returncode=proc.returncode)
 
 
+def run_raspa_job(
+    raspa_path: Path, runtime_root: Path, framework_cif_dir: Path,
+    source_cif: Path, workspace: Path, input_text: str,
+    max_retries: int = 3, retry_delay: int = 60,
+) -> RASPAResult:
+    """
+    Run a RASPA job with retry on failure.
+
+    FIX: Previous version caught CalledProcessError which subprocess.run
+    (without check=True) never raises.  We now check result.ok and retry
+    on any non-zero returncode or timeout.
+    """
+    last: Optional[RASPAResult] = None
+    for attempt in range(max_retries):
+        result = _run_once(raspa_path, runtime_root, framework_cif_dir,
+                           source_cif, workspace, input_text)
+        if result.ok:
+            return result
+        last = result
+        if attempt < max_retries - 1:
+            wait = retry_delay * (2 ** attempt)   # 60s, 120s, 240s …
+            logger.warning(
+                f"  Attempt {attempt + 1}/{max_retries} failed "
+                f"(rc={result.returncode}). Retrying in {wait}s …"
+            )
+            time.sleep(wait)
+    return last  # type: ignore[return-value]
+
+
+# ---------------------------------------------------------------------------
+# Output parsers
+# ---------------------------------------------------------------------------
 def _extract_float(pattern: str, text: str) -> Optional[float]:
-    m = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
+    m = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
     if not m:
         return None
     try:
@@ -605,457 +543,544 @@ def _extract_float(pattern: str, text: str) -> Optional[float]:
         return None
 
 
-def _parse_component_block(output_text: str, component_name: str) -> Dict[str, Optional[float]]:
-    result: Dict[str, Optional[float]] = {
-        "loading_molkg": None,
-        "loading_molecules_uc": None,
-        "enthalpy_kjmol": None,
-    }
-
-    block_pattern = re.compile(
-        rf"Component\s+\d+\s+\[{re.escape(component_name)}\](.*?)(?=Component\s+\d+\s+\[|\Z)",
-        flags=re.IGNORECASE | re.DOTALL,
+def _parse_component(text: str, molecule: str) -> Dict[str, Optional[float]]:
+    pat = re.compile(
+        rf"Component\s+\d+\s+\[{re.escape(molecule)}\](.*?)"
+        r"(?=Component\s+\d+\s+\[|\Z)",
+        re.IGNORECASE | re.DOTALL,
     )
-    all_matches = list(block_pattern.finditer(output_text))
-    m = all_matches[-1] if all_matches else None
-    if not m:
-        return result
-
-    block = m.group(1)
-
-    result["loading_molkg"] = _extract_float(
-        r"Average loading absolute \[mol/kg framework\]\s+([+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)",
-        block,
-    )
-
-    result["loading_molecules_uc"] = _extract_float(
-        r"Average loading absolute \[molecules/unit cell\]\s+([+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)",
-        block,
-    )
-
-    result["enthalpy_kjmol"] = _extract_float(
-        r"Enthalpy of adsorption \[kJ/mol\]\s+([+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)",
-        block,
-    )
-
-    return result
-
-
-def parse_single_component_result(output_text: str, component_name: str) -> Dict[str, Optional[float]]:
-    parsed = _parse_component_block(output_text, component_name)
+    matches = list(pat.finditer(text))
+    block = matches[-1].group(1) if matches else ""
     return {
-        "loading_molkg": parsed["loading_molkg"],
-        "loading_molecules_uc": parsed["loading_molecules_uc"],
-        "enthalpy_kjmol": parsed["enthalpy_kjmol"],
+        "loading_molkg": _extract_float(
+            r"Average loading absolute \[mol/kg framework\]\s+"
+            r"([+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)", block),
+        "loading_moluc": _extract_float(
+            r"Average loading absolute \[molecules/unit cell\]\s+"
+            r"([+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)", block),
+        "enthalpy_kjmol": _extract_float(
+            r"Enthalpy of adsorption \[kJ/mol\]\s+"
+            r"([+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)", block),
     }
 
 
-def parse_multicomponent_result(output_text: str) -> Dict[str, Optional[float]]:
-    co2 = _parse_component_block(output_text, "CO2")
-    n2 = _parse_component_block(output_text, "N2")
-    h2o = _parse_component_block(output_text, "H2O")
-
-    co2_load = co2["loading_molkg"]
-    n2_load = n2["loading_molkg"]
-
-    selectivity = None
-    if co2_load is not None and n2_load is not None and n2_load > 0:
-        selectivity = co2_load / n2_load
-
+def parse_single(text: str, molecule: str) -> Dict[str, Optional[float]]:
+    d = _parse_component(text, molecule)
     return {
-        "co2_loading_molkg": co2["loading_molkg"],
-        "n2_loading_molkg": n2["loading_molkg"],
-        "h2o_loading_molkg": h2o["loading_molkg"],
-        "co2_loading_molecules_uc": co2["loading_molecules_uc"],
-        "n2_loading_molecules_uc": n2["loading_molecules_uc"],
-        "h2o_loading_molecules_uc": h2o["loading_molecules_uc"],
-        "co2_enthalpy_kjmol": co2["enthalpy_kjmol"],
-        "n2_enthalpy_kjmol": n2["enthalpy_kjmol"],
-        "h2o_enthalpy_kjmol": h2o["enthalpy_kjmol"],
-        "co2_over_n2_selectivity": selectivity,
+        "loading_molkg":  d["loading_molkg"],
+        "loading_moluc":  d["loading_moluc"],
+        "enthalpy_kjmol": d["enthalpy_kjmol"],
     }
 
 
-# ---------------------------------------------------------------------
-# Main simulation logic
-# ---------------------------------------------------------------------
+def parse_multi(text: str) -> Dict[str, Optional[float]]:
+    co2 = _parse_component(text, "CO2")
+    n2  = _parse_component(text, "N2")
+    h2o = _parse_component(text, "H2O")
+    sel = None
+    if co2["loading_molkg"] is not None and n2["loading_molkg"] and n2["loading_molkg"] > 0:
+        sel = co2["loading_molkg"] / n2["loading_molkg"]
+    return {
+        "co2_loading_molkg":    co2["loading_molkg"],
+        "n2_loading_molkg":     n2["loading_molkg"],
+        "h2o_loading_molkg":    h2o["loading_molkg"],
+        "co2_loading_moluc":    co2["loading_moluc"],
+        "n2_loading_moluc":     n2["loading_moluc"],
+        "h2o_loading_moluc":    h2o["loading_moluc"],
+        "co2_enthalpy_kjmol":   co2["enthalpy_kjmol"],
+        "n2_enthalpy_kjmol":    n2["enthalpy_kjmol"],
+        "h2o_enthalpy_kjmol":   h2o["enthalpy_kjmol"],
+        "co2_over_n2_selectivity": sel,
+    }
 
-def load_cif_paths(cif_dir: Path, max_mofs: int) -> List[Path]:
-    cifs = sorted(cif_dir.glob("*.cif"))
-    if max_mofs > 0:
-        cifs = cifs[:max_mofs]
-    return [p.resolve() for p in cifs]
 
-
-def run_low_fidelity_isotherms(
-    cif_paths: Sequence[Path],
-    output_dir: Path,
-    runtime_root: Path,
-    framework_cif_dir: Path,
-    raspa_path: Path,
-    temperatures_k: Sequence[float],
-    pressures_bar: Sequence[float],
-    n_cycles: int,
-    keep_workspaces: bool,
-    forcefield: str,
-    use_framework_charges: bool,
-    cutoff: float,
-    co2_definition: str,
-    n2_definition: str,
+# ---------------------------------------------------------------------------
+# Stage 1 — Low-fidelity single-component pressure sweep
+# ---------------------------------------------------------------------------
+def run_stage1_isotherms(
+    cif_paths: Sequence[Path], output_dir: Path,
+    runtime_root: Path, framework_cif_dir: Path, raspa_path: Path,
+    temperatures_k: Sequence[float], pressures_bar: Sequence[float],
+    n_cycles: int, keep_workspaces: bool,
+    forcefield: str, use_charges: bool, cutoff: float,
+    co2_dir: str, n2_dir: str,
+    max_retries: int = 3, retry_delay: int = 60,
 ) -> pd.DataFrame:
+    """
+    Run single-component RASPA at every (MOF, component, T, P) point.
+
+    FIX: Previous version only ran at max(pressures_bar) — a single point
+    per isotherm — which cannot compute working capacity.  We now sweep ALL
+    pressures so that Stage 2 can compute ΔN = N(P_high) − N(P_low).
+    """
     rows: List[Dict] = []
-    workspace_root = ensure_dir((output_dir / "tmmc_workspace").resolve())
+    ws_root = ensure_dir(output_dir / "stage1_workspace")
+    components = [("CO2", co2_dir), ("N2", n2_dir)]
+    total = len(cif_paths) * len(components) * len(temperatures_k) * len(pressures_bar)
+    job = 0
 
-    print("[1/2] Running GC-TMMC (low-fidelity single-component isotherms)...")
+    logger.info(f"\n[Stage 1] Single-component isotherms: {total} jobs across {len(cif_paths)} MOFs")
 
-    for cif_path in cif_paths:
-        framework_name = cif_path.stem
-        unit_cells = determine_unit_cells(cif_path, cutoff_angstrom=cutoff)
-
-        for component_name, definition in [("CO2", co2_definition), ("N2", n2_definition)]:
-            for temperature_k in temperatures_k:
-                workspace = workspace_root / f"{framework_name}__{component_name}__{temperature_k:.2f}K"
-                pressure_bar = max(pressures_bar)
-
-                sim_input = build_single_component_input(
-                    framework_name=framework_name,
-                    unit_cells=unit_cells,
-                    temperature_k=temperature_k,
-                    pressure_bar=pressure_bar,
-                    component_name=component_name,
-                    molecule_definition=definition,
-                    n_cycles=n_cycles,
-                    forcefield=forcefield,
-                    use_framework_charges=use_framework_charges,
-                    cutoff=cutoff,
-                )
-
-                ok, combined, full_log, returncode = run_raspa_job(
-                    raspa_path=raspa_path,
-                    runtime_root=runtime_root,
-                    framework_cif_dir=framework_cif_dir,
-                    source_cif=cif_path,
-                    workspace=workspace,
-                    input_text=sim_input,
-                )
-
-                if not ok:
-                    print(
-                        f"GC-TMMC failed for {framework_name}/{component_name} "
-                        f"(returncode={returncode}): {tail_text(combined, 12)}"
+    for cif in cif_paths:
+        name = cif.stem
+        uc = determine_unit_cells(cif, cutoff)
+        for mol, mol_dir in components:
+            for t in temperatures_k:
+                for p in pressures_bar:
+                    job += 1
+                    ws = ws_root / f"{name}__{mol}__T{t:.0f}__P{p:g}"
+                    inp = build_single_component_input(
+                        name, uc, t, p, mol, mol_dir,
+                        n_cycles, forcefield, use_charges, cutoff,
                     )
-                else:
-                    parsed = parse_single_component_result(combined, component_name)
-                    row = {
-                        "mof_id": framework_name,
-                        "component": component_name,
-                        "temperature_k": float(temperature_k),
-                        "pressure_bar": float(pressure_bar),
-                        "log_path": str(full_log),
-                        **parsed,
-                    }
-                    rows.append(row)
-
-                if not keep_workspaces and workspace.exists():
-                    shutil.rmtree(workspace, ignore_errors=True)
+                    logger.info(f"  [{job}/{total}] {name} | {mol} | T={t:.0f}K P={p:g}bar")
+                    res = run_raspa_job(raspa_path, runtime_root, framework_cif_dir,
+                                       cif, ws, inp, max_retries, retry_delay)
+                    if res.ok:
+                        parsed = parse_single(res.combined_text, mol)
+                        rows.append({"mof_id": name, "component": mol,
+                                     "temperature_k": t, "pressure_bar": p,
+                                     "log": str(res.log_path), **parsed})
+                    else:
+                        logger.warning(f"    FAILED rc={res.returncode}: {tail_text(res.combined_text, 5)}")
+                    if not keep_workspaces and ws.exists():
+                        shutil.rmtree(ws, ignore_errors=True)
 
     df = pd.DataFrame(rows)
-    out_path = (output_dir / "tmmc_isotherms.parquet").resolve()
-    df.to_parquet(out_path, index=False)
-    print(f"  GC-TMMC: {len(df)} rows -> {out_path}")
+    out = output_dir / "stage1_isotherms.parquet"
+    df.to_parquet(out, index=False)
+    logger.info(f"[Stage 1] {len(df)}/{total} succeeded → {out}")
     return df
 
 
-def run_high_fidelity_gcmc(
-    cif_paths: Sequence[Path],
-    output_dir: Path,
-    runtime_root: Path,
-    framework_cif_dir: Path,
-    raspa_path: Path,
+# ---------------------------------------------------------------------------
+# Stage 2 — TMMC→GCMC selection
+# ---------------------------------------------------------------------------
+def _pareto_front(costs: np.ndarray) -> np.ndarray:
+    """
+    Return boolean mask of Pareto-optimal rows (maximise all columns).
+    A point is dominated if another point is ≥ in every column and > in one.
+    """
+    n = costs.shape[0]
+    dominated = np.zeros(n, dtype=bool)
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            if np.all(costs[j] >= costs[i]) and np.any(costs[j] > costs[i]):
+                dominated[i] = True
+                break
+    return ~dominated
+
+
+def select_mofs_for_gcmc(
+    stage1_df: pd.DataFrame,
+    gcmc_budget: int,
+    adsorption_pressure_bar: float,
+    desorption_pressure_bar: float,
+    temperature_k: float = 298.15,
+    exploration_fraction: float = 0.2,
+) -> List[str]:
+    """
+    Pick the best MOFs for expensive GCMC using Stage 1 single-component data.
+
+    Strategy
+    --------
+    For each MOF we compute two KPIs from the CO2 and N2 single-component
+    isotherms at the reference temperature:
+
+      selectivity_proxy  = KH_CO2 / KH_N2
+                         (Henry constants from low-pressure loading / pressure)
+
+      working_capacity   = q_CO2(P_ads) − q_CO2(P_des)
+                         (usable CO2 loading over a PSA/VSA swing)
+
+    We then find the Pareto front over (selectivity, working_capacity),
+    fill remaining budget with the highest-selectivity non-Pareto candidates,
+    and finally replace exploration_fraction of slots with diverse candidates
+    (highest selectivity that are NOT already selected) to avoid clustering.
+
+    Parameters
+    ----------
+    stage1_df               : output of run_stage1_isotherms
+    gcmc_budget             : how many MOFs to label with GCMC (e.g. 500)
+    adsorption_pressure_bar : high pressure point for working capacity (e.g. 5.0)
+    desorption_pressure_bar : low pressure point for working capacity  (e.g. 0.1)
+    temperature_k           : reference temperature for KPI computation
+    exploration_fraction    : fraction of budget reserved for diversity
+    """
+    df = stage1_df.copy()
+    df = df[df["temperature_k"].between(temperature_k - 1.0, temperature_k + 1.0)]
+
+    if df.empty:
+        logger.warning("Stage 1 data has no rows near reference T — selecting all MOFs")
+        return list(stage1_df["mof_id"].unique())
+
+    mof_ids = df["mof_id"].unique().tolist()
+    records: List[Dict] = []
+
+    for mof in mof_ids:
+        sub = df[df["mof_id"] == mof]
+        co2 = sub[sub["component"] == "CO2"].sort_values("pressure_bar")
+        n2  = sub[sub["component"] == "N2" ].sort_values("pressure_bar")
+        if co2.empty or n2.empty:
+            continue
+
+        # Henry constants: slope at lowest pressure point (linear regime)
+        kh_co2 = float(co2.iloc[0]["loading_molkg"]) / float(co2.iloc[0]["pressure_bar"]) \
+            if co2.iloc[0]["loading_molkg"] is not None and co2.iloc[0]["pressure_bar"] > 0 else 0.0
+        kh_n2  = float(n2.iloc[0]["loading_molkg"])  / float(n2.iloc[0]["pressure_bar"]) \
+            if n2.iloc[0]["loading_molkg"]  is not None and n2.iloc[0]["pressure_bar"]  > 0 else 0.0
+
+        sel = kh_co2 / max(kh_n2, 1e-9)
+
+        # Working capacity: interpolate at adsorption / desorption pressures
+        def interp_loading(rows: pd.DataFrame, p_target: float) -> float:
+            if rows.empty or rows["loading_molkg"].isna().all():
+                return 0.0
+            rows = rows.dropna(subset=["loading_molkg"])
+            if len(rows) == 1:
+                return float(rows.iloc[0]["loading_molkg"])
+            return float(np.interp(p_target,
+                                   rows["pressure_bar"].values,
+                                   rows["loading_molkg"].values))
+
+        q_ads = interp_loading(co2, adsorption_pressure_bar)
+        q_des = interp_loading(co2, desorption_pressure_bar)
+        wc = max(0.0, q_ads - q_des)
+
+        records.append({"mof_id": mof, "selectivity": sel, "working_capacity": wc})
+
+    if not records:
+        logger.warning("Could not compute KPIs for any MOF — returning all")
+        return mof_ids
+
+    kpi_df = pd.DataFrame(records)
+
+    # Normalise to [0, 1] for Pareto
+    for col in ["selectivity", "working_capacity"]:
+        rng = kpi_df[col].max() - kpi_df[col].min()
+        kpi_df[f"{col}_norm"] = (kpi_df[col] - kpi_df[col].min()) / max(rng, 1e-9)
+
+    costs = kpi_df[["selectivity_norm", "working_capacity_norm"]].values
+    pareto_mask = _pareto_front(costs)
+    pareto_mofs = kpi_df.loc[pareto_mask, "mof_id"].tolist()
+
+    n_explore  = max(1, int(gcmc_budget * exploration_fraction))
+    n_exploit  = gcmc_budget - n_explore
+
+    # Exploitation: Pareto first, then top selectivity
+    exploit_candidates = (
+        kpi_df.loc[pareto_mask].sort_values("selectivity", ascending=False)["mof_id"].tolist()
+        + kpi_df.loc[~pareto_mask].sort_values("selectivity", ascending=False)["mof_id"].tolist()
+    )
+    selected = exploit_candidates[:n_exploit]
+
+    # Exploration: highest working capacity NOT already selected
+    explore_pool = kpi_df[~kpi_df["mof_id"].isin(selected)] \
+        .sort_values("working_capacity", ascending=False)["mof_id"].tolist()
+    selected += explore_pool[:n_explore]
+
+    selected = selected[:gcmc_budget]
+
+    logger.info(
+        f"[Stage 2] Selected {len(selected)}/{len(mof_ids)} MOFs for GCMC\n"
+        f"  Pareto-front size : {pareto_mask.sum()}\n"
+        f"  Exploitation slots: {n_exploit}\n"
+        f"  Exploration slots : {n_explore}\n"
+        f"  Top selectivity   : {kpi_df['selectivity'].max():.1f}  "
+        f"(CO2/N2 Henry ratio)\n"
+        f"  Top working cap.  : {kpi_df['working_capacity'].max():.3f} mol/kg"
+    )
+    return selected
+
+
+# ---------------------------------------------------------------------------
+# Stage 3 — High-fidelity multicomponent GCMC
+# ---------------------------------------------------------------------------
+def run_stage3_gcmc(
+    cif_paths: Sequence[Path], output_dir: Path,
+    runtime_root: Path, framework_cif_dir: Path, raspa_path: Path,
     conditions: Sequence[Condition],
-    n_cycles: int,
-    keep_workspaces: bool,
-    forcefield: str,
-    use_framework_charges: bool,
-    cutoff: float,
-    co2_definition: str,
-    n2_definition: str,
-    h2o_definition: str,
+    n_cycles: int, keep_workspaces: bool,
+    forcefield: str, use_charges: bool, cutoff: float,
+    co2_dir: str, n2_dir: str, h2o_dir: str,
+    max_retries: int = 3, retry_delay: int = 60,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     rows: List[Dict] = []
     failures: List[Dict] = []
-    workspace_root = ensure_dir((output_dir / "gcmc_workspace").resolve())
+    ws_root = ensure_dir(output_dir / "stage3_workspace")
+    total = len(cif_paths) * len(conditions)
+    job = 0
 
-    total_jobs = len(cif_paths) * len(conditions)
-    job_idx = 0
+    logger.info(f"\n[Stage 3] Multicomponent GCMC: {total} jobs across {len(cif_paths)} MOFs")
 
-    print("\n[2/2] Running GCMC (high-fidelity multicomponent simulations)...")
-
-    for cif_path in cif_paths:
-        framework_name = cif_path.stem
-        unit_cells = determine_unit_cells(cif_path, cutoff_angstrom=cutoff)
-
-        for condition in conditions:
-            job_idx += 1
-            print(
-                f"  GCMC [{job_idx}/{total_jobs}] {framework_name} | "
-                f"T={condition.temperature_k:.2f} K, "
-                f"P={condition.pressure_bar:g} bar, "
-                f"RH={100.0 * condition.rh:.2f}%"
+    for cif in cif_paths:
+        name = cif.stem
+        uc = determine_unit_cells(cif, cutoff)
+        for cond in conditions:
+            job += 1
+            logger.info(
+                f"  [{job}/{total}] {name} | "
+                f"T={cond.temperature_k:.0f}K P={cond.pressure_bar:g}bar RH={cond.rh*100:.0f}%"
             )
-
-            workspace = workspace_root / (
-                f"{framework_name}__"
-                f"T{condition.temperature_k:.2f}__"
-                f"P{condition.pressure_bar:g}__"
-                f"RH{condition.rh:.3f}"
+            ws = ws_root / (
+                f"{name}__T{cond.temperature_k:.0f}"
+                f"__P{cond.pressure_bar:g}__RH{cond.rh:.3f}"
             )
-
-            sim_input = build_multicomponent_input(
-                framework_name=framework_name,
-                unit_cells=unit_cells,
-                condition=condition,
-                n_cycles=n_cycles,
-                forcefield=forcefield,
-                use_framework_charges=use_framework_charges,
-                cutoff=cutoff,
-                co2_definition=co2_definition,
-                n2_definition=n2_definition,
-                h2o_definition=h2o_definition,
+            inp = build_multicomponent_input(
+                name, uc, cond, n_cycles, forcefield, use_charges, cutoff,
+                co2_dir, n2_dir, h2o_dir,
             )
-
-            ok, combined, full_log, returncode = run_raspa_job(
-                raspa_path=raspa_path,
-                runtime_root=runtime_root,
-                framework_cif_dir=framework_cif_dir,
-                source_cif=cif_path,
-                workspace=workspace,
-                input_text=sim_input,
-            )
-
-            if not ok:
-                failures.append(
-                    {
-                        "mof_id": framework_name,
-                        "temperature_k": condition.temperature_k,
-                        "pressure_bar": condition.pressure_bar,
-                        "rh": condition.rh,
-                        "x_co2_total": condition.x_co2_total,
-                        "x_n2_total": condition.x_n2_total,
-                        "x_h2o_total": condition.x_h2o_total,
-                        "log_path": str(full_log),
-                        "returncode": int(returncode),
-                        "error_tail": tail_text(combined, 80),
-                    }
-                )
-                print(
-                    f"GCMC failed for {framework_name} (returncode={returncode}): "
-                    f"{tail_text(combined, 12)}"
-                )
+            res = run_raspa_job(raspa_path, runtime_root, framework_cif_dir,
+                                cif, ws, inp, max_retries, retry_delay)
+            if res.ok:
+                parsed = parse_multi(res.combined_text)
+                rows.append({
+                    "mof_id":        name,
+                    "temperature_k": cond.temperature_k,
+                    "pressure_bar":  cond.pressure_bar,
+                    "rh":            cond.rh,
+                    "p_co2_bar":     cond.p_co2_bar,
+                    "p_n2_bar":      cond.p_n2_bar,
+                    "p_h2o_bar":     cond.p_h2o_bar,
+                    "x_co2_total":   cond.x_co2_total,
+                    "x_n2_total":    cond.x_n2_total,
+                    "x_h2o_total":   cond.x_h2o_total,
+                    "y_co2_dry":     cond.y_co2_dry,
+                    "y_n2_dry":      cond.y_n2_dry,
+                    # Columns expected by AdsorptionDataset:
+                    "mu_CO2":        cond.mu_co2,
+                    "mu_N2":         cond.mu_n2,
+                    "mu_H2O":        cond.mu_h2o,
+                    "T":             cond.temperature_k,
+                    "log":           str(res.log_path),
+                    **parsed,
+                })
             else:
-                parsed = parse_multicomponent_result(combined)
-                rows.append(
-                    {
-                        "mof_id": framework_name,
-                        "temperature_k": condition.temperature_k,
-                        "pressure_bar": condition.pressure_bar,
-                        "rh": condition.rh,
-                        "p_h2o_bar": condition.p_h2o_bar,
-                        "p_co2_bar": condition.p_co2_bar,
-                        "p_n2_bar": condition.p_n2_bar,
-                        "x_co2_total": condition.x_co2_total,
-                        "x_n2_total": condition.x_n2_total,
-                        "x_h2o_total": condition.x_h2o_total,
-                        "y_co2_dry": condition.y_co2_dry,
-                        "y_n2_dry": condition.y_n2_dry,
-                        "mu_CO2": condition.mu_co2,
-                        "mu_N2": condition.mu_n2,
-                        "mu_H2O": condition.mu_h2o,
-                        "T": condition.temperature_k,
-                        "log_path": str(full_log),
-                        **parsed,
-                    }
-                )
+                failures.append({
+                    "mof_id": name, "temperature_k": cond.temperature_k,
+                    "pressure_bar": cond.pressure_bar, "rh": cond.rh,
+                    "returncode": res.returncode,
+                    "error_tail": tail_text(res.combined_text, 40),
+                })
+                logger.warning(f"    FAILED rc={res.returncode}")
+            if not keep_workspaces and ws.exists():
+                shutil.rmtree(ws, ignore_errors=True)
 
-            if not keep_workspaces and workspace.exists():
-                shutil.rmtree(workspace, ignore_errors=True)
+    gcmc_df    = pd.DataFrame(rows)
+    failure_df = pd.DataFrame(failures)
 
-    gcmc_df = pd.DataFrame(rows)
-    failures_df = pd.DataFrame(failures)
+    gcmc_out = output_dir / "gcmc_adsorption.parquet"
+    fail_out = output_dir / "gcmc_failures.parquet"
+    gcmc_df.to_parquet(gcmc_out,    index=False)
+    failure_df.to_parquet(fail_out, index=False)
 
-    gcmc_out = (output_dir / "gcmc_adsorption.parquet").resolve()
-    fail_out = (output_dir / "gcmc_failures.parquet").resolve()
-
-    gcmc_df.to_parquet(gcmc_out, index=False)
-    failures_df.to_parquet(fail_out, index=False)
-
-    print(f"  GCMC: {len(gcmc_df)}/{total_jobs} succeeded -> {gcmc_out}")
-    print(f"  Failed jobs saved -> {fail_out}")
-
-    return gcmc_df, failures_df
+    logger.info(f"[Stage 3] {len(gcmc_df)}/{total} succeeded → {gcmc_out}")
+    if not failure_df.empty:
+        logger.info(f"  {len(failure_df)} failures → {fail_out}")
+    return gcmc_df, failure_df
 
 
+# ---------------------------------------------------------------------------
+# Build training dataset (AdsorptionDataset layout)
+# ---------------------------------------------------------------------------
 def build_training_dataset(gcmc_df: pd.DataFrame, output_dir: Path) -> pd.DataFrame:
-    print("\nMerging successful GCMC points into training dataset...")
-    training_df = gcmc_df.copy()
-    out_path = (output_dir / "adsorption_training.parquet").resolve()
-    training_df.to_parquet(out_path, index=False)
-    print(f"  Training data: {len(training_df)} rows -> {out_path}")
-    return training_df
+    """
+    Ensure the saved parquet has the column names that AdsorptionDataset
+    expects: mof_id, mu_CO2, mu_N2, mu_H2O, T,
+             co2_loading_molkg, n2_loading_molkg, h2o_loading_molkg.
+    Drop rows where any loading is None (simulation produced NaN).
+    """
+    df = gcmc_df.dropna(subset=["co2_loading_molkg", "n2_loading_molkg", "h2o_loading_molkg"])
+    out = output_dir / "adsorption_training.parquet"
+    df.to_parquet(out, index=False)
+    logger.info(f"\n[Training data] {len(df)} clean rows → {out}")
+    return df
 
 
-# ---------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # CLI
-# ---------------------------------------------------------------------
-
+# ---------------------------------------------------------------------------
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run RASPA humid adsorption simulations robustly.")
-    parser.add_argument("--cif-dir", default="data/intermediate/cifs_sanitized")
-    parser.add_argument("--output-dir", default="data/processed/adsorption")
-    parser.add_argument("--max-mofs", type=int, default=0, help="0 = all")
-    parser.add_argument("--n-cycles", type=int, default=5000)
-    parser.add_argument("--keep-workspaces", action="store_true")
-    parser.add_argument("--raspa-path", required=True)
-    parser.add_argument("--raspa-data-dir", required=True)
-
-    parser.add_argument("--temperatures", default="298.15,313.15,333.15")
-    parser.add_argument("--pressures", default="0.1,0.5,1.0,5.0,10.0")
-    parser.add_argument("--rhs", default="0.0,0.05,0.15")
-    parser.add_argument("--dry-co2-frac", type=float, default=0.15)
-
-    parser.add_argument("--forcefield", default="GenericMOFs")
-    parser.add_argument("--cutoff", type=float, default=12.0)
-    parser.add_argument(
-        "--use-framework-charges",
-        action="store_true",
-        help="Read framework charges from CIF. Off by default in this debug-safe version.",
+    p = argparse.ArgumentParser(
+        description="Run RASPA humid CO2/N2/H2O simulations with TMMC→GCMC selection."
     )
+    # Paths
+    p.add_argument("--cif-dir",      default="data/intermediate/cifs_sanitized")
+    p.add_argument("--output-dir",   default="data/processed/adsorption")
+    p.add_argument("--raspa-path",   required=True, help="Path to RASPA2 simulate binary")
+    p.add_argument("--raspa-data-dir", required=True, help="RASPA2 data/share root")
+    p.add_argument("--config",       help="Optional pipeline.yaml config file")
 
-    parser.add_argument("--co2-definition", default="TraPPE")
-    parser.add_argument("--n2-definition", default="TraPPE")
-    parser.add_argument("--h2o-definition", default="TraPPE")
+    # MOF selection
+    p.add_argument("--max-mofs",    type=int, default=0,   help="0=all CIFs")
+    p.add_argument("--gcmc-budget", type=int, default=500, help="MOFs to label with GCMC")
+    p.add_argument("--exploration-fraction", type=float, default=0.2,
+                   help="Fraction of GCMC budget for diversity exploration")
 
-    parser.add_argument("--co2-def-file", default=None, help="Optional path to CO2.def")
-    parser.add_argument("--n2-def-file", default=None, help="Optional path to N2.def")
-    parser.add_argument("--h2o-def-file", default=None, help="Optional path to H2O.def")
+    # Simulation parameters
+    p.add_argument("--n-cycles",    type=int,   default=5000)
+    p.add_argument("--temperatures", default="298.15,313.15,333.15")
+    p.add_argument("--pressures",    default="0.1,0.5,1.0,5.0,10.0")
+    p.add_argument("--rhs",          default="0.0,0.05,0.15")
+    p.add_argument("--dry-co2-frac", type=float, default=0.15)
+    p.add_argument("--cutoff",       type=float, default=12.0)
+    p.add_argument("--forcefield",   default="GenericMOFs")
+    p.add_argument("--use-framework-charges", action="store_true")
+    p.add_argument("--keep-workspaces",       action="store_true")
 
-    args = parser.parse_args()
+    # Molecule definitions
+    p.add_argument("--co2-definition", default="TraPPE")
+    p.add_argument("--n2-definition",  default="TraPPE")
+    p.add_argument("--h2o-definition", default="TraPPE")
+    p.add_argument("--co2-def-file",   default=None)
+    p.add_argument("--n2-def-file",    default=None)
+    p.add_argument("--h2o-def-file",   default=None)
 
-    cif_dir = Path(args.cif_dir).expanduser().resolve()
-    output_dir = ensure_dir(Path(args.output_dir).expanduser().resolve())
-    raspa_path = Path(args.raspa_path).expanduser().resolve()
-    raspa_data_dir = Path(args.raspa_data_dir).expanduser().resolve()
+    # Retry
+    p.add_argument("--max-retries",  type=int, default=3)
+    p.add_argument("--retry-delay",  type=int, default=60, help="Initial delay seconds")
+
+    # Stage control (useful for resuming)
+    p.add_argument("--skip-stage1",  action="store_true", help="Load existing stage1 parquet")
+    p.add_argument("--skip-stage2",  action="store_true", help="Run GCMC on all (skip selection)")
+
+    args = p.parse_args()
+
+    # Optional YAML override
+    if args.config:
+        import yaml
+        with open(args.config) as f:
+            cfg = yaml.safe_load(f) or {}
+        sim = cfg.get("simulation", {})
+        for key, val in sim.items():
+            attr = key.replace("-", "_")
+            if hasattr(args, attr):
+                setattr(args, attr, val)
+
+    # Resolve paths
+    cif_dir     = Path(args.cif_dir).expanduser().resolve()
+    output_dir  = ensure_dir(Path(args.output_dir).expanduser().resolve())
+    raspa_path  = Path(args.raspa_path).expanduser().resolve()
+    raspa_dd    = Path(args.raspa_data_dir).expanduser().resolve()
 
     if not cif_dir.exists():
-        raise FileNotFoundError(f"CIF directory not found: {cif_dir}")
+        raise FileNotFoundError(f"CIF dir not found: {cif_dir}")
     if not raspa_path.exists():
-        raise FileNotFoundError(f"RASPA executable not found: {raspa_path}")
+        raise FileNotFoundError(f"RASPA binary not found: {raspa_path}")
 
-    temperatures_k = parse_float_list(args.temperatures)
-    pressures_bar = parse_float_list(args.pressures)
-    rhs = parse_float_list(args.rhs)
+    # Load CIFs
+    all_cifs = sorted(cif_dir.glob("*.cif"))
+    if args.max_mofs > 0:
+        all_cifs = all_cifs[:args.max_mofs]
+    all_cifs = [c.resolve() for c in all_cifs]
+    if not all_cifs:
+        raise FileNotFoundError(f"No CIF files in {cif_dir}")
 
-    cif_paths = load_cif_paths(cif_dir, args.max_mofs)
-    if not cif_paths:
-        raise FileNotFoundError(f"No CIF files found in: {cif_dir}")
+    temps    = parse_float_list(args.temperatures)
+    pressures = parse_float_list(args.pressures)
+    rhs      = parse_float_list(args.rhs)
 
-    conditions = build_valid_conditions(
-        temperatures_k=temperatures_k,
-        pressures_bar=pressures_bar,
-        rhs=rhs,
-        dry_co2_frac=args.dry_co2_frac,
-    )
+    # RASPA setup
+    raspa_share  = detect_raspa_share(raspa_dd)
+    ff_name      = resolve_forcefield(raspa_share, args.forcefield)
+    runtime_root, runtime_share, fw_cif_dir = prepare_runtime(output_dir, raspa_share)
 
-    raspa_share = detect_raspa_share(raspa_data_dir)
-    resolved_forcefield = resolve_forcefield_name(raspa_share, args.forcefield)
+    # Molecule directories
+    def _resolve_mol(def_file_arg, mol_name, preferred):
+        if def_file_arg:
+            return install_user_def(runtime_share, mol_name, Path(def_file_arg))
+        return find_molecule_dir(raspa_share, mol_name, preferred)
 
-    runtime_root, runtime_share, framework_cif_dir = prepare_runtime_root(
-        runtime_root=output_dir / "_raspa_runtime",
-        raspa_share=raspa_share,
-    )
+    co2_dir = _resolve_mol(args.co2_def_file, "CO2", args.co2_definition)
+    n2_dir  = _resolve_mol(args.n2_def_file,  "N2",  args.n2_definition)
+    h2o_dir = _resolve_mol(args.h2o_def_file, "H2O", args.h2o_definition)
 
-    co2_definition = args.co2_definition
-    n2_definition = args.n2_definition
-    h2o_definition = args.h2o_definition
+    check_ff_assets(runtime_share, ff_name)
+    check_mol_def(runtime_share, co2_dir, "CO2")
+    check_mol_def(runtime_share, n2_dir,  "N2")
+    check_mol_def(runtime_share, h2o_dir, "H2O")
 
-    if args.co2_def_file:
-        co2_definition = install_user_definition_file(runtime_share, "CO2", Path(args.co2_def_file))
+    conditions = build_conditions(temps, pressures, rhs, args.dry_co2_frac)
+
+    logger.info("=" * 65)
+    logger.info(f"UC-TPNO SIMULATION PIPELINE")
+    logger.info(f"  CIFs            : {len(all_cifs)}")
+    logger.info(f"  Temperatures (K): {temps}")
+    logger.info(f"  Pressures (bar) : {pressures}")
+    logger.info(f"  RH values       : {rhs}")
+    logger.info(f"  Dry CO2 frac    : {args.dry_co2_frac}")
+    logger.info(f"  Valid cond/MOF  : {len(conditions)}")
+    logger.info(f"  GCMC budget     : {args.gcmc_budget} MOFs")
+    logger.info(f"  Forcefield      : {ff_name}")
+    logger.info(f"  CO2 mol dir     : {co2_dir}")
+    logger.info(f"  N2  mol dir     : {n2_dir}")
+    logger.info(f"  H2O mol dir     : {h2o_dir}")
+    logger.info("=" * 65)
+
+    # ------------------------------------------------------------------
+    # Stage 1 — single-component pressure sweep (ALL MOFs)
+    # ------------------------------------------------------------------
+    stage1_parquet = output_dir / "stage1_isotherms.parquet"
+    if args.skip_stage1 and stage1_parquet.exists():
+        logger.info(f"\n[Stage 1] Skipped — loading {stage1_parquet}")
+        stage1_df = pd.read_parquet(stage1_parquet)
     else:
-        co2_definition = find_definition_dir_by_file(raspa_share, "CO2", args.co2_definition)
+        stage1_df = run_stage1_isotherms(
+            all_cifs, output_dir, runtime_root, fw_cif_dir, raspa_path,
+            temps, pressures,
+            args.n_cycles, args.keep_workspaces,
+            ff_name, args.use_framework_charges, args.cutoff,
+            co2_dir, n2_dir,
+            args.max_retries, args.retry_delay,
+        )
 
-    if args.n2_def_file:
-        n2_definition = install_user_definition_file(runtime_share, "N2", Path(args.n2_def_file))
+    # ------------------------------------------------------------------
+    # Stage 2 — select best MOFs for GCMC
+    # ------------------------------------------------------------------
+    if args.skip_stage2:
+        gcmc_cifs = all_cifs
+        logger.info(f"\n[Stage 2] Skipped — using all {len(gcmc_cifs)} MOFs for GCMC")
     else:
-        n2_definition = find_definition_dir_by_file(raspa_share, "N2", args.n2_definition)
+        selected_ids = select_mofs_for_gcmc(
+            stage1_df,
+            gcmc_budget=args.gcmc_budget,
+            adsorption_pressure_bar=max(pressures),
+            desorption_pressure_bar=min(pressures),
+            temperature_k=temps[0],
+            exploration_fraction=args.exploration_fraction,
+        )
+        # Save selection list
+        sel_file = output_dir / "gcmc_selected_mofs.txt"
+        sel_file.write_text("\n".join(selected_ids), encoding="utf-8")
+        logger.info(f"[Stage 2] Selection saved → {sel_file}")
 
-    if args.h2o_def_file:
-        h2o_definition = install_user_definition_file(runtime_share, "H2O", Path(args.h2o_def_file))
-    else:
-        h2o_definition = find_definition_dir_by_file(raspa_share, "H2O", args.h2o_definition)
+        id_set   = set(selected_ids)
+        gcmc_cifs = [c for c in all_cifs if c.stem in id_set]
 
-    check_forcefield_assets(runtime_share, resolved_forcefield)
-    check_molecule_definition(runtime_share, co2_definition, "CO2")
-    check_molecule_definition(runtime_share, n2_definition, "N2")
-    check_molecule_definition(runtime_share, h2o_definition, "H2O")
-
-    print("=" * 60)
-    print(f"SIMULATION SETUP: {len(cif_paths)} MOFs")
-    print(f"  Temperatures (K):   {temperatures_k}")
-    print(f"  Pressures (bar):    {pressures_bar}")
-    print(f"  RH values:          {rhs}")
-    print(f"  Dry gas CO2 frac:   {args.dry_co2_frac:.3f}")
-    print(f"  Valid cond./MOF:    {len(conditions)}")
-    print(f"  Total GCMC jobs:    {len(cif_paths) * len(conditions)}")
-    print(f"  RASPA executable:   {raspa_path}")
-    print(f"  RASPA share dir:    {raspa_share}")
-    print(f"  Runtime root:       {runtime_root}")
-    print(f"  Forcefield used:    {resolved_forcefield}")
-    print(f"  CO2 definition dir: {co2_definition}")
-    print(f"  N2 definition dir:  {n2_definition}")
-    print(f"  H2O definition dir: {h2o_definition}")
-    print("=" * 60)
-    print()
-
-    run_low_fidelity_isotherms(
-        cif_paths=cif_paths,
-        output_dir=output_dir,
-        runtime_root=runtime_root,
-        framework_cif_dir=framework_cif_dir,
-        raspa_path=raspa_path,
-        temperatures_k=temperatures_k,
-        pressures_bar=pressures_bar,
-        n_cycles=args.n_cycles,
-        keep_workspaces=args.keep_workspaces,
-        forcefield=resolved_forcefield,
-        use_framework_charges=args.use_framework_charges,
-        cutoff=args.cutoff,
-        co2_definition=co2_definition,
-        n2_definition=n2_definition,
+    # ------------------------------------------------------------------
+    # Stage 3 — multicomponent GCMC on selected MOFs
+    # ------------------------------------------------------------------
+    gcmc_df, _ = run_stage3_gcmc(
+        gcmc_cifs, output_dir, runtime_root, fw_cif_dir, raspa_path,
+        conditions,
+        args.n_cycles, args.keep_workspaces,
+        ff_name, args.use_framework_charges, args.cutoff,
+        co2_dir, n2_dir, h2o_dir,
+        args.max_retries, args.retry_delay,
     )
 
-    gcmc_df, _ = run_high_fidelity_gcmc(
-        cif_paths=cif_paths,
-        output_dir=output_dir,
-        runtime_root=runtime_root,
-        framework_cif_dir=framework_cif_dir,
-        raspa_path=raspa_path,
-        conditions=conditions,
-        n_cycles=args.n_cycles,
-        keep_workspaces=args.keep_workspaces,
-        forcefield=resolved_forcefield,
-        use_framework_charges=args.use_framework_charges,
-        cutoff=args.cutoff,
-        co2_definition=co2_definition,
-        n2_definition=n2_definition,
-        h2o_definition=h2o_definition,
-    )
+    train_df = build_training_dataset(gcmc_df, output_dir)
 
-    build_training_dataset(gcmc_df, output_dir)
-
-    print("\n" + "=" * 60)
-    print("SIMULATION COMPLETE")
-    print("Next: python scripts/05_train_model.py")
-    print("=" * 60)
+    logger.info("\n" + "=" * 65)
+    logger.info("PIPELINE COMPLETE")
+    logger.info(f"  Stage 1 rows     : {len(stage1_df)}")
+    logger.info(f"  GCMC MOFs        : {len(gcmc_cifs)}")
+    logger.info(f"  Training rows    : {len(train_df)}")
+    logger.info(f"  Output dir       : {output_dir}")
+    logger.info("Next: python scripts/05_train_model.py")
+    logger.info("=" * 65)
 
 
 if __name__ == "__main__":

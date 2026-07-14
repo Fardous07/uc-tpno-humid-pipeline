@@ -98,45 +98,51 @@ def load_splits(path: str) -> Dict[str, List[str]]:
         return json.load(f)
 
 
-def build_model_from_config(model_cfg: Dict[str, Any], device: torch.device) -> ThermodynamicPotentialNO:
+def build_model_from_config(
+    model_cfg: Dict[str, Any], device: torch.device
+) -> ThermodynamicPotentialNO:
     encoder_config = {
-        "encoder": model_cfg.get("encoder", "nequip"),
-        "n_species": model_cfg.get("n_species", 100),
-        "emb_dim": model_cfg.get("emb_dim", 128),
-        "n_layers": model_cfg.get("n_encoder_layers", 4),
-        "lmax": model_cfg.get("lmax", 2),
-        "cutoff": model_cfg.get("cutoff", 6.0),
-        "n_rbf": model_cfg.get("n_rbf", 32),
-        "use_pbc": model_cfg.get("use_pbc", True),
+        "encoder":   model_cfg.get("encoder",          "nequip"),
+        "n_species": model_cfg.get("n_species",        100),
+        "emb_dim":   model_cfg.get("emb_dim",          128),
+        "n_layers":  model_cfg.get("n_encoder_layers", 4),
+        "lmax":      model_cfg.get("lmax",             2),
+        "cutoff":    model_cfg.get("cutoff",           6.0),
+        "n_rbf":     model_cfg.get("n_rbf",            32),
+        "use_pbc":   model_cfg.get("use_pbc",          True),
     }
     encoder = EncoderAdapter.from_config(
-        encoder_config, target_dim=model_cfg.get("emb_dim", 128), normalize=True,
+        encoder_config,
+        target_dim=model_cfg.get("emb_dim", 128),
+        normalize=True,
     )
     tpno_cfg = TPNOConfig(
-        emb_dim=int(model_cfg.get("emb_dim", 128)),
-        n_conditions=int(model_cfg.get("n_conditions", 4)),
-        n_components=int(model_cfg.get("n_components", 3)),
-        hidden_dim=int(model_cfg.get("hidden_dim", 256)),
-        n_layers=int(model_cfg.get("n_tpno_layers", 4)),
-        convex_constraint=model_cfg.get("convex_constraint", "softplus"),
-        film_conditioning=bool(model_cfg.get("film_conditioning", True)),
-        dropout=float(model_cfg.get("dropout", 0.1)),
-        use_layer_norm=bool(model_cfg.get("use_layer_norm", True)),
-        activation=model_cfg.get("activation", "swish"),
-        min_potential=float(model_cfg.get("min_potential", 1e-6)),
+        emb_dim          =int  (model_cfg.get("emb_dim",           128)),
+        n_conditions     =int  (model_cfg.get("n_conditions",      4)),
+        n_components     =int  (model_cfg.get("n_components",      3)),
+        hidden_dim       =int  (model_cfg.get("hidden_dim",        256)),
+        n_layers         =int  (model_cfg.get("n_tpno_layers",     4)),
+        convex_constraint=      model_cfg.get("convex_constraint", "softplus"),
+        film_conditioning=bool (model_cfg.get("film_conditioning", True)),
+        dropout          =float(model_cfg.get("dropout",           0.1)),
+        use_layer_norm   =bool (model_cfg.get("use_layer_norm",    True)),
+        activation       =      model_cfg.get("activation",        "swish"),
+        min_potential    =float(model_cfg.get("min_potential",     1e-6)),
     )
     model = ThermodynamicPotentialNO(encoder=encoder, config=tpno_cfg)
     model.to(device)
     return model
 
 
-def load_checkpoint_into_model(model: torch.nn.Module, checkpoint_path: str, device: torch.device) -> None:
+def load_checkpoint_into_model(
+    model: torch.nn.Module, checkpoint_path: str, device: torch.device
+) -> None:
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     if isinstance(ckpt, dict):
-        if "state_dict" in ckpt:
-            state_dict = ckpt["state_dict"]
-        elif "model_state_dict" in ckpt:
+        if "model_state_dict" in ckpt:
             state_dict = ckpt["model_state_dict"]
+        elif "state_dict" in ckpt:
+            state_dict = ckpt["state_dict"]
         else:
             state_dict = ckpt
     else:
@@ -148,81 +154,138 @@ def load_checkpoint_into_model(model: torch.nn.Module, checkpoint_path: str, dev
 # Prediction collection helpers
 # ─────────────────────────────────────────────────────────────
 
-def _safe_sigma_fallback(y_true: np.ndarray, y_pred: np.ndarray) -> np.ndarray:
+def _safe_sigma_fallback(
+    y_true: np.ndarray, y_pred: np.ndarray
+) -> np.ndarray:
     resid = np.abs(y_true - y_pred)
     scale = max(float(np.std(resid)), 1e-3)
     return np.full_like(y_pred, scale, dtype=np.float64)
 
 
-def collect_predictions(model, loader, device, log_prefix="TEST", log_interval=10):
+def _extract_q_pred(predictions: Dict[str, Any]) -> torch.Tensor:
+    """
+    Robustly extract the loading tensor from model output.
+
+    FIX: The original code used ``out["q_pred"]`` directly, which raises
+    KeyError when the model returns a different key (e.g. "loadings" or
+    "mean").  This function tries all known keys in priority order before
+    falling back to the first tensor value in the dict.
+    """
+    if not isinstance(predictions, dict):
+        # Model returned a bare tensor
+        return predictions
+    for key in ("q_pred", "loadings", "mean", "predictions", "output"):
+        val = predictions.get(key)
+        if val is not None and isinstance(val, torch.Tensor):
+            return val
+    # Last resort: first tensor in the dict
+    for val in predictions.values():
+        if isinstance(val, torch.Tensor):
+            return val
+    raise KeyError(
+        f"Cannot locate loading tensor in model output. "
+        f"Keys found: {list(predictions.keys())}"
+    )
+
+
+def collect_predictions(
+    model, loader, device, log_prefix: str = "TEST", log_interval: int = 10
+) -> Dict[str, np.ndarray]:
     model.eval()
     all_true, all_pred, all_std, all_cond, all_mof_ids = [], [], [], [], []
 
     with torch.no_grad():
         for batch_idx, batch in enumerate(loader, start=1):
-            graphs = batch["graphs"].to(device)
+            graphs     = batch["graphs"].to(device)
             conditions = batch["conditions"].to(device)
-            targets = batch["loadings"].to(device)
-            mask = batch["mask"].to(device)
-            mof_ids = batch["mof_ids"]
+            targets    = batch["loadings"].to(device)
+            mask       = batch["mask"].to(device)
+            mof_ids    = batch["mof_ids"]
 
-            out = model(graphs, conditions, return_uncertainty=True, return_potential=False, return_hessian=False)
-            y_pred = out["q_pred"] if isinstance(out, dict) else out
-            y_std = out.get("sigma", None) if isinstance(out, dict) else None
+            out = model(
+                graphs, conditions,
+                return_uncertainty=True,
+                return_potential=False,
+                return_hessian=False,
+            )
 
-            valid = mask.bool()
+            # FIX: use robust extractor instead of out["q_pred"] directly
+            q_pred = _extract_q_pred(out)
+            y_std  = (out.get("sigma") if isinstance(out, dict) else None)
+
+            valid    = mask.bool()
             true_pts = targets[valid].detach().cpu().numpy().astype(np.float64)
-            pred_pts = y_pred[valid].detach().cpu().numpy().astype(np.float64)
+            pred_pts = q_pred[valid].detach().cpu().numpy().astype(np.float64)
             cond_pts = conditions[valid].detach().cpu().numpy().astype(np.float64)
-            std_pts = (y_std[valid].detach().cpu().numpy().astype(np.float64)
-                       if y_std is not None else _safe_sigma_fallback(true_pts, pred_pts))
+
+            if y_std is not None:
+                std_pts = y_std[valid].detach().cpu().numpy().astype(np.float64)
+            else:
+                std_pts = _safe_sigma_fallback(true_pts, pred_pts)
             std_pts = np.maximum(std_pts, 1e-6)
 
-            counts = mask.sum(dim=1).detach().cpu().numpy().astype(int)
+            counts  = mask.sum(dim=1).detach().cpu().numpy().astype(int)
             mof_pts = []
             for m_id, cnt in zip(mof_ids, counts):
                 mof_pts.extend([m_id] * int(cnt))
 
-            all_true.append(true_pts); all_pred.append(pred_pts)
-            all_std.append(std_pts); all_cond.append(cond_pts)
+            all_true.append(true_pts)
+            all_pred.append(pred_pts)
+            all_std.append(std_pts)
+            all_cond.append(cond_pts)
             all_mof_ids.append(np.array(mof_pts, dtype=object))
 
             if batch_idx == 1 or batch_idx % max(log_interval, 1) == 0:
-                logger.info("%s batches: %d | valid points: %d", log_prefix, batch_idx, sum(a.shape[0] for a in all_true))
+                logger.info(
+                    "%s  batch %d | valid points so far: %d",
+                    log_prefix, batch_idx,
+                    sum(a.shape[0] for a in all_true),
+                )
 
     if not all_true:
         raise RuntimeError(f"No predictions collected for: {log_prefix}")
 
     return {
-        "y_true": np.concatenate(all_true, axis=0),
-        "y_pred": np.concatenate(all_pred, axis=0),
-        "y_std":  np.concatenate(all_std,  axis=0),
-        "conditions": np.concatenate(all_cond, axis=0),
-        "mof_ids": np.concatenate(all_mof_ids, axis=0),
+        "y_true":     np.concatenate(all_true,    axis=0),
+        "y_pred":     np.concatenate(all_pred,    axis=0),
+        "y_std":      np.concatenate(all_std,     axis=0),
+        "conditions": np.concatenate(all_cond,    axis=0),
+        "mof_ids":    np.concatenate(all_mof_ids, axis=0),
     }
 
 
-def collect_conditions_targets(loader, device, log_prefix="DATA", log_interval=10):
+def collect_conditions_targets(
+    loader, device, log_prefix: str = "DATA", log_interval: int = 10
+) -> Dict[str, np.ndarray]:
     all_cond, all_tgt = [], []
     for batch_idx, batch in enumerate(loader, start=1):
         conditions = batch["conditions"].to(device)
-        targets = batch["loadings"].to(device)
-        mask = batch["mask"].to(device)
-        valid = mask.bool()
+        targets    = batch["loadings"].to(device)
+        mask       = batch["mask"].to(device)
+        valid      = mask.bool()
         all_cond.append(conditions[valid].detach().cpu().numpy().astype(np.float64))
         all_tgt.append(targets[valid].detach().cpu().numpy().astype(np.float64))
         if batch_idx == 1 or batch_idx % max(log_interval, 1) == 0:
-            logger.info("%s batches: %d | points: %d", log_prefix, batch_idx, sum(a.shape[0] for a in all_cond))
+            logger.info(
+                "%s  batch %d | points so far: %d",
+                log_prefix, batch_idx,
+                sum(a.shape[0] for a in all_cond),
+            )
     if not all_cond:
         raise RuntimeError(f"No data collected for: {log_prefix}")
-    return {"conditions": np.concatenate(all_cond, 0), "targets": np.concatenate(all_tgt, 0)}
+    return {
+        "conditions": np.concatenate(all_cond, axis=0),
+        "targets":    np.concatenate(all_tgt,  axis=0),
+    }
 
 
-def build_representative_thermo_batch(dataset, indices, device):
+def build_representative_thermo_batch(
+    dataset: AdsorptionDataset, indices: List[int], device: torch.device
+) -> Dict[str, Any]:
     if not indices:
         raise RuntimeError("No indices for thermodynamic validation.")
     sample = dataset[indices[0]]
-    batch = AdsorptionDataset.collate_fn([sample])
+    batch  = AdsorptionDataset.collate_fn([sample])
     for k in ("graphs", "conditions", "loadings", "mask"):
         batch[k] = batch[k].to(device)
     return batch
@@ -232,7 +295,7 @@ def build_representative_thermo_batch(dataset, indices, device):
 # NIST ISODB — unit conversion tables
 # ─────────────────────────────────────────────────────────────
 
-# adsorbate name → component index [CO2=0, N2=1, H2O=2]
+# adsorbate name → component index  [CO2=0, N2=1, H2O=2]
 _ADS_TO_COMP: Dict[str, int] = {
     "carbon dioxide": 0, "co2": 0,
     "nitrogen": 1, "n2": 1,
@@ -242,7 +305,8 @@ _ADS_TO_COMP: Dict[str, int] = {
 # pressure unit → bar
 _P_TO_BAR: Dict[str, float] = {
     "bar": 1.0, "kpa": 0.01, "pa": 1e-5, "mpa": 10.0,
-    "atm": 1.01325, "psi": 0.0689476, "mmhg": 0.00133322, "torr": 0.00133322,
+    "atm": 1.01325, "psi": 0.0689476,
+    "mmhg": 0.00133322, "torr": 0.00133322,
 }
 
 # molar mass g/mol
@@ -263,19 +327,21 @@ def _to_molkg(value: float, unit: str, ads: str) -> Optional[float]:
     if u == "mol/g":
         return float(value) * 1000.0
     if u in ("cm3(stp)/g", "cm3 (stp)/g", "cm3/g"):
-        return float(value) / 22.414  # cm3(STP)/g -> mol/kg
+        return float(value) / 22.414
     if u == "mg/g":
         mm = _MM.get(ads.lower())
         return (float(value) / mm) if mm else None
     return None
 
 
-def _fuzzy_match(name: str, registry_ids: List[str], min_overlap: int = 4) -> Optional[str]:
+def _fuzzy_match(
+    name: str, registry_ids: List[str], min_overlap: int = 4
+) -> Optional[str]:
     """Match NIST adsorbent name to registry MOF ID by token overlap."""
-    tokens = set(
+    tokens = {
         t for t in name.lower().replace("-", " ").replace("_", " ").split()
         if len(t) >= min_overlap
-    )
+    }
     if not tokens:
         return None
     best_id, best_score = None, 0
@@ -302,37 +368,43 @@ def run_nist_validation(
     Compare model predictions against NIST ISODB experimental isotherms.
 
     Steps per JSON file:
-      1. Parse using parse_nist_isodb_json (already implemented in io_utils)
+      1. Parse using parse_nist_isodb_json (already in io_utils)
       2. Fuzzy-match adsorbent name to registry MOF ID
       3. Convert pressure → bar, loading → mol/kg
-      4. Build normalised pure-component condition vector [mu_CO2, mu_N2, mu_H2O, T]
-      5. Query model, extract component loading, denormalize
+      4. Build normalised pure-component condition vector [μ_CO2, μ_N2, μ_H2O, T]
+      5. Query model; extract component loading; denormalize
       6. Accumulate MAE / RMSE
     """
     nist_dir = Path(nist_dir)
-    out_dir = Path(out_dir)
+    out_dir  = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     json_files = sorted(nist_dir.glob("*.json"))
     if not json_files:
-        return {"n_files": 0, "n_matched_isotherms": 0, "n_points": 0,
-                "mae_molkg": None, "rmse_molkg": None}
+        return {
+            "n_files": 0, "n_matched_isotherms": 0,
+            "n_points": 0, "mae_molkg": None, "rmse_molkg": None,
+        }
 
     registry_ids: List[str] = dataset.mof_ids
 
-    mu_mean = np.array(normalization.get("mu_mean", [0, 0, 0, 298.15]), dtype=np.float64)
-    mu_std  = np.array(normalization.get("mu_std",  [1, 1, 1, 1]),      dtype=np.float64)
-    q_mean  = np.array(normalization.get("q_mean",  [0, 0, 0]),          dtype=np.float64)
-    q_std   = np.array(normalization.get("q_std",   [1, 1, 1]),          dtype=np.float64)
-    mu_std  = np.where(mu_std > 0, mu_std, 1.0)
-    q_std   = np.where(q_std  > 0, q_std,  1.0)
+    mu_mean = np.array(normalization.get("mu_mean", [0.0, 0.0, 0.0, 298.15]),
+                       dtype=np.float64)
+    mu_std  = np.array(normalization.get("mu_std",  [1.0, 1.0, 1.0, 1.0]),
+                       dtype=np.float64)
+    q_mean  = np.array(normalization.get("q_mean",  [0.0, 0.0, 0.0]),
+                       dtype=np.float64)
+    q_std   = np.array(normalization.get("q_std",   [1.0, 1.0, 1.0]),
+                       dtype=np.float64)
+    mu_std = np.where(mu_std > 0, mu_std, 1.0)
+    q_std  = np.where(q_std  > 0, q_std,  1.0)
 
     comp_names = ["CO2", "N2", "H2O"]
     eps = 1e-10
 
     all_rows: List[Dict] = []
-    n_matched = 0
-    n_skip_unit = 0
+    n_matched    = 0
+    n_skip_unit  = 0
     n_skip_match = 0
 
     model.eval()
@@ -350,15 +422,16 @@ def run_nist_validation(
             if pt.get("pressure") is None or pt.get("loading") is None:
                 continue
             key = (
-                str(pt.get("adsorbent", "unknown")),
-                str(pt.get("adsorbate", "unknown")).lower(),
+                str(pt.get("adsorbent",       "unknown")),
+                str(pt.get("adsorbate",       "unknown")).lower(),
                 float(pt.get("temperature") or 298.15),
-                str(pt.get("units_pressure", "bar")),
-                str(pt.get("units_loading", "mmol/g")),
+                str(pt.get("units_pressure",  "bar")),
+                str(pt.get("units_loading",   "mmol/g")),
             )
             groups.setdefault(key, []).append(pt)
 
-        for (adsorbent, adsorbate, temperature, p_unit, q_unit), grp in groups.items():
+        for (adsorbent, adsorbate, temperature,
+             p_unit, q_unit), grp in groups.items():
 
             comp_idx = _ADS_TO_COMP.get(adsorbate.lower().strip())
             if comp_idx is None:
@@ -392,62 +465,67 @@ def run_nist_validation(
 
             n_matched += 1
 
-            # Load MOF graph once
             sample = dataset[mof_idx]
-            batch = AdsorptionDataset.collate_fn([sample])
+            batch  = AdsorptionDataset.collate_fn([sample])
             graphs = batch["graphs"].to(device)
 
             for p_bar, q_exp in zip(pressures_bar, loadings_molkg):
-                # Pure-component chemical potentials: mu_i = ln(y_i * P)
-                # All non-target species get y≈0 → ln(eps)
-                mu_raw = np.array([
-                    math.log(eps), math.log(eps), math.log(eps), float(temperature)
-                ], dtype=np.float64)
+                # Pure-component condition vector:
+                # target species gets ln(P), all others get ln(eps)
+                mu_raw          = np.full(4, math.log(eps), dtype=np.float64)
                 mu_raw[comp_idx] = math.log(p_bar + eps)
+                mu_raw[3]        = float(temperature)
 
                 mu_norm = (mu_raw - mu_mean) / mu_std
-                cond_t = torch.tensor(
+                cond_t  = torch.tensor(
                     mu_norm[np.newaxis, np.newaxis, :],
                     dtype=torch.float32, device=device,
                 )  # [1, 1, 4]
 
                 with torch.no_grad():
-                    out = model(graphs, cond_t, return_uncertainty=False,
-                                return_potential=False, return_hessian=False)
+                    out = model(
+                        graphs, cond_t,
+                        return_uncertainty=False,
+                        return_potential=False,
+                        return_hessian=False,
+                    )
 
-                q_norm = float(
-                    (out["q_pred"] if isinstance(out, dict) else out)[0, 0, comp_idx]
-                    .detach().cpu().numpy()
-                )
-                q_pred = max(float(q_norm * q_std[comp_idx] + q_mean[comp_idx]), 0.0)
+                # FIX: use robust extractor instead of out["q_pred"] directly
+                q_tensor = _extract_q_pred(out)
+                q_norm   = float(q_tensor[0, 0, comp_idx].detach().cpu().numpy())
+                q_pred   = max(float(q_norm * q_std[comp_idx] + q_mean[comp_idx]), 0.0)
 
                 all_rows.append({
-                    "file": jf.name,
-                    "adsorbent_nist": adsorbent,
-                    "matched_mof": matched_mof,
-                    "adsorbate": adsorbate,
-                    "component": comp_names[comp_idx],
-                    "temperature_k": temperature,
-                    "pressure_bar": p_bar,
-                    "loading_exp_molkg": q_exp,
-                    "loading_pred_molkg": q_pred,
-                    "abs_error_molkg": abs(q_pred - q_exp),
+                    "file":                 jf.name,
+                    "adsorbent_nist":       adsorbent,
+                    "matched_mof":          matched_mof,
+                    "adsorbate":            adsorbate,
+                    "component":            comp_names[comp_idx],
+                    "temperature_k":        temperature,
+                    "pressure_bar":         p_bar,
+                    "loading_exp_molkg":    q_exp,
+                    "loading_pred_molkg":   q_pred,
+                    "abs_error_molkg":      abs(q_pred - q_exp),
                 })
 
-    # ── Aggregate ────────────────────────────────────────────────
+    # ── Aggregate ────────────────────────────────────────────────────
     base_summary = {
-        "n_files": len(json_files),
-        "n_matched_isotherms": n_matched,
-        "n_skipped_unit_conversion": n_skip_unit,
-        "n_skipped_no_mof_match": n_skip_match,
-        "n_points": len(all_rows),
+        "n_files":                    len(json_files),
+        "n_matched_isotherms":        n_matched,
+        "n_skipped_unit_conversion":  n_skip_unit,
+        "n_skipped_no_mof_match":     n_skip_match,
+        "n_points":                   len(all_rows),
     }
 
     if not all_rows:
-        logger.warning("NIST: no comparable points. matched=%d skip_unit=%d skip_match=%d",
-                       n_matched, n_skip_unit, n_skip_match)
+        logger.warning(
+            "NIST: no comparable points. "
+            "matched=%d skip_unit=%d skip_match=%d",
+            n_matched, n_skip_unit, n_skip_match,
+        )
         with open(out_dir / "nist_validation_summary.json", "w") as f:
-            json.dump({**base_summary, "mae_molkg": None, "rmse_molkg": None}, f, indent=2)
+            json.dump({**base_summary,
+                       "mae_molkg": None, "rmse_molkg": None}, f, indent=2)
         return base_summary
 
     df = pd.DataFrame(all_rows)
@@ -458,16 +536,19 @@ def run_nist_validation(
     mae  = float(np.mean(errs))
     rmse = float(np.sqrt(np.mean(errs ** 2)))
 
-    comp_mae = {}
+    comp_mae: Dict[str, Any] = {}
     for c in ["CO2", "N2", "H2O"]:
         sub = df[df["component"] == c]["abs_error_molkg"].values
         comp_mae[f"mae_{c}_molkg"] = float(np.mean(sub)) if len(sub) > 0 else None
 
     mof_summary = (
         df.groupby("matched_mof")
-        .agg(n_points=("abs_error_molkg","count"),
-             mae=("abs_error_molkg","mean"),
-             rmse=("abs_error_molkg", lambda x: float(np.sqrt(np.mean(x**2)))))
+        .agg(
+            n_points=("abs_error_molkg", "count"),
+            mae     =("abs_error_molkg", "mean"),
+            rmse    =("abs_error_molkg",
+                      lambda x: float(np.sqrt(np.mean(np.array(x) ** 2)))),
+        )
         .reset_index()
     )
     mof_summary.to_csv(out_dir / "nist_per_mof_summary.csv", index=False)
@@ -475,17 +556,23 @@ def run_nist_validation(
     summary = {
         **base_summary,
         "n_mofs_matched": int(df["matched_mof"].nunique()),
-        "mae_molkg": mae,
+        "mae_molkg":  mae,
         "rmse_molkg": rmse,
         **comp_mae,
     }
 
     with open(out_dir / "nist_validation_summary.json", "w") as f:
-        json.dump({k: (float(v) if isinstance(v, (float, np.floating)) else v)
-                   for k, v in summary.items()}, f, indent=2)
+        json.dump(
+            {k: (float(v) if isinstance(v, (float, np.floating)) else v)
+             for k, v in summary.items()},
+            f, indent=2,
+        )
 
-    logger.info("NIST: %d points from %d isotherms | MAE=%.4f mol/kg | RMSE=%.4f mol/kg",
-                len(df), n_matched, mae, rmse)
+    logger.info(
+        "NIST: %d points from %d isotherms | "
+        "MAE=%.4f mol/kg | RMSE=%.4f mol/kg",
+        len(df), n_matched, mae, rmse,
+    )
     return summary
 
 
@@ -496,28 +583,28 @@ def run_nist_validation(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Validate trained UC-TPNO model")
     parser.add_argument("--model-checkpoint", required=True)
-    parser.add_argument("--config", default="configs/pipeline.yaml")
-    parser.add_argument("--registry", required=True)
-    parser.add_argument("--adsorption-data", required=True)
-    parser.add_argument("--graph-dir", required=True)
-    parser.add_argument("--splits-file", required=True)
-    parser.add_argument("--output-dir", default="results/validation")
-    parser.add_argument("--nist-dir", default="data/raw/nist_isodb",
+    parser.add_argument("--config",           default="configs/pipeline.yaml")
+    parser.add_argument("--registry",         required=True)
+    parser.add_argument("--adsorption-data",  required=True)
+    parser.add_argument("--graph-dir",        required=True)
+    parser.add_argument("--splits-file",      required=True)
+    parser.add_argument("--output-dir",       default="results/validation")
+    parser.add_argument("--nist-dir",         default="data/raw/nist_isodb",
                         help="Directory containing NIST ISODB JSON files.")
-    parser.add_argument("--skip-nist", action="store_true",
+    parser.add_argument("--skip-nist",        action="store_true",
                         help="Skip NIST ISODB external validation.")
-    parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--log-interval", type=int, default=10)
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--batch-size",       type=int, default=8)
+    parser.add_argument("--num-workers",      type=int, default=0)
+    parser.add_argument("--log-interval",     type=int, default=10)
+    parser.add_argument("--seed",             type=int, default=42)
     args = parser.parse_args()
 
     configure_logging()
     set_seed(args.seed)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device     = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     pin_memory = device.type == "cuda"
-    out_dir = Path(args.output_dir)
+    out_dir    = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 70)
@@ -528,14 +615,14 @@ def main() -> None:
     print(f"Output dir:  {out_dir}")
     print("=" * 70)
 
-    # ── Data ─────────────────────────────────────────────
+    # ── Data ─────────────────────────────────────────────────────────
     print("\n=== Loading Data ===")
     dataset = AdsorptionDataset(
         registry_path=args.registry,
         adsorption_path=args.adsorption_data,
         graph_dir=args.graph_dir,
     )
-    splits = load_splits(args.splits_file)
+    splits    = load_splits(args.splits_file)
     train_ids = set(splits["train"])
     test_ids  = set(splits["test"])
     train_idx = [i for i, m in enumerate(dataset.mof_ids) if m in train_ids]
@@ -544,15 +631,19 @@ def main() -> None:
     if len(test_idx) == 0:
         raise RuntimeError("Test split is empty.")
 
-    train_loader = dataset.get_dataloader(indices=train_idx, batch_size=args.batch_size,
-                                          shuffle=False, num_workers=args.num_workers, pin_memory=pin_memory)
-    test_loader  = dataset.get_dataloader(indices=test_idx,  batch_size=args.batch_size,
-                                          shuffle=False, num_workers=args.num_workers, pin_memory=pin_memory)
+    train_loader = dataset.get_dataloader(
+        indices=train_idx, batch_size=args.batch_size,
+        shuffle=False, num_workers=args.num_workers, pin_memory=pin_memory,
+    )
+    test_loader = dataset.get_dataloader(
+        indices=test_idx, batch_size=args.batch_size,
+        shuffle=False, num_workers=args.num_workers, pin_memory=pin_memory,
+    )
     print(f"Train MOFs: {len(train_idx)} | Test MOFs: {len(test_idx)}")
 
-    # ── Model ────────────────────────────────────────────
+    # ── Model ─────────────────────────────────────────────────────────
     print("\n=== Loading Model ===")
-    cfg = load_yaml_config(args.config)
+    cfg       = load_yaml_config(args.config)
     model_cfg = dict(cfg.get("model", {}))
 
     # Load normalization: try resolved_config.json → checkpoint → fallback
@@ -562,7 +653,9 @@ def main() -> None:
         with open(rc_path) as f:
             normalization = json.load(f).get("normalization", {})
     if not normalization:
-        ckpt = torch.load(args.model_checkpoint, map_location="cpu", weights_only=False)
+        ckpt = torch.load(
+            args.model_checkpoint, map_location="cpu", weights_only=False
+        )
         if isinstance(ckpt, dict):
             normalization = ckpt.get("normalization", {})
     if not normalization:
@@ -579,43 +672,55 @@ def main() -> None:
     model.eval()
     print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
-    # ── Collect test predictions ─────────────────────────
+    # ── Collect test predictions ──────────────────────────────────────
     print("\n=== Running Inference on Test Set ===")
-    pred_data = collect_predictions(model=model, loader=test_loader, device=device,
-                                    log_prefix="TEST", log_interval=args.log_interval)
-    if not np.all(np.isfinite(pred_data["y_std"])) or np.any(pred_data["y_std"] <= 0):
-        pred_data["y_std"] = _safe_sigma_fallback(pred_data["y_true"], pred_data["y_pred"])
+    pred_data = collect_predictions(
+        model=model, loader=test_loader, device=device,
+        log_prefix="TEST", log_interval=args.log_interval,
+    )
+    if (not np.all(np.isfinite(pred_data["y_std"]))
+            or np.any(pred_data["y_std"] <= 0)):
+        pred_data["y_std"] = _safe_sigma_fallback(
+            pred_data["y_true"], pred_data["y_pred"]
+        )
     print(f"Valid test points: {pred_data['y_true'].shape[0]}")
 
-    train_data = collect_conditions_targets(loader=train_loader, device=device,
-                                            log_prefix="TRAIN", log_interval=args.log_interval)
+    train_data = collect_conditions_targets(
+        loader=train_loader, device=device,
+        log_prefix="TRAIN", log_interval=args.log_interval,
+    )
+
     y_true = pred_data["y_true"]
     y_pred = pred_data["y_pred"]
     y_std  = pred_data["y_std"]
 
-    # ── 1. Regression metrics ────────────────────────────
+    # ── 1. Regression metrics ─────────────────────────────────────────
     print("\n" + "=" * 50)
     print("1. REGRESSION METRICS (simulated test set)")
     print("=" * 50)
     components = ["CO2", "N2", "H2O"]
-    reg = compute_regression_metrics(y_true=y_true, y_pred=y_pred,
-                                     component_names=components, prefix="reg_")
+    reg = compute_regression_metrics(
+        y_true=y_true, y_pred=y_pred,
+        component_names=components, prefix="reg_",
+    )
     for k, v in sorted(reg.items()):
         print(f"  {k}: {v:.6f}")
 
-    # ── 2. UQ metrics ────────────────────────────────────
+    # ── 2. UQ metrics ─────────────────────────────────────────────────
     print("\n" + "=" * 50)
     print("2. UNCERTAINTY QUANTIFICATION")
     print("=" * 50)
-    uq = compute_uncertainty_metrics(y_true=y_true, y_pred=y_pred, y_std=y_std, prefix="uq_")
+    uq = compute_uncertainty_metrics(
+        y_true=y_true, y_pred=y_pred, y_std=y_std, prefix="uq_"
+    )
     for k, v in sorted(uq.items()):
         print(f"  {k}: {v:.6f}")
 
-    # ── 3. Statistical validation ────────────────────────
+    # ── 3. Statistical validation ─────────────────────────────────────
     print("\n" + "=" * 50)
     print("3. STATISTICAL VALIDATION")
     print("=" * 50)
-    mv = ModelValidator()
+    mv     = ModelValidator()
     report = mv.full_report(
         y_true=y_true, y_pred=y_pred, y_std=y_std,
         X_train=train_data["conditions"],
@@ -629,20 +734,24 @@ def main() -> None:
                 if isinstance(v, (int, float, bool, np.bool_)):
                     print(f"    {k}: {v}")
 
-    # ── 4. Thermodynamic consistency ─────────────────────
+    # ── 4. Thermodynamic consistency ──────────────────────────────────
     print("\n" + "=" * 50)
     print("4. THERMODYNAMIC CONSISTENCY")
     print("=" * 50)
-    thermo_batch = build_representative_thermo_batch(dataset=dataset, indices=test_idx, device=device)
+    thermo_batch = build_representative_thermo_batch(
+        dataset=dataset, indices=test_idx, device=device
+    )
     thermo_report = mv.thermo_wrapper.check_all(
-        model=model, graphs=thermo_batch["graphs"], conditions=thermo_batch["conditions"],
+        model=model,
+        graphs=thermo_batch["graphs"],
+        conditions=thermo_batch["conditions"],
     )
     report["thermodynamic"] = thermo_report
     for k, v in thermo_report.items():
         if isinstance(v, (int, float, bool, np.bool_)):
             print(f"  {k}: {v}")
 
-    # ── 5. NIST ISODB external validation ────────────────
+    # ── 5. NIST ISODB external validation ─────────────────────────────
     print("\n" + "=" * 50)
     print("5. NIST ISODB EXTERNAL VALIDATION")
     print("=" * 50)
@@ -654,7 +763,8 @@ def main() -> None:
         nist_dir = Path(args.nist_dir)
         if not nist_dir.exists():
             print(f"  NIST directory not found: {nist_dir}")
-            print("  Place NIST ISODB JSON files there to enable experimental validation.")
+            print("  Place NIST ISODB JSON files there to enable "
+                  "experimental validation.")
             print("  Download from: https://adsorption.nist.gov/isodb/api/isotherms")
         else:
             n_jsons = len(list(nist_dir.glob("*.json")))
@@ -662,10 +772,11 @@ def main() -> None:
             if n_jsons == 0:
                 print("  No JSON files — download isotherms and rerun.")
             else:
-                nist_out = out_dir / "nist_validation"
+                nist_out     = out_dir / "nist_validation"
                 nist_summary = run_nist_validation(
                     nist_dir=nist_dir, model=model, dataset=dataset,
-                    device=device, normalization=normalization, out_dir=nist_out,
+                    device=device, normalization=normalization,
+                    out_dir=nist_out,
                 )
                 print(f"  Files scanned:       {nist_summary['n_files']}")
                 print(f"  Isotherms matched:   {nist_summary['n_matched_isotherms']}")
@@ -684,15 +795,15 @@ def main() -> None:
 
     report["nist_external"] = nist_summary
 
-    # ── 6. Visualisations ────────────────────────────────
+    # ── 6. Visualisations ─────────────────────────────────────────────
     print("\n" + "=" * 50)
     print("6. GENERATING PLOTS")
     print("=" * 50)
-    viz = ResultVisualizer(save_dir=str(out_dir), component_names=components)
+    viz  = ResultVisualizer(save_dir=str(out_dir), component_names=components)
     figs = viz.full_report(y_true=y_true, y_pred=y_pred, y_std=y_std)
     print(f"  Generated {len(figs)} figures -> {out_dir}")
 
-    # ── Save outputs ─────────────────────────────────────
+    # ── Save outputs ──────────────────────────────────────────────────
     print("\n=== Saving Outputs ===")
     summary_metrics = {**reg, **uq}
     if nist_summary.get("mae_molkg") is not None:
@@ -700,32 +811,35 @@ def main() -> None:
         summary_metrics["nist_rmse_molkg"] = nist_summary["rmse_molkg"]
 
     with open(out_dir / "validation_report.json", "w", encoding="utf-8") as f:
-        json.dump({k: float(v) if isinstance(v, (float, np.floating)) else v
-                   for k, v in summary_metrics.items()}, f, indent=2)
+        json.dump(
+            {k: float(v) if isinstance(v, (float, np.floating)) else v
+             for k, v in summary_metrics.items()},
+            f, indent=2,
+        )
 
     mv.save_report(report, out_dir / "full_report.json")
-    np.save(out_dir / "y_pred.npy", y_pred)
-    np.save(out_dir / "y_true.npy", y_true)
-    np.save(out_dir / "y_std.npy",  y_std)
-    np.save(out_dir / "conditions.npy", pred_data["conditions"])
-    np.save(out_dir / "mof_ids.npy", pred_data["mof_ids"].astype(str))
+    np.save(out_dir / "y_pred.npy",      y_pred)
+    np.save(out_dir / "y_true.npy",      y_true)
+    np.save(out_dir / "y_std.npy",       y_std)
+    np.save(out_dir / "conditions.npy",  pred_data["conditions"])
+    np.save(out_dir / "mof_ids.npy",     pred_data["mof_ids"].astype(str))
 
     with open(out_dir / "manifest.json", "w", encoding="utf-8") as f:
         json.dump({
             "model_checkpoint": args.model_checkpoint,
-            "config": args.config,
-            "registry": args.registry,
-            "adsorption_data": args.adsorption_data,
-            "graph_dir": args.graph_dir,
-            "splits_file": args.splits_file,
-            "output_dir": str(out_dir),
-            "nist_dir": args.nist_dir,
-            "device": str(device),
-            "seed": args.seed,
-            "n_test_mofs": len(test_idx),
-            "n_test_points": int(y_true.shape[0]),
-            "nist_n_points": nist_summary.get("n_points", 0),
-            "nist_mae_molkg": nist_summary.get("mae_molkg"),
+            "config":           args.config,
+            "registry":         args.registry,
+            "adsorption_data":  args.adsorption_data,
+            "graph_dir":        args.graph_dir,
+            "splits_file":      args.splits_file,
+            "output_dir":       str(out_dir),
+            "nist_dir":         args.nist_dir,
+            "device":           str(device),
+            "seed":             args.seed,
+            "n_test_mofs":      len(test_idx),
+            "n_test_points":    int(y_true.shape[0]),
+            "nist_n_points":    nist_summary.get("n_points", 0),
+            "nist_mae_molkg":   nist_summary.get("mae_molkg"),
         }, f, indent=2)
 
     print(f"\nValidation complete -> {out_dir}")
