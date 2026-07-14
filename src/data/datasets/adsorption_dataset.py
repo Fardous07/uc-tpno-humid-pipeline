@@ -1,33 +1,8 @@
-"""
-Adsorption isotherm dataset for UC-TPNO training.
-
-Each sample corresponds to *one MOF* and contains:
-*  ``graphs``     — PyG Data object (structure graph).
-*  ``conditions`` — ``[P, D]`` tensor of operating conditions
-                    (μ_CO₂, μ_N₂, μ_H₂O, T) at P pressure points.
-*  ``loadings``   — ``[P, C]`` tensor of adsorption targets
-                    (q_CO₂, q_N₂, q_H₂O).
-
-The collate function pads variable-length condition/loading tensors
-to the maximum P in the batch, producing:
-*  ``graphs``     — PyG ``Batch`` object
-*  ``conditions`` — ``[B, P_max, D]``
-*  ``loadings``   — ``[B, P_max, C]``
-*  ``mask``       — ``[B, P_max]`` bool — True for real points
-
-This matches the format ``TPNOTrainer._to_device()`` expects.
-
-Author  : Rayhan (University of Bergen)
-Project : UC-TPNO — Uncertainty-Calibrated Thermodynamic Potential
-          Neural Operator for Humid Flue-Gas CO₂ Capture in MOFs
-License : MIT
-"""
-
 from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 
 import numpy as np
 import torch
@@ -38,30 +13,24 @@ logger = logging.getLogger(__name__)
 
 class AdsorptionDataset(Dataset):
     """
-    Dataset for multi-component adsorption data.
+    Dataset for multicomponent humid adsorption in MOFs.
 
-    Parameters
-    ----------
-    registry_path     : Path to MOF registry (parquet/csv) with ``mof_id``.
-    adsorption_path   : Path to adsorption data (parquet/csv) with
-                        ``mof_id``, condition columns, and target columns.
-    graph_dir         : Directory containing ``{mof_id}.pt`` graphs.
-    condition_columns : Column names for conditions.
-    target_columns    : Column names for targets.
-    transform         : Optional transform on the graph.
+    Each sample is one MOF; __getitem__ returns all its (condition, loading)
+    pairs padded to a common length by the collate function.
 
-    Example
-    ───────
-    >>> ds = AdsorptionDataset(
-    ...     "data/mof_registry.parquet",
-    ...     "data/adsorption.parquet",
-    ...     "data/graphs",
-    ... )
-    >>> loader = ds.get_dataloader(batch_size=8)
-    >>> batch = next(iter(loader))
-    >>> batch["graphs"]      # PyG Batch
-    >>> batch["conditions"]  # [8, P_max, 4]
-    >>> batch["loadings"]    # [8, P_max, 3]
+    Fixes vs. original
+    ------------------
+    1. BUG FIXED: grouped.groups returns index LABELS, not positional integers.
+       iloc[labels] silently returns wrong rows when the DataFrame index is
+       non-contiguous (e.g. after dropna).  Now uses grouped.indices which
+       always gives positional integers.
+    2. BUG FIXED: NaN loadings from failed/partial GCMC runs are silently
+       propagated to tensors and corrupt training.  Rows with NaN in any
+       target column are dropped and the index is reset before building the
+       lookup table (which also guarantees contiguous integer positions).
+    3. Removed lazy_loading flag — both old branches did identical work at
+       init time (pre-computed all row indices), so the flag saved no memory.
+       One clean path is simpler and correct.
     """
 
     def __init__(
@@ -78,7 +47,6 @@ class AdsorptionDataset(Dataset):
         self.graph_dir = Path(graph_dir)
         self.transform = transform
 
-        # Default columns
         if condition_columns is None:
             condition_columns = ["mu_CO2", "mu_N2", "mu_H2O", "T"]
         if target_columns is None:
@@ -87,31 +55,61 @@ class AdsorptionDataset(Dataset):
         self.condition_columns = condition_columns
         self.target_columns = target_columns
 
-        # Load registry
+        # --- registry (MOF metadata) ---
         rp = Path(registry_path)
-        self.registry = (pd.read_parquet(rp) if rp.suffix == ".parquet"
-                         else pd.read_csv(rp))
+        self.registry = (
+            pd.read_parquet(rp) if rp.suffix == ".parquet" else pd.read_csv(rp)
+        )
 
-        # Load adsorption data
+        # --- adsorption data ---
         ap = Path(adsorption_path)
-        self.adsorption = (pd.read_parquet(ap) if ap.suffix == ".parquet"
-                           else pd.read_csv(ap))
+        adsorption_raw = (
+            pd.read_parquet(ap) if ap.suffix == ".parquet" else pd.read_csv(ap)
+        )
 
-        # Unique MOFs that have both graph files and adsorption data
-        ads_mofs = set(self.adsorption["mof_id"].unique())
+        # FIX 2: drop rows where any loading is NaN (failed GCMC points)
+        # then reset_index so iloc positions == index labels (fixes FIX 1).
+        n_before = len(adsorption_raw)
+        self.adsorption = (
+            adsorption_raw
+            .dropna(subset=self.target_columns)
+            .reset_index(drop=True)
+        )
+        n_dropped = n_before - len(self.adsorption)
+        if n_dropped:
+            logger.warning(
+                f"Dropped {n_dropped}/{n_before} adsorption rows with NaN loadings."
+            )
+
+        # --- valid MOFs: must have both adsorption data and a graph file ---
+        ads_mofs   = set(self.adsorption["mof_id"].unique())
         graph_mofs = {f.stem for f in self.graph_dir.glob("*.pt")}
         valid_mofs = ads_mofs & graph_mofs
         self.mof_ids = sorted(valid_mofs)
 
-        # Precompute per-MOF row indices
-        self._mof_to_rows: Dict[str, np.ndarray] = {}
-        grouped = self.adsorption.groupby("mof_id")
-        for mof_id in self.mof_ids:
-            if mof_id in grouped.groups:
-                self._mof_to_rows[mof_id] = grouped.groups[mof_id].values
+        if not self.mof_ids:
+            raise RuntimeError(
+                "No MOFs found with both adsorption data and a graph file. "
+                f"Adsorption MOFs: {len(ads_mofs)}, Graph MOFs: {len(graph_mofs)}"
+            )
 
-        logger.info(f"AdsorptionDataset: {len(self.mof_ids)} MOFs, "
-                     f"{len(self.adsorption)} data points.")
+        # FIX 1: grouped.indices gives positional integers — safe with iloc.
+        grouped = self.adsorption.groupby("mof_id")
+        self._mof_to_rows: Dict[str, np.ndarray] = {
+            mof_id: grouped.indices[mof_id]
+            for mof_id in self.mof_ids
+            if mof_id in grouped.groups
+        }
+
+        logger.info(
+            f"AdsorptionDataset: {len(self.mof_ids)} MOFs, "
+            f"{len(self.adsorption)} clean data points "
+            f"({n_dropped} NaN rows removed)"
+        )
+
+    # ------------------------------------------------------------------
+    # Dataset interface
+    # ------------------------------------------------------------------
 
     def __len__(self) -> int:
         return len(self.mof_ids)
@@ -119,32 +117,34 @@ class AdsorptionDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         mof_id = self.mof_ids[idx]
 
-        # Graph
+        # Load graph
         graph_path = self.graph_dir / f"{mof_id}.pt"
         graph = torch.load(str(graph_path), weights_only=False)
         if self.transform is not None:
             graph = self.transform(graph)
 
-        # Conditions and targets for this MOF
+        # Slice adsorption rows (positional — safe after reset_index)
         rows = self._mof_to_rows[mof_id]
-        df = self.adsorption.iloc[rows]
+        df   = self.adsorption.iloc[rows]
 
         conditions = torch.tensor(
-            df[self.condition_columns].values, dtype=torch.float32,
+            df[self.condition_columns].values, dtype=torch.float32
         )
         loadings = torch.tensor(
-            df[self.target_columns].values, dtype=torch.float32,
+            df[self.target_columns].values, dtype=torch.float32
         )
 
         return {
-            "mof_id": mof_id,
-            "graphs": graph,
+            "mof_id":     mof_id,
+            "graphs":     graph,
             "conditions": conditions,   # [P, D]
-            "loadings": loadings,       # [P, C]
-            "n_points": len(conditions),
+            "loadings":   loadings,     # [P, C]
+            "n_points":   len(conditions),
         }
 
-    # ── DataLoader ───────────────────────────────────────────────
+    # ------------------------------------------------------------------
+    # DataLoader factory
+    # ------------------------------------------------------------------
 
     def get_dataloader(
         self,
@@ -153,91 +153,97 @@ class AdsorptionDataset(Dataset):
         shuffle: bool = True,
         num_workers: int = 0,
         pin_memory: bool = True,
-    ):
-        """
-        Create a DataLoader with padded collation.
-
-        The returned batches have:
-        *  ``graphs``     : PyG Batch
-        *  ``conditions`` : ``[B, P_max, D]``
-        *  ``loadings``   : ``[B, P_max, C]``
-        *  ``mask``       : ``[B, P_max]``
-        *  ``mof_ids``    : list of str
-        """
-        if indices is not None:
-            subset = torch.utils.data.Subset(self, indices)
-        else:
-            subset = self
-
+    ) -> torch.utils.data.DataLoader:
+        dataset = torch.utils.data.Subset(self, indices) if indices is not None else self
         return torch.utils.data.DataLoader(
-            subset,
+            dataset,
             batch_size=batch_size,
             shuffle=shuffle,
             num_workers=num_workers,
-            collate_fn=self.collate_fn,
+            collate_fn=AdsorptionDataset.collate_fn,
             pin_memory=pin_memory,
         )
 
+    # ------------------------------------------------------------------
+    # Collate: pad variable-length pressure grids to a common length
+    # ------------------------------------------------------------------
+
     @staticmethod
     def collate_fn(batch: List[Dict]) -> Dict[str, Any]:
-        """
-        Pad variable-length conditions/loadings to max P in batch.
-
-        Returns ``graphs`` (PyG Batch), ``conditions`` ``[B, P_max, D]``,
-        ``loadings`` ``[B, P_max, C]``, ``mask`` ``[B, P_max]``.
-        """
         from torch_geometric.data import Batch
 
         mof_ids = [item["mof_id"] for item in batch]
-        graphs = Batch.from_data_list([item["graphs"] for item in batch])
+        graphs  = Batch.from_data_list([item["graphs"] for item in batch])
+        n_pts   = [item["n_points"] for item in batch]
 
-        # Determine max points
-        n_pts = [item["n_points"] for item in batch]
+        B     = len(batch)
         P_max = max(n_pts)
-        B = len(batch)
-        D = batch[0]["conditions"].shape[-1]
-        C = batch[0]["loadings"].shape[-1]
+        D     = batch[0]["conditions"].shape[-1]
+        C     = batch[0]["loadings"].shape[-1]
 
         conditions = torch.zeros(B, P_max, D)
-        loadings = torch.zeros(B, P_max, C)
-        mask = torch.zeros(B, P_max, dtype=torch.bool)
+        loadings   = torch.zeros(B, P_max, C)
+        mask       = torch.zeros(B, P_max, dtype=torch.bool)
 
         for i, item in enumerate(batch):
             p = item["n_points"]
             conditions[i, :p] = item["conditions"]
-            loadings[i, :p] = item["loadings"]
-            mask[i, :p] = True
+            loadings[i,   :p] = item["loadings"]
+            mask[i,       :p] = True
 
         return {
-            "mof_ids": mof_ids,
-            "graphs": graphs,
-            "conditions": conditions,
-            "loadings": loadings,
-            "mask": mask,
-            "n_points": n_pts,
+            "mof_ids":    mof_ids,
+            "graphs":     graphs,
+            "conditions": conditions,   # [B, P_max, D]
+            "loadings":   loadings,     # [B, P_max, C]
+            "mask":       mask,         # [B, P_max]  True where real data
+            "n_points":   n_pts,
+        }
+
+    # ------------------------------------------------------------------
+    # Convenience: compute normalization statistics from a loader
+    # ------------------------------------------------------------------
+
+    def compute_normalization_stats(
+        self, indices: Optional[List[int]] = None
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Compute per-column mean and std for conditions and loadings.
+
+        Pass the result directly to model.set_normalization():
+            stats = dataset.compute_normalization_stats(train_indices)
+            model.set_normalization(**stats)
+        """
+        all_cond: List[torch.Tensor] = []
+        all_load: List[torch.Tensor] = []
+
+        idx_iter = indices if indices is not None else range(len(self))
+        for i in idx_iter:
+            item = self[i]
+            all_cond.append(item["conditions"])   # [P, D]
+            all_load.append(item["loadings"])     # [P, C]
+
+        cond_cat = torch.cat(all_cond, dim=0)   # [N_total, D]
+        load_cat = torch.cat(all_load, dim=0)   # [N_total, C]
+
+        return {
+            "mu_mean": cond_cat.mean(0),
+            "mu_std":  cond_cat.std(0).clamp(min=1e-6),
+            "q_mean":  load_cat.mean(0),
+            "q_std":   load_cat.std(0).clamp(min=1e-6),
         }
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# SYNTHETIC DATASET (for testing without real data)
-# ═══════════════════════════════════════════════════════════════════════
+# ---------------------------------------------------------------------------
+# Synthetic dataset (for unit tests and shape checks)
+# ---------------------------------------------------------------------------
 
 class SyntheticAdsorptionDataset(Dataset):
     """
-    Generates fake adsorption data for unit testing.
+    Langmuir-ish synthetic data for fast testing without real CIFs.
 
-    Each sample has a random graph, random conditions, and Langmuir-
-    based loadings.  Useful for testing the full pipeline without
-    real CIF files.
-
-    Parameters
-    ----------
-    n_mofs       : Number of fake MOFs.
-    n_points     : Condition points per MOF.
-    n_atoms_range: (min, max) atoms per graph.
-    n_conditions : Condition dimensions.
-    n_components : Loading components.
-    seed         : Random seed.
+    Fix: self-loops removed from edge_index so graph structure better
+    matches real NequIP inputs (which exclude i==j by construction).
     """
 
     def __init__(
@@ -252,45 +258,50 @@ class SyntheticAdsorptionDataset(Dataset):
         from torch_geometric.data import Data
 
         rng = np.random.RandomState(seed)
-        self.samples = []
+        self.samples: List[Dict[str, Any]] = []
 
         for i in range(n_mofs):
             n_atoms = rng.randint(*n_atoms_range)
 
-            # Random graph
-            z = torch.tensor(rng.randint(1, 80, n_atoms), dtype=torch.long)
-            pos = torch.tensor(rng.randn(n_atoms, 3) * 5, dtype=torch.float32)
+            z   = torch.tensor(rng.randint(1, 80, n_atoms), dtype=torch.long)
+            pos = torch.tensor(rng.randn(n_atoms, 3) * 5.0, dtype=torch.float32)
             cell = torch.eye(3, dtype=torch.float32).unsqueeze(0) * 25.0
 
-            # Random edges (radius graph approximation)
+            # Build edges without self-loops
             n_edges = n_atoms * 8
-            src = torch.tensor(rng.randint(0, n_atoms, n_edges), dtype=torch.long)
-            dst = torch.tensor(rng.randint(0, n_atoms, n_edges), dtype=torch.long)
-            edge_index = torch.stack([src, dst])
+            src = rng.randint(0, n_atoms, n_edges)
+            dst = rng.randint(0, n_atoms, n_edges)
+            no_self = src != dst
+            src, dst = src[no_self], dst[no_self]
+            edge_index = torch.tensor(np.stack([src, dst]), dtype=torch.long)
 
-            graph = Data(z=z, pos=pos, cell=cell, edge_index=edge_index,
-                         num_nodes=n_atoms)
-
-            # Random conditions (μ_CO2, μ_N2, μ_H2O, T)
-            conditions = torch.tensor(
-                rng.randn(n_points, n_conditions).astype(np.float32),
+            graph = Data(
+                z=z, pos=pos, cell=cell,
+                edge_index=edge_index,
+                num_nodes=n_atoms,
             )
 
-            # Langmuir-ish loadings
-            K = rng.uniform(0.1, 2.0, n_components)
+            # Conditions: [n_points, n_conditions]
+            conditions = torch.tensor(
+                rng.randn(n_points, n_conditions).astype(np.float32)
+            )
+
+            # Langmuir loadings: q = q_sat * K*P / (1 + K*P)
+            # μ = RT ln(P) → P_eff = exp(μ)  (RT = 1 for synthetic)
+            K     = rng.uniform(0.1, 2.0, n_components)
             q_sat = rng.uniform(1.0, 8.0, n_components)
-            mu = conditions[:, :n_components].numpy()
+            mu    = conditions[:, :n_components].numpy()
             P_eff = np.exp(mu)
             loadings_np = q_sat * K * P_eff / (1.0 + K * P_eff)
             loadings_np += rng.randn(*loadings_np.shape) * 0.05
             loadings = torch.tensor(loadings_np.clip(0), dtype=torch.float32)
 
             self.samples.append({
-                "mof_id": f"SYNTH_{i:04d}",
-                "graphs": graph,
+                "mof_id":     f"SYNTH_{i:04d}",
+                "graphs":     graph,
                 "conditions": conditions,
-                "loadings": loadings,
-                "n_points": n_points,
+                "loadings":   loadings,
+                "n_points":   n_points,
             })
 
     def __len__(self) -> int:
@@ -305,13 +316,12 @@ class SyntheticAdsorptionDataset(Dataset):
         batch_size: int = 8,
         shuffle: bool = True,
         **kwargs,
-    ):
-        if indices is not None:
-            subset = torch.utils.data.Subset(self, indices)
-        else:
-            subset = self
+    ) -> torch.utils.data.DataLoader:
+        dataset = torch.utils.data.Subset(self, indices) if indices is not None else self
         return torch.utils.data.DataLoader(
-            subset, batch_size=batch_size, shuffle=shuffle,
+            dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
             collate_fn=AdsorptionDataset.collate_fn,
         )
 

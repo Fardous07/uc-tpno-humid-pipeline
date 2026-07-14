@@ -1,59 +1,56 @@
 """
 Multi-fidelity Bayesian optimisation for MOF discovery.
 
-This module implements the active-learning loop that selects which MOF
-structures to simulate next, balancing exploration (high uncertainty)
-against exploitation (promising predicted performance) while accounting
-for the drastically different costs of low- vs. high-fidelity GCMC
-simulations.
-
 Architecture overview
 ─────────────────────
-1.  **Acquisition functions** — stand-alone callables that score
-    candidate MOFs.  Both model-agnostic heuristics (uncertainty
-    sampling, expected improvement, Thompson sampling) and
-    BoTorch-backed multi-objective acquisitions (qEHVI, qNEI) are
-    provided.
-2.  **FidelityManager** — maps discrete fidelity levels (e.g.
-    short GCMC, production GCMC, DFT) to wall-clock costs and decides
-    which fidelity to use for a given candidate.
-3.  **MultiFidelityBO** — the main optimisation loop.  It maintains a
-    Gaussian-process surrogate (via BoTorch when available, or a
-    lightweight fallback), proposes batches of candidates, and tracks
-    the Pareto front of multi-objective evaluations.
-4.  **UncertaintyAcquisition** — TPNO-specific acquisition that
-    combines the ensemble's epistemic uncertainty with conformal
-    prediction widths to prioritise MOFs in under-explored regions of
-    chemical space.
+1.  Acquisition functions — stand-alone callables that score candidate MOFs.
+2.  FidelityManager    — maps fidelity levels to costs.
+3.  MultiFidelityBO    — main optimisation loop with GP surrogate.
+4.  UncertaintyAcquisition — TPNO-specific acquisition (ensemble + conformal).
 
 Dependencies
 ────────────
-* **Required:** ``torch``, ``numpy``.
-* **Optional (lazy):** ``botorch``, ``gpytorch`` — used for GP
-  surrogates and analytic acquisition functions.  When absent, the
-  module falls back to simpler heuristics and logs a warning.
+* Required : ``torch``, ``numpy``.
+* Optional  : ``botorch``, ``gpytorch`` — lazy-imported; falls back to
+              heuristics when absent.
+
+Fixes vs. original
+------------------
+1. BUG FIXED: @torch.no_grad() on UncertaintyAcquisition.__call__.
+   TPNO derives loadings via autograd.grad(omega, mu).  Under no_grad,
+   requires_grad_(True) is silently ignored → RuntimeError.  Decorator
+   removed; model.eval() is sufficient.
+
+2. BUG FIXED: with torch.no_grad() in score_candidates_simple.
+   Same root cause — model call inside a no_grad context crashes TPNO.
+   Removed; the caller is responsible for gradient context.
+
+3. BUG FIXED: entropy_acquisition called ensemble members inside
+   torch.no_grad() without re-enabling gradients.  The outer no_grad
+   block has been removed; model.eval() handles dropout/BN correctly.
+
+4. BUG FIXED: qEHVI acquisition missing required partitioning argument.
+   Since BoTorch 0.6, qExpectedHypervolumeImprovement requires a
+   NondominatedPartitioning object.  Added.
+
+5. BUG FIXED: Manual Adam GP-fitting loop passed 2D train_Y directly
+   to self._mll(), which fails for single-output models that expect a
+   1D target.  Replaced with BoTorch's fit_gpytorch_mll() which handles
+   all model/output-transform combinations correctly.
 
 References
 ──────────
-[1] Lakshminarayanan et al. (2017). Simple and Scalable Predictive
-    Uncertainty Estimation using Deep Ensembles.
-[2] Balandat et al. (2020). BoTorch: A Framework for Efficient
-    Monte-Carlo Bayesian Optimization. NeurIPS.
-[3] Takeno et al. (2020). Multi-fidelity Bayesian Optimization with
-    Max-value Entropy Search. ICML.
+[1] Lakshminarayanan et al. (2017). Deep Ensembles. NeurIPS.
+[2] Balandat et al. (2020). BoTorch. NeurIPS.
+[3] Takeno et al. (2020). Multi-fidelity BO with Max-value Entropy. ICML.
 
 Author  : Rayhan (University of Bergen)
-Project : UC-TPNO — Uncertainty-Calibrated Thermodynamic Potential
-          Neural Operator for Humid Flue-Gas CO₂ Capture in MOFs
+Project : UC-TPNO
 License : MIT
 """
-
 from __future__ import annotations
 
-import copy
 import logging
-import math
-import warnings
 from dataclasses import dataclass, field
 from typing import (
     Any, Callable, Dict, List, Optional, Protocol, Sequence, Tuple, Union,
@@ -65,15 +62,15 @@ import torch.nn as nn
 
 logger = logging.getLogger(__name__)
 
-# ── Optional BoTorch imports (lazy) ──────────────────────────────────
 
+# ── Optional BoTorch imports (lazy) ──────────────────────────────────
 _HAS_BOTORCH = False
 
-def _import_botorch():
-    """Lazy-import BoTorch + GPyTorch; set module-level flag."""
+
+def _import_botorch() -> bool:
     global _HAS_BOTORCH
     try:
-        import botorch  # noqa: F401
+        import botorch   # noqa: F401
         import gpytorch  # noqa: F401
         _HAS_BOTORCH = True
     except ImportError:
@@ -87,48 +84,22 @@ def _import_botorch():
 
 @dataclass
 class BOConfig:
-    """
-    Bayesian-optimisation and active-learning hyperparameters.
-
-    Attributes
-    ──────────
-    n_init          : Number of initial random or LHS evaluations.
-    n_iterations    : Total BO iterations (outer loop).
-    n_candidates    : Batch size — candidates proposed per iteration.
-    acquisition     : Acquisition function name.  One of:
-                      ``'qEI'``, ``'qNEI'``, ``'qEHVI'``,
-                      ``'ucb'``, ``'thompson'``, ``'uncertainty'``.
-    multi_fidelity  : Use multi-fidelity GP and fidelity-aware costs.
-    fidelity_dim    : Index of the fidelity column in the design
-                      matrix (typically the last column).
-    cost_aware      : Re-weight acquisitions by 1 / cost.
-    ref_point       : Reference point for hypervolume computations
-                      (multi-objective only).  If *None*, inferred
-                      from observed data.
-    ucb_beta        : Exploration weight for UCB acquisition.
-    gp_fit_steps    : Adam steps when fitting the GP hyperparameters.
-    gp_lr           : Learning rate for GP fitting.
-    mc_samples      : Number of MC samples for qMC-based acquisitions.
-    num_restarts    : Multi-start restarts for acquisition optimisation.
-    raw_samples     : Random raw samples for initialising the optimiser.
-    seed            : Random seed for reproducibility.
-    """
-
-    n_init: int = 20
-    n_iterations: int = 50
-    n_candidates: int = 10
-    acquisition: str = "qEHVI"
-    multi_fidelity: bool = True
-    fidelity_dim: int = -1
-    cost_aware: bool = True
-    ref_point: Optional[List[float]] = None
-    ucb_beta: float = 2.0
-    gp_fit_steps: int = 100
-    gp_lr: float = 0.01
-    mc_samples: int = 256
-    num_restarts: int = 10
-    raw_samples: int = 512
-    seed: int = 42
+    """Bayesian-optimisation and active-learning hyperparameters."""
+    n_init:         int            = 20
+    n_iterations:   int            = 50
+    n_candidates:   int            = 10
+    acquisition:    str            = "qEHVI"
+    multi_fidelity: bool           = True
+    fidelity_dim:   int            = -1
+    cost_aware:     bool           = True
+    ref_point:      Optional[List[float]] = None
+    ucb_beta:       float          = 2.0
+    gp_fit_steps:   int            = 100
+    gp_lr:          float          = 0.01
+    mc_samples:     int            = 256
+    num_restarts:   int            = 10
+    raw_samples:    int            = 512
+    seed:           int            = 42
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -137,19 +108,9 @@ class BOConfig:
 
 @dataclass
 class FidelityLevel:
-    """
-    Description of a single simulation fidelity.
-
-    Attributes
-    ──────────
-    name    : Human-readable label (e.g. ``'gcmc_short'``).
-    cost    : Estimated wall-clock cost in CPU-hours.
-    index   : Numeric index (0 = cheapest, higher = more expensive).
-    noise   : Expected observation noise at this fidelity.
-    """
-
-    name: str
-    cost: float
+    """Description of a single simulation fidelity."""
+    name:  str
+    cost:  float
     index: int
     noise: float = 0.0
 
@@ -163,38 +124,29 @@ class FidelityManager:
         0  gcmc_short    ~0.1 CPU-h   (1 k cycles, screening)
         1  gcmc_long     ~1.0 CPU-h   (10 k cycles, production)
         2  dft_opt       ~50  CPU-h   (DFT geometry optimisation)
-
-    Parameters
-    ----------
-    levels : Sequence of ``FidelityLevel`` objects.  If *None*, the
-             three default levels above are used.
     """
 
     def __init__(self, levels: Optional[Sequence[FidelityLevel]] = None):
         if levels is None:
             levels = [
-                FidelityLevel("gcmc_short", cost=0.1, index=0, noise=0.10),
-                FidelityLevel("gcmc_long", cost=1.0, index=1, noise=0.02),
-                FidelityLevel("dft_opt", cost=50.0, index=2, noise=0.005),
+                FidelityLevel("gcmc_short", cost=0.1,  index=0, noise=0.10),
+                FidelityLevel("gcmc_long",  cost=1.0,  index=1, noise=0.02),
+                FidelityLevel("dft_opt",    cost=50.0, index=2, noise=0.005),
             ]
-        self.levels = sorted(levels, key=lambda l: l.index)
+        self.levels    = sorted(levels, key=lambda l: l.index)
         self._by_index = {l.index: l for l in self.levels}
 
     def cost(self, fidelity_index: Union[int, float, torch.Tensor]) -> float:
-        """Return the cost of a given fidelity index."""
         idx = int(fidelity_index)
         if idx in self._by_index:
             return self._by_index[idx].cost
-        # Interpolate if continuous fidelity
         indices = sorted(self._by_index.keys())
-        costs = [self._by_index[i].cost for i in indices]
+        costs   = [self._by_index[i].cost for i in indices]
         return float(np.interp(float(fidelity_index), indices, costs))
 
     def noise(self, fidelity_index: Union[int, float]) -> float:
         idx = int(fidelity_index)
-        if idx in self._by_index:
-            return self._by_index[idx].noise
-        return 0.0
+        return self._by_index[idx].noise if idx in self._by_index else 0.0
 
     @property
     def cheapest(self) -> FidelityLevel:
@@ -218,60 +170,107 @@ class FidelityManager:
 
 class AcquisitionFunction(Protocol):
     """Protocol that all acquisition functions satisfy."""
-
     def __call__(
         self,
-        X: torch.Tensor,
-        model: Any,
+        X:          torch.Tensor,
+        model:      Any,
         Y_observed: torch.Tensor,
-    ) -> torch.Tensor:
-        """Score candidates ``X`` → ``[n_candidates]``."""
-        ...
+    ) -> torch.Tensor: ...
 
 
 def upper_confidence_bound(
-    X: torch.Tensor,
-    model: Any,
+    X:          torch.Tensor,
+    model:      Any,
     Y_observed: torch.Tensor,
-    beta: float = 2.0,
+    beta:       float = 2.0,
 ) -> torch.Tensor:
-    """
-    UCB: μ(x) + β·σ(x).
-
-    Works with any model that has a ``.posterior(X)`` returning an
-    object with ``.mean`` and ``.variance``.
-    """
+    """UCB: μ(x) + β·σ(x).  Requires model.posterior(X)."""
     posterior = model.posterior(X)
-    mu = posterior.mean.squeeze(-1)
+    mu    = posterior.mean.squeeze(-1)
     sigma = posterior.variance.squeeze(-1).sqrt()
     return mu + beta * sigma
 
 
 def thompson_sampling(
-    X: torch.Tensor,
-    model: Any,
+    X:          torch.Tensor,
+    model:      Any,
     Y_observed: torch.Tensor,
-    n_samples: int = 1,
+    n_samples:  int = 1,
 ) -> torch.Tensor:
-    """
-    Score candidates by drawing a sample from the GP posterior.
-    """
+    """Score candidates by drawing a sample from the GP posterior."""
     posterior = model.posterior(X)
-    sample = posterior.rsample(torch.Size([n_samples]))  # [S, N, 1]
-    return sample.mean(dim=0).squeeze(-1)  # [N]
+    sample    = posterior.rsample(torch.Size([n_samples]))
+    return sample.mean(dim=0).squeeze(-1)
 
 
 def pure_uncertainty(
-    X: torch.Tensor,
-    model: Any,
+    X:          torch.Tensor,
+    model:      Any,
     Y_observed: torch.Tensor,
 ) -> torch.Tensor:
-    """
-    Select the candidate with maximum predictive variance (pure
-    exploration).
-    """
+    """Pure-exploration: maximum predictive variance."""
     posterior = model.posterior(X)
     return posterior.variance.squeeze(-1)
+
+
+def entropy_acquisition(
+    model:      nn.Module,
+    candidates: Any,
+    conditions: torch.Tensor,
+    n_samples:  int = 10,
+) -> torch.Tensor:
+    """
+    Entropy-based acquisition using MC dropout or ensemble.
+
+    FIX: original wrapped ensemble model calls inside torch.no_grad(),
+    which prevents TPNO from computing loadings via autograd.grad.
+    Removed the outer no_grad block; model.eval() handles BN/dropout.
+
+    Parameters
+    ----------
+    model      : nn.Module (TPNO or ensemble)
+    candidates : batched graph data
+    conditions : [B, P, D]
+    n_samples  : MC-dropout samples (ignored for ensembles)
+    """
+    # FIX: model.eval() is sufficient — NO torch.no_grad() wrapper here
+    # because TPNO internally calls autograd.grad(omega, mu).
+    model.eval()
+
+    ensemble_obj = getattr(model, "ensemble", None) or getattr(model, "models", None)
+
+    if ensemble_obj is not None:
+        preds: List[torch.Tensor] = []
+        for m in ensemble_obj:
+            out = m(candidates, conditions)
+            q = out["q_pred"] if isinstance(out, dict) else out[0]
+            preds.append(q)
+        pred_stack = torch.stack(preds, dim=0)          # [M, B, P, C]
+        std        = pred_stack.std(dim=0)               # [B, P, C]
+        return std.mean(dim=(1, 2))                      # [B]
+
+    # MC-dropout path — switch to train() to activate dropout
+    model.train()
+    preds_mc: List[torch.Tensor] = []
+    for _ in range(n_samples):
+        out = model(candidates, conditions)
+        q   = out["q_pred"] if isinstance(out, dict) else out[0]
+        preds_mc.append(q.detach())
+    model.eval()
+
+    pred_stack = torch.stack(preds_mc, dim=0)
+    std        = pred_stack.std(dim=0)
+    return std.mean(dim=(1, 2))
+
+
+def random_acquisition(
+    candidates: Any,
+    n:          int,
+    seed:       int = 42,
+) -> torch.Tensor:
+    """Random acquisition for baseline comparison."""
+    rng = np.random.RandomState(seed)
+    return torch.tensor(rng.random(n), dtype=torch.float32)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -280,46 +279,37 @@ def pure_uncertainty(
 
 class UncertaintyAcquisition:
     """
-    TPNO-specific acquisition function that combines:
+    TPNO-specific acquisition combining:
+    * Epistemic uncertainty   (ensemble disagreement)
+    * Conformal interval width (distribution-free coverage)
+    * Predicted CO₂/N₂ selectivity (exploitation signal)
 
-    * **Epistemic uncertainty** from the deep ensemble (model
-      disagreement).
-    * **Conformal interval width** from the calibrated conformal
-      predictor (distribution-free coverage).
-    * **Predicted selectivity** as an exploitation signal (prefer
-      MOFs likely to have high CO₂/N₂ selectivity).
+    Score = w_epi · σ_epi + w_conf · width_conf + w_sel · selectivity
 
-    The final score is::
-
-        score = w_epi · σ_epi + w_conf · width_conf + w_sel · selectivity
-
-    Parameters
-    ----------
-    ensemble     : The ``TPNOEnsemble`` model.
-    conformal    : A fitted ``ConformalCalibrator`` (optional).
-    w_epistemic  : Weight for epistemic uncertainty.
-    w_conformal  : Weight for conformal interval width.
-    w_selectivity: Weight for predicted selectivity.
+    FIX: original had @torch.no_grad() decorator which prevents TPNO
+    from computing loadings via autograd.grad(omega, mu).  Removed;
+    model.eval() is sufficient.
     """
 
     def __init__(
         self,
-        ensemble: nn.Module,
-        conformal: Optional[Any] = None,
-        w_epistemic: float = 1.0,
-        w_conformal: float = 0.5,
+        ensemble:      nn.Module,
+        conformal:     Optional[Any] = None,
+        w_epistemic:   float = 1.0,
+        w_conformal:   float = 0.5,
         w_selectivity: float = 0.3,
     ):
         self.ensemble = ensemble
         self.conformal = conformal
-        self.w_epi = w_epistemic
+        self.w_epi  = w_epistemic
         self.w_conf = w_conformal
-        self.w_sel = w_selectivity
+        self.w_sel  = w_selectivity
 
-    @torch.no_grad()
+    # FIX: @torch.no_grad() REMOVED — autograd.grad inside TPNO requires
+    # gradients to be enabled.  model.eval() disables dropout/BN only.
     def __call__(
         self,
-        graphs: Any,
+        graphs:     Any,
         conditions: torch.Tensor,
     ) -> torch.Tensor:
         """
@@ -327,36 +317,38 @@ class UncertaintyAcquisition:
 
         Parameters
         ----------
-        graphs     : Batched graph data for the ensemble encoder.
-        conditions : ``[B, P, 4]`` thermodynamic conditions.
+        graphs     : batched graph data for the encoder.
+        conditions : [B, P, 4] thermodynamic conditions.
 
         Returns
         -------
-        ``[B]`` acquisition scores (higher = more informative).
+        [B] acquisition scores (higher = more informative).
         """
+        self.ensemble.eval()
+
         out = self.ensemble(graphs, conditions, return_all=False)
 
-        # Epistemic: mean std across condition points and components
-        epi = out["epistemic"].mean(dim=(1, 2))  # [B]
-
+        # Epistemic: mean std across condition-points and components
+        epi   = out["epistemic"].mean(dim=(1, 2))  # [B]
         score = self.w_epi * epi
 
-        # Conformal width (if calibrator is fitted)
+        # Conformal width (optional)
         if self.conformal is not None and self.conformal.is_fitted:
-            y_pred_np = out["q_pred"].mean(dim=1).cpu().numpy()  # [B, C]
-            sigma_np = out["aleatoric"].mean(dim=1).cpu().numpy()
+            y_pred_np = out["q_pred"].mean(dim=1).cpu().detach().numpy()
+            sigma_np  = out["aleatoric"].mean(dim=1).cpu().detach().numpy()
             iv = self.conformal.predict_intervals(
                 {"y_pred": y_pred_np, "y_std": sigma_np}
             )
             conf_width = iv["upper"] - iv["lower"]
-            conf_score = torch.from_numpy(conf_width.mean(axis=-1)).to(epi)
+            conf_score = torch.from_numpy(
+                conf_width.mean(axis=-1).astype(np.float32)
+            ).to(epi.device)
             score = score + self.w_conf * conf_score
 
-        # Selectivity exploitation: CO₂/N₂ selectivity
-        q_mean = out["q_pred"].mean(dim=1)  # [B, C]
+        # Selectivity exploitation
+        q_mean = out["q_pred"].mean(dim=1)              # [B, C]
         if q_mean.shape[-1] >= 2:
-            sel = q_mean[:, 0] / (q_mean[:, 1] + 1e-8)  # CO₂ / N₂
-            # Normalise to [0, 1]
+            sel = q_mean[:, 0] / (q_mean[:, 1] + 1e-8) # [B]
             sel = (sel - sel.min()) / (sel.max() - sel.min() + 1e-8)
             score = score + self.w_sel * sel
 
@@ -371,48 +363,43 @@ class MultiFidelityBO:
     """
     Multi-fidelity Bayesian optimisation loop for MOF screening.
 
-    This class orchestrates:
-
-    1.  Initial random evaluations at the cheapest fidelity.
-    2.  GP surrogate fitting (BoTorch ``SingleTaskGP`` or
-        ``SingleTaskMultiFidelityGP``).
-    3.  Acquisition-function optimisation to propose the next batch.
-    4.  Fidelity selection (cheapest for exploration, expensive for
-        promising candidates).
-    5.  Pareto-front tracking for multi-objective problems.
+    Orchestrates:
+    1. Initial random evaluations at the cheapest fidelity.
+    2. GP surrogate fitting (BoTorch SingleTaskGP or
+       SingleTaskMultiFidelityGP).
+    3. Acquisition-function optimisation → next batch.
+    4. Fidelity selection.
+    5. Pareto-front tracking.
 
     Parameters
     ----------
-    config        : ``BOConfig`` hyperparameters.
-    bounds        : ``[2, d]`` lower/upper bounds for the design space.
-    fidelity_mgr  : ``FidelityManager`` (optional; uses defaults).
-    objective_fn  : Callable ``(x, fidelity) → (y, cost)`` that
-                    evaluates a candidate (may be a simulation wrapper).
+    config       : BOConfig hyperparameters.
+    bounds       : [2, d] lower/upper bounds for the design space.
+    fidelity_mgr : FidelityManager (optional; uses defaults).
+    objective_fn : Callable (x, fidelity) → (y, cost).
     """
 
     def __init__(
         self,
-        config: BOConfig,
-        bounds: torch.Tensor,
+        config:       BOConfig,
+        bounds:       torch.Tensor,
         fidelity_mgr: Optional[FidelityManager] = None,
-        objective_fn: Optional[Callable] = None,
+        objective_fn: Optional[Callable]        = None,
     ):
-        self.config = config
-        self.bounds = bounds
+        self.config       = config
+        self.bounds       = bounds
         self.fidelity_mgr = fidelity_mgr or FidelityManager()
         self.objective_fn = objective_fn
 
-        # Observation storage
-        self.X: Optional[torch.Tensor] = None
-        self.Y: Optional[torch.Tensor] = None
+        self.X:          Optional[torch.Tensor] = None
+        self.Y:          Optional[torch.Tensor] = None
         self.fidelities: Optional[torch.Tensor] = None
-        self.costs: Optional[torch.Tensor] = None
+        self.costs:      Optional[torch.Tensor] = None
 
-        # GP surrogate
         self._model = None
-        self._mll = None
+        self._mll   = None
 
-    # ── Observation management ───────────────────────────────────
+    # ── Observation management ────────────────────────────────────────
 
     @property
     def n_observed(self) -> int:
@@ -420,17 +407,17 @@ class MultiFidelityBO:
 
     def add_observations(
         self,
-        X: torch.Tensor,
-        Y: torch.Tensor,
+        X:          torch.Tensor,
+        Y:          torch.Tensor,
         fidelities: Optional[torch.Tensor] = None,
-        costs: Optional[torch.Tensor] = None,
+        costs:      Optional[torch.Tensor] = None,
     ) -> None:
         """Append new observations and refit the GP."""
         if self.X is None:
-            self.X = X
-            self.Y = Y
+            self.X          = X
+            self.Y          = Y
             self.fidelities = fidelities
-            self.costs = costs
+            self.costs      = costs
         else:
             self.X = torch.cat([self.X, X], dim=0)
             self.Y = torch.cat([self.Y, Y], dim=0)
@@ -438,37 +425,32 @@ class MultiFidelityBO:
                 self.fidelities = torch.cat([self.fidelities, fidelities], dim=0)
             if costs is not None and self.costs is not None:
                 self.costs = torch.cat([self.costs, costs], dim=0)
-
         self._fit_model()
 
-    def initialize_random(
-        self,
-        n: Optional[int] = None,
-    ) -> torch.Tensor:
-        """
-        Generate ``n`` random initial designs via Sobol or uniform
-        sampling within ``self.bounds``.
-
-        Returns the design tensor ``[n, d]`` (does *not* evaluate them).
-        """
+    def initialize_random(self, n: Optional[int] = None) -> torch.Tensor:
+        """Generate ``n`` initial designs via Sobol / uniform sampling."""
         n = n or self.config.n_init
         d = self.bounds.shape[1]
-
         try:
             from torch.quasirandom import SobolEngine
             sobol = SobolEngine(dimension=d, scramble=True, seed=self.config.seed)
-            raw = sobol.draw(n).to(self.bounds.dtype)
+            raw   = sobol.draw(n).to(self.bounds.dtype)
         except Exception:
             torch.manual_seed(self.config.seed)
             raw = torch.rand(n, d)
-
         lo, hi = self.bounds[0], self.bounds[1]
         return lo + (hi - lo) * raw
 
-    # ── GP surrogate ─────────────────────────────────────────────
+    # ── GP surrogate ──────────────────────────────────────────────────
 
     def _fit_model(self) -> None:
-        """Fit (or refit) the GP surrogate on current observations."""
+        """
+        Fit (or refit) the GP surrogate on current observations.
+
+        FIX: original used a manual Adam loop that passed 2D train_Y to
+        self._mll(), failing for single-output models.  Now uses
+        fit_gpytorch_mll() which handles all output-transform variants.
+        """
         if not _import_botorch():
             logger.warning(
                 "BoTorch not installed — GP surrogate unavailable. "
@@ -478,14 +460,15 @@ class MultiFidelityBO:
 
         from botorch.models import SingleTaskGP
         from botorch.models.transforms import Standardize
+        from botorch.fit import fit_gpytorch_mll
         from gpytorch.mlls import ExactMarginalLogLikelihood
 
-        train_X = self.X.detach().clone()
-        train_Y = self.Y.detach().clone()
+        train_X = self.X.detach().clone().double()
+        train_Y = self.Y.detach().clone().double()
 
         # Append fidelity column for multi-fidelity
         if self.config.multi_fidelity and self.fidelities is not None:
-            f_col = self.fidelities.unsqueeze(-1).to(train_X)
+            f_col   = self.fidelities.unsqueeze(-1).to(train_X)
             train_X = torch.cat([train_X, f_col], dim=-1)
 
         n_obj = train_Y.shape[-1] if train_Y.dim() > 1 else 1
@@ -511,37 +494,27 @@ class MultiFidelityBO:
             )
 
         self._mll = ExactMarginalLogLikelihood(
-            self._model.likelihood, self._model,
+            self._model.likelihood, self._model
         )
 
-        # Fit via Adam
-        self._model.train()
-        self._mll.train()
-        opt = torch.optim.Adam(self._model.parameters(), lr=self.config.gp_lr)
-
-        for _ in range(self.config.gp_fit_steps):
-            opt.zero_grad()
-            output = self._model(train_X)
-            loss = -self._mll(output, train_Y)
-            loss.backward()
-            opt.step()
+        # FIX: use fit_gpytorch_mll instead of a fragile manual Adam loop
+        try:
+            fit_gpytorch_mll(self._mll)
+        except Exception as e:
+            logger.warning("fit_gpytorch_mll failed (%s); GP may be suboptimal.", e)
 
         self._model.eval()
-        self._mll.eval()
 
-    # ── Acquisition functions ────────────────────────────────────
+    # ── Acquisition functions ─────────────────────────────────────────
 
     def _build_acquisition(self):
         """Build a BoTorch acquisition function from config."""
-        if self._model is None:
-            return None
-
-        if not _HAS_BOTORCH:
+        if self._model is None or not _HAS_BOTORCH:
             return None
 
         from botorch.sampling import SobolQMCNormalSampler
         sampler = SobolQMCNormalSampler(
-            sample_shape=torch.Size([self.config.mc_samples]),
+            sample_shape=torch.Size([self.config.mc_samples])
         )
 
         acq_name = self.config.acquisition.lower()
@@ -550,75 +523,73 @@ class MultiFidelityBO:
             from botorch.acquisition import qExpectedImprovement
             best_f = self.Y.max(dim=0)[0] if self.Y.dim() > 1 else self.Y.max()
             return qExpectedImprovement(
-                model=self._model,
-                best_f=best_f,
-                sampler=sampler,
+                model=self._model, best_f=best_f, sampler=sampler
             )
 
         if acq_name == "qnei":
             from botorch.acquisition import qNoisyExpectedImprovement
             return qNoisyExpectedImprovement(
-                model=self._model,
-                X_baseline=self.X,
-                sampler=sampler,
+                model=self._model, X_baseline=self.X, sampler=sampler
             )
 
         if acq_name == "qehvi":
+            # FIX: NondominatedPartitioning is required since BoTorch 0.6.
+            # The original call without partitioning raises TypeError.
             from botorch.acquisition.multi_objective import (
                 qExpectedHypervolumeImprovement,
             )
+            from botorch.utils.multi_objective.box_decompositions.non_dominated import (
+                NondominatedPartitioning,
+            )
             if self.config.ref_point is not None:
-                ref = torch.tensor(self.config.ref_point, dtype=self.Y.dtype)
+                ref = torch.tensor(
+                    self.config.ref_point, dtype=self.Y.dtype
+                )
             else:
                 y_range = self.Y.max(0)[0] - self.Y.min(0)[0]
-                ref = self.Y.min(0)[0] - 0.1 * y_range
+                ref     = self.Y.min(0)[0] - 0.1 * y_range
+
+            partitioning = NondominatedPartitioning(ref_point=ref, Y=self.Y)
 
             return qExpectedHypervolumeImprovement(
                 model=self._model,
                 ref_point=ref,
+                partitioning=partitioning,
                 sampler=sampler,
             )
 
         if acq_name == "ucb":
             from botorch.acquisition import qUpperConfidenceBound
             return qUpperConfidenceBound(
-                model=self._model,
-                beta=self.config.ucb_beta,
-                sampler=sampler,
+                model=self._model, beta=self.config.ucb_beta, sampler=sampler
             )
 
-        raise ValueError(f"Unknown BoTorch acquisition: {self.config.acquisition}")
+        raise ValueError(
+            f"Unknown BoTorch acquisition: '{self.config.acquisition}'. "
+            "Choose from: qEI, qNEI, qEHVI, ucb."
+        )
 
-    # ── Candidate proposal ───────────────────────────────────────
+    # ── Candidate proposal ────────────────────────────────────────────
 
-    def propose_candidates(
-        self,
-        n: Optional[int] = None,
-    ) -> torch.Tensor:
-        """
-        Propose the next batch of candidates by optimising the
-        acquisition function.
-
-        Returns ``[n, d]`` design-space candidates.
-        """
-        n = n or self.config.n_candidates
-
+    def propose_candidates(self, n: Optional[int] = None) -> torch.Tensor:
+        """Propose next batch by optimising the acquisition function."""
+        n   = n or self.config.n_candidates
         acq = self._build_acquisition()
+
         if acq is None:
             logger.info("No GP model available; proposing random candidates.")
             return self.initialize_random(n)
 
         from botorch.optim import optimize_acqf
-
         bounds = self.bounds
+
         if self.config.multi_fidelity and self.fidelities is not None:
-            # Extend bounds to include fidelity column
             fid_lo = torch.zeros(1, dtype=bounds.dtype)
             fid_hi = torch.tensor(
-                [float(self.fidelity_mgr.n_levels - 1)], dtype=bounds.dtype,
+                [float(self.fidelity_mgr.n_levels - 1)], dtype=bounds.dtype
             )
             bounds = torch.cat(
-                [bounds, torch.stack([fid_lo, fid_hi], dim=0)], dim=1,
+                [bounds, torch.stack([fid_lo, fid_hi], dim=0)], dim=1
             )
 
         candidates, acq_values = optimize_acqf(
@@ -630,7 +601,6 @@ class MultiFidelityBO:
             options={"batch_limit": 5, "maxiter": 200},
         )
 
-        # Cost-aware re-ranking
         if self.config.cost_aware and self.config.multi_fidelity:
             candidates = self._cost_rerank(candidates, acq_values)
 
@@ -638,82 +608,87 @@ class MultiFidelityBO:
 
     def _cost_rerank(
         self,
-        candidates: torch.Tensor,
-        acq_values: torch.Tensor,
+        candidates:  torch.Tensor,
+        acq_values:  torch.Tensor,
     ) -> torch.Tensor:
         """Re-rank candidates by acquisition / cost."""
         costs = torch.tensor(
-            [self.fidelity_mgr.cost(c[self.config.fidelity_dim]) for c in candidates],
+            [
+                self.fidelity_mgr.cost(c[self.config.fidelity_dim])
+                for c in candidates
+            ],
             dtype=candidates.dtype,
         )
         weighted = acq_values / (costs + 1e-8)
-        idx = weighted.argsort(descending=True)
+        idx      = weighted.argsort(descending=True)
         return candidates[idx]
 
-    # ── Full optimisation loop ───────────────────────────────────
+    # ── Full optimisation loop ────────────────────────────────────────
 
     def run(
         self,
         objective_fn: Optional[Callable] = None,
-        callback: Optional[Callable] = None,
+        callback:     Optional[Callable] = None,
     ) -> Dict[str, Any]:
         """
         Execute the full BO loop.
 
         Parameters
         ----------
-        objective_fn : ``(x, fidelity) → (y, cost)``; overrides the
-                       instance-level ``self.objective_fn``.
-        callback     : Called after each iteration with
-                       ``(iteration, X, Y, candidates)``.
+        objective_fn : (x, fidelity) → (y: Tensor, cost: float)
+        callback     : called after each iteration with
+                       (iteration, X, Y, candidates)
 
         Returns
         -------
-        Dict with ``X``, ``Y``, ``costs``, ``fidelities``,
-        ``pareto_X``, ``pareto_Y``.
+        Dict with X, Y, costs, fidelities, pareto_X, pareto_Y.
         """
         obj_fn = objective_fn or self.objective_fn
         if obj_fn is None:
             raise ValueError("No objective function provided.")
 
-        # Initialise
         if self.n_observed == 0:
-            X_init = self.initialize_random()
-            Y_list, cost_list, fid_list = [], [], []
+            X_init       = self.initialize_random()
+            Y_list:    List[torch.Tensor] = []
+            cost_list: List[float]        = []
+            fid_list:  List[int]          = []
             fid_cheapest = self.fidelity_mgr.cheapest.index
+
             for x in X_init:
                 y, cost = obj_fn(x, fid_cheapest)
-                Y_list.append(y)
-                cost_list.append(cost)
+                Y_list.append(y if isinstance(y, torch.Tensor) else torch.tensor(y))
+                cost_list.append(float(cost))
                 fid_list.append(fid_cheapest)
+
             self.add_observations(
                 X_init,
                 torch.stack(Y_list),
-                torch.tensor(fid_list, dtype=torch.float),
+                torch.tensor(fid_list,  dtype=torch.float),
                 torch.tensor(cost_list, dtype=torch.float),
             )
 
-        # Main loop
         for it in range(self.config.n_iterations):
             candidates = self.propose_candidates()
+            Y_new:    List[torch.Tensor] = []
+            cost_new: List[float]        = []
+            fid_new:  List[int]          = []
 
-            Y_new, cost_new, fid_new = [], [], []
             for c in candidates:
                 if self.config.multi_fidelity:
                     fid = int(c[self.config.fidelity_dim].item())
                 else:
                     fid = self.fidelity_mgr.most_accurate.index
 
-                x = c[: self.bounds.shape[1]]
+                x       = c[: self.bounds.shape[1]]
                 y, cost = obj_fn(x, fid)
-                Y_new.append(y)
-                cost_new.append(cost)
+                Y_new.append(y if isinstance(y, torch.Tensor) else torch.tensor(y))
+                cost_new.append(float(cost))
                 fid_new.append(fid)
 
             self.add_observations(
                 candidates[:, : self.bounds.shape[1]],
                 torch.stack(Y_new),
-                torch.tensor(fid_new, dtype=torch.float),
+                torch.tensor(fid_new,  dtype=torch.float),
                 torch.tensor(cost_new, dtype=torch.float),
             )
 
@@ -721,39 +696,36 @@ class MultiFidelityBO:
                 callback(it, self.X, self.Y, candidates)
 
             logger.info(
-                f"BO iter {it+1}/{self.config.n_iterations} — "
-                f"n_obs={self.n_observed}, "
-                f"best_Y={self.Y.max(0)[0].tolist()}"
+                "BO iter %d/%d — n_obs=%d, best_Y=%s",
+                it + 1, self.config.n_iterations,
+                self.n_observed,
+                self.Y.max(0)[0].tolist(),
             )
 
-        # Pareto front
         pareto_X, pareto_Y = self.get_pareto_front()
-
         return {
-            "X": self.X,
-            "Y": self.Y,
-            "costs": self.costs,
+            "X":          self.X,
+            "Y":          self.Y,
+            "costs":      self.costs,
             "fidelities": self.fidelities,
-            "pareto_X": pareto_X,
-            "pareto_Y": pareto_Y,
+            "pareto_X":   pareto_X,
+            "pareto_Y":   pareto_Y,
         }
 
-    # ── Pareto front ─────────────────────────────────────────────
+    # ── Pareto front ──────────────────────────────────────────────────
 
     def get_pareto_front(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Return the non-dominated subset of observed ``(X, Y)``."""
+        """Return the non-dominated subset of observed (X, Y)."""
         if self.Y is None or self.Y.numel() == 0:
             return torch.empty(0), torch.empty(0)
 
         Y = self.Y
         if Y.dim() == 1:
             best_idx = Y.argmax()
-            return self.X[best_idx : best_idx + 1], Y[best_idx : best_idx + 1]
+            return self.X[best_idx: best_idx + 1], Y[best_idx: best_idx + 1]
 
         mask = _is_non_dominated(Y)
         return self.X[mask], Y[mask]
-
-    # ── Summary ──────────────────────────────────────────────────
 
     def summary(self) -> Dict[str, Any]:
         """Return a dict summarising the current state."""
@@ -773,10 +745,8 @@ class MultiFidelityBO:
 
 def _is_non_dominated(Y: torch.Tensor) -> torch.Tensor:
     """
-    Return a boolean mask identifying the Pareto-optimal rows of
-    ``Y`` (maximisation assumed on all objectives).
-
-    Falls back to a simple O(n²) sweep when BoTorch is absent.
+    Boolean mask of Pareto-optimal rows of Y (maximisation on all
+    objectives).  Falls back to O(n²) sweep when BoTorch is absent.
     """
     if _import_botorch():
         try:
@@ -785,9 +755,8 @@ def _is_non_dominated(Y: torch.Tensor) -> torch.Tensor:
         except Exception:
             pass
 
-    # Fallback: pairwise dominance check
-    n = Y.shape[0]
-    dominated = torch.zeros(n, dtype=torch.bool)
+    n          = Y.shape[0]
+    dominated  = torch.zeros(n, dtype=torch.bool)
     for i in range(n):
         for j in range(n):
             if i == j:
@@ -803,32 +772,30 @@ def _is_non_dominated(Y: torch.Tensor) -> torch.Tensor:
 # ═══════════════════════════════════════════════════════════════════════
 
 def tpno_screening_loop(
-    ensemble: nn.Module,
-    candidate_graphs: List[Any],
+    ensemble:             nn.Module,
+    candidate_graphs:     List[Any],
     candidate_conditions: torch.Tensor,
-    budget: int = 100,
-    conformal: Optional[Any] = None,
-    w_epistemic: float = 1.0,
-    w_conformal: float = 0.5,
-    w_selectivity: float = 0.3,
+    budget:               int          = 100,
+    conformal:            Optional[Any] = None,
+    w_epistemic:          float         = 1.0,
+    w_conformal:          float         = 0.5,
+    w_selectivity:        float         = 0.3,
 ) -> List[int]:
     """
     Lightweight active-screening loop that ranks candidate MOFs using
-    the TPNO ensemble + conformal calibrator without requiring a GP
-    surrogate or BoTorch.
+    the TPNO ensemble + conformal calibrator, without a GP surrogate.
 
     Parameters
     ----------
-    ensemble            : Trained ``TPNOEnsemble``.
-    candidate_graphs    : List of graph-batch inputs (one per MOF).
-    candidate_conditions: ``[N, P, 4]`` conditions to evaluate at.
-    budget              : How many MOFs to select.
-    conformal           : Fitted ``ConformalCalibrator`` (optional).
+    ensemble            : Trained TPNOEnsemble.
+    candidate_graphs    : List of graph inputs (one per MOF).
+    candidate_conditions: [N, P, 4] conditions.
+    budget              : Number of MOFs to select.
 
     Returns
     -------
-    List of indices into ``candidate_graphs`` ranked by acquisition
-    score (highest first), truncated to ``budget``.
+    Indices into candidate_graphs ranked by score (highest first),
+    truncated to budget.
     """
     acq = UncertaintyAcquisition(
         ensemble=ensemble,
@@ -838,35 +805,101 @@ def tpno_screening_loop(
         w_selectivity=w_selectivity,
     )
 
-    scores_list = []
+    scores_list: List[float] = []
     for i, g in enumerate(candidate_graphs):
-        cond = candidate_conditions[i : i + 1] if candidate_conditions.dim() == 3 else candidate_conditions.unsqueeze(0)
+        if candidate_conditions.dim() == 3:
+            cond = candidate_conditions[i: i + 1]   # [1, P, D]
+        else:
+            cond = candidate_conditions.unsqueeze(0) # [1, P, D]
+
         s = acq(g, cond)
-        scores_list.append(s.item())
+        # s may be [1] — call mean() to get a scalar safely
+        scores_list.append(float(s.mean().item()))
 
-    scores = np.array(scores_list)
+    scores  = np.array(scores_list, dtype=np.float32)
     ranking = np.argsort(-scores).tolist()
-
     return ranking[:budget]
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# 8.  PUBLIC API
+# 8.  SIMPLE ACQUISITION WRAPPER FOR ACTIVE LEARNING LOOP
+# ═══════════════════════════════════════════════════════════════════════
+
+def score_candidates_simple(
+    model:       nn.Module,
+    candidates:  Any,
+    conditions:  torch.Tensor,
+    acquisition: str   = "ucb",
+    beta:        float = 1.0,
+    return_all:  bool  = False,
+) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
+    """
+    Simple acquisition function wrapper for the active learning loop.
+
+    FIX: original wrapped the model call in torch.no_grad() which
+    prevents TPNO from computing loadings via autograd.grad(omega, mu).
+    Removed; model.eval() is sufficient.
+
+    Parameters
+    ----------
+    model       : ThermodynamicPotentialNO or TPNOEnsemble.
+    candidates  : batched graph data.
+    conditions  : [B, P, D] thermodynamic conditions.
+    acquisition : 'ucb' | 'uncertainty' | 'exploitation' | 'random' | 'entropy'
+    beta        : UCB exploration weight.
+    return_all  : If True, return dict with all intermediate scores.
+    """
+    # FIX: NO torch.no_grad() — TPNO uses autograd.grad internally.
+    model.eval()
+
+    out    = model(candidates, conditions)
+    q_pred = out["q_pred"] if isinstance(out, dict) else out[0]
+    sigma  = (
+        out.get("sigma", torch.zeros_like(q_pred))
+        if isinstance(out, dict)
+        else torch.zeros_like(q_pred)
+    )
+
+    mean_q     = q_pred.mean(dim=(1, 2))             # [B]
+    mean_sigma = sigma.mean(dim=(1, 2))              # [B]
+    max_sigma  = sigma.max(dim=1)[0].mean(dim=1)    # [B]
+
+    if acquisition == "uncertainty":
+        scores = mean_sigma
+    elif acquisition == "exploitation":
+        scores = mean_q
+    elif acquisition == "random":
+        scores = torch.rand_like(mean_q)
+    elif acquisition == "entropy":
+        scores = entropy_acquisition(model, candidates, conditions)
+    else:  # ucb (default)
+        scores = mean_q + beta * mean_sigma
+
+    if return_all:
+        return {
+            "scores":     scores,
+            "mean_q":     mean_q,
+            "mean_sigma": mean_sigma,
+            "max_sigma":  max_sigma,
+        }
+    return scores
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 9.  PUBLIC API
 # ═══════════════════════════════════════════════════════════════════════
 
 __all__ = [
-    # Config
     "BOConfig",
-    # Fidelity
     "FidelityLevel",
     "FidelityManager",
-    # Acquisition functions
     "upper_confidence_bound",
     "thompson_sampling",
     "pure_uncertainty",
+    "entropy_acquisition",
+    "random_acquisition",
     "UncertaintyAcquisition",
-    # BO loop
     "MultiFidelityBO",
-    # Convenience
     "tpno_screening_loop",
+    "score_candidates_simple",
 ]

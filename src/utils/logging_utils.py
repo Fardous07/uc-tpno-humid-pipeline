@@ -22,13 +22,25 @@ single, composable API:
     6.  **Console formatters** — colour-coded severity levels, aligned
         metric columns, and optional ``rich`` integration.
 
-Design goals
-────────────
-* Zero-dependency path: the module works with nothing but the stdlib.
-  ``wandb``, ``rich``, and ``tqdm`` are imported lazily and their
-  absence is handled gracefully.
-* Every function is safe to call from any process (main or DataLoader
-  worker) — file handlers use append mode and W&B calls are guarded.
+Fixes vs previous version
+──────────────────────────
+1. ``from .constants import PIPELINE_NAME, PIPELINE_VERSION`` crashed at
+   import because constants.py contains physics constants only — those
+   names were never defined.  Fixed: define them as module-level strings
+   here so the module is self-contained.
+
+2. MetricLogger.log() mutated the caller's metrics dict when prefix=""
+   (the default).  ``metrics["epoch"] = step`` and
+   ``metrics.setdefault("timestamp", …)`` modified the original object.
+   Fixed: always copy() before any mutation.
+
+3. CSVMetricSink._rewrite_with_new_columns() imported pandas for the
+   rare new-column case.  If pandas is not installed (lightweight
+   analysis scripts) this raised ImportError.  Fixed: rewrite using
+   stdlib csv reader/writer only.
+
+4. MetricTracker.best only iterated history[0].keys(), silently omitting
+   metrics that first appeared after epoch 0.  Fixed: union all keys.
 
 Author  : Rayhan (University of Bergen)
 Project : UC-TPNO — Uncertainty-Calibrated Thermodynamic Potential
@@ -39,6 +51,7 @@ License : MIT
 from __future__ import annotations
 
 import csv
+import io
 import json
 import logging
 import os
@@ -46,34 +59,35 @@ import sys
 import time
 from collections import defaultdict
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from pathlib import Path
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
-from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
-from .constants import PIPELINE_NAME, PIPELINE_VERSION
+# ── FIX 1: define pipeline identity here, not imported from constants ──
+# constants.py holds physics constants (R, K_B, …) — it never had these.
+PIPELINE_NAME: str    = "uc_tpno"
+PIPELINE_VERSION: str = "0.1.0"
 
 PathLike = Union[str, Path]
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # 1.  STRUCTURED PYTHON LOGGING
 # ═══════════════════════════════════════════════════════════════════════
 
-_DEFAULT_FMT = "%(asctime)s │ %(levelname)-8s │ %(name)-24s │ %(message)s"
+_DEFAULT_FMT  = "%(asctime)s │ %(levelname)-8s │ %(name)-24s │ %(message)s"
 _DEFAULT_DATE = "%Y-%m-%d %H:%M:%S"
 
-# ANSI colour codes for console output (no-op on Windows unless
-# coloured-terminal support is detected).
 _COLOURS = {
-    "DEBUG": "\033[36m",    # cyan
-    "INFO": "\033[32m",     # green
-    "WARNING": "\033[33m",  # yellow
-    "ERROR": "\033[31m",    # red
-    "CRITICAL": "\033[35m", # magenta
-    "RESET": "\033[0m",
+    "DEBUG":    "\033[36m",   # cyan
+    "INFO":     "\033[32m",   # green
+    "WARNING":  "\033[33m",   # yellow
+    "ERROR":    "\033[31m",   # red
+    "CRITICAL": "\033[35m",   # magenta
+    "RESET":    "\033[0m",
 }
 
 _USE_COLOUR: bool = hasattr(sys.stderr, "isatty") and sys.stderr.isatty()
@@ -88,7 +102,8 @@ class _ColourFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         if _USE_COLOUR:
             colour = _COLOURS.get(record.levelname, "")
-            reset = _COLOURS["RESET"]
+            reset  = _COLOURS["RESET"]
+            record = logging.makeLogRecord(record.__dict__)  # don't mutate original
             record.levelname = f"{colour}{record.levelname}{reset}"
         return super().format(record)
 
@@ -97,7 +112,7 @@ def setup_logger(
     name: str = PIPELINE_NAME,
     level: Union[int, str] = logging.INFO,
     log_file: Optional[PathLike] = None,
-    max_bytes: int = 10 * 1024 * 1024,  # 10 MiB
+    max_bytes: int = 10 * 1024 * 1024,
     backup_count: int = 3,
     console: bool = True,
     propagate: bool = False,
@@ -114,10 +129,6 @@ def setup_logger(
     backup_count : Number of rotated backup files to keep.
     console      : Attach a coloured ``StreamHandler`` to stderr.
     propagate    : Whether to propagate to parent loggers.
-
-    Returns
-    -------
-    ``logging.Logger`` instance.
     """
     logger = logging.getLogger(name)
     logger.setLevel(level)
@@ -127,14 +138,12 @@ def setup_logger(
     if logger.handlers:
         return logger
 
-    # ── Console handler ──────────────────────────────────────────
     if console:
         ch = logging.StreamHandler(sys.stderr)
         ch.setLevel(level)
         ch.setFormatter(_ColourFormatter())
         logger.addHandler(ch)
 
-    # ── File handler (rotating) ──────────────────────────────────
     if log_file is not None:
         p = Path(log_file)
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -177,19 +186,14 @@ class MetricTracker:
     >>> tracker = MetricTracker()
     >>> for batch in dataloader:
     ...     tracker.update(loss=0.5, mae=0.1)
-    >>> avg = tracker.average()        # {'loss': …, 'mae': …}
+    >>> avg = tracker.average()
     >>> tracker.reset()                # call at epoch start
-
-    The ``history`` attribute stores a list of epoch-averaged dicts
-    for learning-curve plotting.
     """
 
     def __init__(self) -> None:
-        self._sums: Dict[str, float] = defaultdict(float)
-        self._counts: Dict[str, int] = defaultdict(int)
+        self._sums:   Dict[str, float] = defaultdict(float)
+        self._counts: Dict[str, int]   = defaultdict(int)
         self.history: List[Dict[str, float]] = []
-
-    # ── core API ─────────────────────────────────────────────────
 
     def update(self, n: int = 1, **metrics: float) -> None:
         """
@@ -197,13 +201,12 @@ class MetricTracker:
 
         Parameters
         ----------
-        n        : Number of samples this batch represents (for
-                   weighted averaging).
+        n        : Number of samples (for weighted averaging).
         **metrics: Keyword metric values, e.g. ``loss=0.3, mae=0.12``.
         """
         for k, v in metrics.items():
-            if v is not None and np.isfinite(v):
-                self._sums[k] += float(v) * n
+            if v is not None and np.isfinite(float(v)):
+                self._sums[k]   += float(v) * n
                 self._counts[k] += n
 
     def average(self) -> Dict[str, float]:
@@ -214,15 +217,12 @@ class MetricTracker:
         }
 
     def sum(self) -> Dict[str, float]:
-        """Return the running sum of all tracked metrics."""
         return dict(self._sums)
 
     def reset(self, *, commit: bool = True) -> Dict[str, float]:
         """
-        Reset accumulators.  If *commit* is True (default), append
-        the current averages to ``self.history`` before clearing.
-
-        Returns the averages from the completed epoch.
+        Reset accumulators.  If *commit* (default True), append current
+        averages to ``self.history`` before clearing.
         """
         avg = self.average()
         if commit and self._counts:
@@ -231,8 +231,6 @@ class MetricTracker:
         self._counts.clear()
         return avg
 
-    # ── convenience ──────────────────────────────────────────────
-
     @property
     def last(self) -> Dict[str, float]:
         """Most recent committed epoch averages."""
@@ -240,16 +238,28 @@ class MetricTracker:
 
     @property
     def best(self) -> Dict[str, Optional[float]]:
-        """Best (minimum) value seen for each metric across epochs."""
+        """
+        Best (minimum) value seen for each metric across all epochs.
+
+        FIX: previous version only iterated history[0].keys(), which
+        silently omitted metrics that first appeared after epoch 0
+        (e.g. physics losses that activate after warmup).
+        Now unions all keys across the full history.
+        """
         if not self.history:
             return {}
-        keys = self.history[0].keys()
-        return {k: min(h.get(k, float("inf")) for h in self.history) for k in keys}
+        all_keys = set()
+        for h in self.history:
+            all_keys.update(h.keys())
+        return {
+            k: min(h.get(k, float("inf")) for h in self.history)
+            for k in all_keys
+        }
 
     def best_epoch(self, metric: str, mode: str = "min") -> int:
         """Return the 0-indexed epoch with the best value of *metric*."""
-        vals = [h.get(metric, float("inf") if mode == "min" else float("-inf"))
-                for h in self.history]
+        sentinel = float("inf") if mode == "min" else float("-inf")
+        vals = [h.get(metric, sentinel) for h in self.history]
         if mode == "min":
             return int(np.argmin(vals))
         return int(np.argmax(vals))
@@ -262,7 +272,7 @@ class MetricTracker:
         return len(self.history)
 
     def __repr__(self) -> str:
-        cur = self.average()
+        cur   = self.average()
         items = ", ".join(f"{k}={v:.4f}" for k, v in cur.items())
         return f"MetricTracker(epochs={len(self.history)}, current=[{items}])"
 
@@ -276,56 +286,86 @@ class CSVMetricSink:
     Append-only CSV writer for per-epoch metrics.
 
     Creates the file and writes the header row on first call to
-    :meth:`write`.  Subsequent calls append rows, adding new columns
-    as they appear.
+    :meth:`write`.  Subsequent calls append rows.  If new metric keys
+    appear mid-training the file is rewritten using stdlib ``csv`` only
+    (no pandas dependency).
     """
 
     def __init__(self, path: PathLike) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._columns: Optional[List[str]] = None
+        self._rows_cache: List[Dict[str, Any]] = []   # for rewrite
         self._file = None
         self._writer = None
 
     def write(self, metrics: Dict[str, Any]) -> None:
-        """Append a row of metrics."""
+        """Append a row of metrics, rewriting header if new keys appear."""
+        row = {k: f"{v:.6g}" if isinstance(v, float) else v
+               for k, v in metrics.items()}
+
         if self._columns is None:
-            # First write — create file and header
+            # First write — open file and write header
             self._columns = sorted(metrics.keys())
-            self._file = open(self.path, "w", newline="", encoding="utf-8")
-            self._writer = csv.DictWriter(
-                self._file, fieldnames=self._columns, extrasaction="ignore"
-            )
+            self._open_append()
             self._writer.writeheader()
 
-        # Handle new columns by rewriting header (rare edge case)
-        new_keys = set(metrics.keys()) - set(self._columns)
+        new_keys = sorted(set(metrics.keys()) - set(self._columns))
         if new_keys:
-            self._columns = sorted(set(self._columns) | new_keys)
+            # FIX: rewrite using stdlib csv, not pandas
+            self._columns = sorted(set(self._columns) | set(new_keys))
             self.close()
-            # Re-open and rewrite
             self._rewrite_with_new_columns()
 
-        self._writer.writerow(
-            {k: f"{v:.6g}" if isinstance(v, float) else v for k, v in metrics.items()}
-        )
+        self._rows_cache.append(row)
+        self._writer.writerow(row)
         self._file.flush()
 
-    def _rewrite_with_new_columns(self) -> None:
-        """Rewrite the CSV with updated column set."""
-        import pandas as pd
-
-        df = pd.read_csv(self.path) if self.path.exists() else pd.DataFrame()
-        for col in self._columns:
-            if col not in df.columns:
-                df[col] = np.nan
-        df = df[self._columns]
-        df.to_csv(self.path, index=False)
-        # Re-open for appending
+    def _open_append(self) -> None:
         self._file = open(self.path, "a", newline="", encoding="utf-8")
         self._writer = csv.DictWriter(
-            self._file, fieldnames=self._columns, extrasaction="ignore"
+            self._file,
+            fieldnames=self._columns,
+            extrasaction="ignore",
         )
+
+    def _rewrite_with_new_columns(self) -> None:
+        """
+        Rewrite the CSV with the updated column set.
+
+        FIX: uses stdlib csv only — previous version imported pandas,
+        which crashed with ImportError in lightweight environments.
+        Falls back to the in-memory row cache if the file does not exist.
+        """
+        # Read existing file rows (if any) into memory
+        existing_rows: List[Dict[str, str]] = []
+        if self.path.exists() and self.path.stat().st_size > 0:
+            try:
+                with open(self.path, "r", newline="", encoding="utf-8") as f:
+                    reader = csv.DictReader(f)
+                    existing_rows = list(reader)
+            except Exception:
+                existing_rows = []
+
+        # If file was unreadable, use in-memory cache
+        if not existing_rows and self._rows_cache:
+            existing_rows = [
+                {k: str(v) for k, v in r.items()} for r in self._rows_cache
+            ]
+
+        # Rewrite the file with all columns
+        with open(self.path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=self._columns,
+                extrasaction="ignore",
+            )
+            writer.writeheader()
+            for r in existing_rows:
+                writer.writerow(r)
+
+        # Re-open in append mode (header already written)
+        self._open_append()
 
     def close(self) -> None:
         f = getattr(self, "_file", None)
@@ -339,8 +379,7 @@ class CSVMetricSink:
 class JSONLMetricSink:
     """
     Append-only JSON-lines writer.  Each call to :meth:`write` appends
-    one JSON object per line.  This format is easy to parse incrementally
-    and tolerates new keys without header issues.
+    one JSON object per line.  Tolerates new keys without header issues.
     """
 
     def __init__(self, path: PathLike) -> None:
@@ -376,18 +415,13 @@ class JSONLMetricSink:
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# 4.  W&B LOGGER
+# ═══════════════════════════════════════════════════════════════════════
 
 class WandbLogger:
     """
     Thin wrapper around W&B that silently no-ops when ``wandb`` is not
     installed or when the logger is disabled.
-
-    Usage
-    ─────
-    >>> wb = WandbLogger(enabled=True, project='tpno-mof', config=cfg)
-    >>> wb.log({'loss': 0.5}, step=100)
-    >>> wb.log_artifact('checkpoints/best.pt', name='best-model', type='model')
-    >>> wb.finish()
     """
 
     def __init__(
@@ -402,7 +436,7 @@ class WandbLogger:
         resume: Optional[str] = None,
     ) -> None:
         self.enabled = enabled
-        self._run = None
+        self._run    = None
 
         if not enabled:
             return
@@ -411,7 +445,7 @@ class WandbLogger:
             import wandb
 
             self._wandb = wandb
-            self._run = wandb.init(
+            self._run   = wandb.init(
                 project=project,
                 entity=entity,
                 name=name,
@@ -432,21 +466,17 @@ class WandbLogger:
             )
             self.enabled = False
 
-    # ── core methods ─────────────────────────────────────────────
-
     def log(
         self,
         metrics: Dict[str, Any],
         step: Optional[int] = None,
         commit: bool = True,
     ) -> None:
-        """Log metrics to W&B."""
         if not self.enabled or self._run is None:
             return
         self._wandb.log(metrics, step=step, commit=commit)
 
     def log_summary(self, metrics: Dict[str, Any]) -> None:
-        """Write to the W&B run summary (final metrics)."""
         if not self.enabled or self._run is None:
             return
         for k, v in metrics.items():
@@ -459,21 +489,24 @@ class WandbLogger:
         type: str = "model",
         metadata: Optional[Dict] = None,
     ) -> None:
-        """Log a file as a W&B artifact."""
         if not self.enabled or self._run is None:
             return
         artifact = self._wandb.Artifact(name, type=type, metadata=metadata)
         artifact.add_file(str(path))
         self._run.log_artifact(artifact)
 
-    def watch(self, model: Any, log: str = "gradients", log_freq: int = 100) -> None:
+    def watch(
+        self,
+        model: Any,
+        log_gradients: str = "gradients",
+        log_freq: int = 100,
+    ) -> None:
         """Watch a model for gradient / weight logging."""
         if not self.enabled or self._run is None:
             return
-        self._wandb.watch(model, log=log, log_freq=log_freq)
+        self._wandb.watch(model, log=log_gradients, log_freq=log_freq)
 
     def finish(self) -> None:
-        """Finish the W&B run."""
         if not self.enabled or self._run is None:
             return
         self._wandb.finish()
@@ -481,15 +514,11 @@ class WandbLogger:
 
     @property
     def run_id(self) -> Optional[str]:
-        if self._run is not None:
-            return self._run.id
-        return None
+        return self._run.id if self._run is not None else None
 
     @property
     def run_url(self) -> Optional[str]:
-        if self._run is not None:
-            return self._run.get_url()
-        return None
+        return self._run.get_url() if self._run is not None else None
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -504,18 +533,6 @@ class MetricLogger:
     * CSV file  (tabular, easy to load in pandas)
     * JSON-lines file  (structured, schema-flexible)
     * Weights & Biases  (interactive dashboards)
-
-    The trainer calls ``logger.log(metrics, step=epoch)`` once per
-    epoch and this class handles the rest.
-
-    Parameters
-    ----------
-    log_dir      : Directory for CSV / JSONL / log files.
-    experiment   : Experiment name (used for file naming).
-    use_wandb    : Enable W&B integration.
-    wandb_kwargs : Extra keyword arguments passed to ``WandbLogger``.
-    console      : Print summary to console via Python logger.
-    log_level    : Python logging level.
     """
 
     def __init__(
@@ -527,10 +544,9 @@ class MetricLogger:
         console: bool = True,
         log_level: Union[int, str] = logging.INFO,
     ) -> None:
-        self.log_dir = Path(log_dir)
+        self.log_dir    = Path(log_dir)
         self.experiment = experiment
 
-        # ── Python logger ────────────────────────────────────────
         self.logger = setup_logger(
             name=f"{PIPELINE_NAME}.{experiment}",
             level=log_level,
@@ -538,19 +554,14 @@ class MetricLogger:
             console=console,
         )
 
-        # ── File sinks ──────────────────────────────────────────
-        self.csv_sink = CSVMetricSink(self.log_dir / f"{experiment}_metrics.csv")
+        self.csv_sink   = CSVMetricSink(self.log_dir / f"{experiment}_metrics.csv")
         self.jsonl_sink = JSONLMetricSink(self.log_dir / f"{experiment}_metrics.jsonl")
 
-        # ── W&B ─────────────────────────────────────────────────
-        wb_kw = wandb_kwargs or {}
-        self.wandb = WandbLogger(enabled=use_wandb, **wb_kw)
+        wb_kw       = wandb_kwargs or {}
+        self.wandb  = WandbLogger(enabled=use_wandb, **wb_kw)
 
-        # ── Timing ──────────────────────────────────────────────
         self._epoch_start: Optional[float] = None
         self._train_start: Optional[float] = None
-
-    # ── core API ─────────────────────────────────────────────────
 
     def log(
         self,
@@ -561,31 +572,27 @@ class MetricLogger:
         """
         Log a dict of metrics to all sinks.
 
-        Parameters
-        ----------
-        metrics : Metric name → value mapping.
-        step    : Global step (typically epoch number).
-        prefix  : Optional prefix to prepend to metric names
-                  (e.g. ``'train/'``, ``'val/'``).
+        FIX: always works on a *copy* of metrics so the caller's dict is
+        never mutated.  Previous version did ``metrics["epoch"] = step``
+        and ``metrics.setdefault("timestamp", …)`` directly on the
+        original when prefix was empty.
         """
-        # Prefix keys if requested
-        if prefix:
-            metrics = {f"{prefix}{k}": v for k, v in metrics.items()}
+        # Always copy to avoid mutating caller's dict
+        m: Dict[str, Any] = (
+            {f"{prefix}{k}": v for k, v in metrics.items()} if prefix
+            else dict(metrics)
+        )
 
-        # Add step if not already present
-        if step is not None and "step" not in metrics and "epoch" not in metrics:
-            metrics["epoch"] = step
+        if step is not None and "step" not in m and "epoch" not in m:
+            m["epoch"] = step
 
-        # Add timestamp
-        metrics.setdefault("timestamp", datetime.now(timezone.utc).isoformat())
+        m.setdefault("timestamp", datetime.now(timezone.utc).isoformat())
 
-        # ── Fan out ──────────────────────────────────────────────
-        self.csv_sink.write(metrics)
-        self.jsonl_sink.write(metrics)
-        self.wandb.log(metrics, step=step)
+        self.csv_sink.write(m)
+        self.jsonl_sink.write(m)
+        self.wandb.log(m, step=step)
 
-        # ── Console summary ──────────────────────────────────────
-        summary = self._format_metrics(metrics)
+        summary = self._format_metrics(m)
         self.logger.info(summary)
 
     def log_epoch(
@@ -596,11 +603,7 @@ class MetricLogger:
         lr: Optional[float] = None,
         extra: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """
-        Convenience method for end-of-epoch logging.
-
-        Merges train / val metrics with standard prefixes and logs once.
-        """
+        """Convenience: merge train / val metrics and log once."""
         combined: Dict[str, Any] = {"epoch": epoch}
 
         for k, v in train_metrics.items():
@@ -618,7 +621,6 @@ class MetricLogger:
         if extra is not None:
             combined.update(extra)
 
-        # Timing
         if self._epoch_start is not None:
             combined["epoch_time_s"] = round(time.time() - self._epoch_start, 2)
         if self._train_start is not None:
@@ -626,10 +628,7 @@ class MetricLogger:
 
         self.log(combined, step=epoch)
 
-    # ── timing helpers ───────────────────────────────────────────
-
     def start_training(self) -> None:
-        """Call at the beginning of the training loop."""
         self._train_start = time.time()
         self.logger.info(
             "Training started — %s v%s — experiment: %s",
@@ -637,22 +636,17 @@ class MetricLogger:
         )
 
     def start_epoch(self) -> None:
-        """Call at the beginning of each epoch."""
         self._epoch_start = time.time()
 
     def eta(self, current_epoch: int, total_epochs: int) -> str:
-        """Return a human-readable ETA string."""
         if self._train_start is None or current_epoch == 0:
             return "N/A"
-        elapsed = time.time() - self._train_start
+        elapsed   = time.time() - self._train_start
         per_epoch = elapsed / current_epoch
         remaining = per_epoch * (total_epochs - current_epoch)
         return _format_seconds(remaining)
 
-    # ── cleanup ──────────────────────────────────────────────────
-
     def finish(self, final_metrics: Optional[Dict[str, Any]] = None) -> None:
-        """Finalise all sinks."""
         if final_metrics is not None:
             self.log(final_metrics, prefix="final/")
             self.wandb.log_summary(final_metrics)
@@ -663,21 +657,14 @@ class MetricLogger:
 
         self.logger.info("Logging finalised for experiment '%s'.", self.experiment)
 
-    # ── formatting ───────────────────────────────────────────────
-
     @staticmethod
     def _format_metrics(metrics: Dict[str, Any]) -> str:
-        """Format metrics dict into a human-readable one-liner."""
         parts = []
         for k, v in sorted(metrics.items()):
-            if k in ("timestamp",):
+            if k == "timestamp":
                 continue
             if isinstance(v, float):
-                # Adaptive formatting
-                if abs(v) < 0.001 and v != 0:
-                    parts.append(f"{k}={v:.2e}")
-                else:
-                    parts.append(f"{k}={v:.4f}")
+                parts.append(f"{k}={v:.2e}" if (abs(v) < 0.001 and v != 0) else f"{k}={v:.4f}")
             else:
                 parts.append(f"{k}={v}")
         return " │ ".join(parts)
@@ -712,7 +699,7 @@ def epoch_summary(
 
     Example output::
 
-        Epoch  12/100 │ loss=0.0342 │ val/mae=0.118 │ val/rmse=0.245 │ lr=3.0e-04 │ ETA 1h 23m 04s
+        Epoch  12/100 │ loss=0.0342 │ val/mae=0.118 │ lr=3.0e-04 │ ETA 1h 23m 04s
     """
     parts = [f"Epoch {epoch + 1:4d}/{total_epochs}"]
     parts.append(f"loss={train_loss:.4f}")
@@ -736,25 +723,22 @@ def log_model_summary(
     logger: Optional[logging.Logger] = None,
 ) -> str:
     """
-    Log a summary of model architecture and parameter count.
+    Log model architecture and parameter count.
 
-    Uses ``torchinfo`` if available, otherwise falls back to a simple
-    parameter count.
+    Uses ``torchinfo`` if available; falls back to a simple count.
     """
     if logger is None:
         logger = get_logger("model")
 
-    # Parameter count
-    total = sum(p.numel() for p in model.parameters())
+    total     = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    frozen = total - trainable
+    frozen    = total - trainable
 
     lines = [
         f"Model: {model.__class__.__name__}",
         f"  Parameters — total: {total:,}  trainable: {trainable:,}  frozen: {frozen:,}",
     ]
 
-    # Try torchinfo for a detailed table
     try:
         from torchinfo import summary as ti_summary
 
@@ -782,8 +766,6 @@ def progress_bar(
     """
     Thin wrapper around ``tqdm`` that falls back to a plain iterator
     if ``tqdm`` is not installed.
-
-    Accepts the same keyword arguments as ``tqdm.tqdm``.
     """
     if disable:
         return iterable
@@ -804,8 +786,6 @@ def log_phase(name: str, logger: Optional[logging.Logger] = None):
 
     >>> with log_phase("Data loading"):
     ...     dataset = load_data()
-    # INFO: ┌ Data loading
-    # INFO: └ Data loading — 12.34 s
     """
     if logger is None:
         logger = get_logger("phase")
@@ -826,12 +806,7 @@ def log_exception(
     logger: Optional[logging.Logger] = None,
     context: str = "",
 ) -> None:
-    """
-    Log an exception with traceback at ERROR level.
-
-    Useful in ``except`` blocks to ensure exceptions are recorded in
-    log files even if they are caught and handled.
-    """
+    """Log an exception with full traceback at ERROR level."""
     if logger is None:
         logger = get_logger("exception")
     msg = f"Exception in {context}: " if context else "Exception: "
@@ -843,6 +818,9 @@ def log_exception(
 # ═══════════════════════════════════════════════════════════════════════
 
 __all__ = [
+    # Identity
+    "PIPELINE_NAME",
+    "PIPELINE_VERSION",
     # Logger setup
     "setup_logger",
     "get_logger",

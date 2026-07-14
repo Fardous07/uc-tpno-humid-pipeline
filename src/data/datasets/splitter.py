@@ -37,8 +37,9 @@ class DataSplitter:
     Parameters
     ----------
     method       : ``'random'``, ``'scaffold'``, or ``'humidity'``.
-    test_size    : Fraction for test set.
-    val_size     : Fraction for validation set.
+    test_size    : Fraction for test set (used by random & scaffold only;
+                   humidity split uses the actual humid fraction).
+    val_size     : Fraction of **total** dataset for validation.
     random_state : Seed for reproducibility.
 
     Example
@@ -164,13 +165,20 @@ class DataSplitter:
         Train on dry conditions, test on humid.
 
         Humidity threshold: samples with ``humidity >= 0.05`` go to
-        test set.  Training is further split into train / val.
-        """
-        import pandas as pd
+        test set.  The training dry set is then split into train / val
+        where val is ``self.val_size`` fraction of the **total** dataset.
 
+        FIX: original code used
+            n_val = int(len(dry_arr) * self.val_size / (1 - self.test_size))
+        which divides by the *configured* test_size, not the actual humid
+        fraction.  In the humidity split the test set is all humid samples,
+        so self.test_size is irrelevant and gave a wrong n_val.
+        Correct: n_val = int(n_total * self.val_size), capped to dry set.
+        """
         if metadata is None or "humidity" not in metadata.columns:
             raise ValueError("Humidity split requires metadata with 'humidity' column.")
 
+        n_total = len(mof_ids)
         meta_idx = metadata.set_index("mof_id")
         dry_idx, humid_idx = [], []
 
@@ -186,10 +194,12 @@ class DataSplitter:
 
         test_idx = humid_idx
 
-        # Split dry into train / val
+        # val = self.val_size fraction of total, taken from dry set
+        # FIX: was int(len(dry_arr) * self.val_size / (1 - self.test_size))
+        #      — wrong denominator; self.test_size has no meaning here
         dry_arr = np.array(dry_idx)
         rng.shuffle(dry_arr)
-        n_val = max(1, int(len(dry_arr) * self.val_size / (1 - self.test_size)))
+        n_val = max(1, min(int(n_total * self.val_size), len(dry_arr) - 1))
         val_idx = dry_arr[:n_val].tolist()
         train_idx = dry_arr[n_val:].tolist()
 
@@ -218,8 +228,10 @@ class DataSplitter:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w") as f:
             json.dump(splits, f, indent=2)
-        logger.info(f"Saved splits to {path}: train={len(train_idx)}, "
-                     f"val={len(val_idx)}, test={len(test_idx)}")
+        logger.info(
+            f"Saved splits to {path}: train={len(train_idx)}, "
+            f"val={len(val_idx)}, test={len(test_idx)}"
+        )
 
     @staticmethod
     def load_splits(

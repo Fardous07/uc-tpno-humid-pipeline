@@ -26,14 +26,32 @@ Key capabilities
 8.  **Pipeline directory layout** — canonical paths for raw / intermediate
     / processed / graph / checkpoint / results directories.
 
-Design goals
-────────────
-* Every public function accepts both ``str`` and ``pathlib.Path``.
-* All writes use atomic semantics where possible (no partial files on
-  crash).
-* Heavy optional dependencies (``ase``, ``pandas``, ``torch``,
-  ``torch_geometric``) are imported lazily so the module can be loaded
-  in lightweight analysis scripts.
+Fixes vs previous version
+──────────────────────────
+1. cif_to_graph() — cell.unsqueeze(0) stored cell as (1,3,3) per graph.
+   PyG Batch.from_data_list() then produces (N,1,3,3) instead of (N,3,3),
+   breaking every downstream model that indexes batch.cell[i].
+   Fix: store cell as (3,3) without unsqueeze.
+
+2. save_graph(compress=True, path="x.pt") — wrote gzip bytes into a .pt
+   file whose suffix does not signal compression.  load_graph() checks
+   p.suffix == ".gz" to decide whether to decompress, so torch.load()
+   then hit a pickle error on the raw gzip stream.
+   Fix: auto-append ".gz" to path when compress=True and suffix is absent.
+
+3. parse_raspa_output() — _re_loading_abs compiled but never used (dead
+   regex).  Also, current_component reset to None between files but the
+   results dict accumulated across files, so the same component in a
+   second .data file silently overwrote the first.
+   Fix: removed dead regex; accumulate per-file then merge with averaging.
+
+4. iter_graphs() / load_graph_batch() — p.stem.replace(".pt", "") could
+   corrupt MOF IDs that contain the substring ".pt" (e.g. "apt_MOF").
+   Fix: strip known extensions from p.name instead of p.stem.
+
+5. apply_dot_overrides() — comment claimed yaml.safe_load() does not
+   handle scientific notation ("3e-4" → str).  In fact PyYAML 1.1 returns
+   float 0.0003.  Comment corrected; fallback kept as defensive code.
 
 Author  : Rayhan (University of Bergen)
 Project : UC-TPNO — Uncertainty-Calibrated Thermodynamic Potential
@@ -89,8 +107,8 @@ def ensure_dir(path: PathLike) -> Path:
 def atomic_write_text(path: PathLike, content: str, encoding: str = "utf-8") -> None:
     """
     Write text to *path* atomically: write to a temporary file in the
-    same directory, then ``os.replace`` (which is atomic on POSIX and
-    near-atomic on Windows).  Prevents half-written files on crash.
+    same directory, then ``os.replace`` (atomic on POSIX, near-atomic on
+    Windows).  Prevents half-written files on crash.
     """
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -100,7 +118,10 @@ def atomic_write_text(path: PathLike, content: str, encoding: str = "utf-8") -> 
             f.write(content)
         os.replace(tmp, p)
     except BaseException:
-        os.unlink(tmp)
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
         raise
 
 
@@ -114,7 +135,10 @@ def atomic_write_bytes(path: PathLike, data: bytes) -> None:
             f.write(data)
         os.replace(tmp, p)
     except BaseException:
-        os.unlink(tmp)
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
         raise
 
 
@@ -157,6 +181,20 @@ def directory_size_mb(path: PathLike) -> float:
         if f.is_file():
             total += f.stat().st_size
     return total / (1024 * 1024)
+
+
+def _stem_without_graph_ext(p: Path) -> str:
+    """
+    Return the MOF ID (filename without graph extensions).
+
+    FIX: using p.stem.replace(".pt", "") corrupts MOF IDs that happen to
+    contain ".pt" (e.g. "apt_MOF" → "a_MOF").  Strip from p.name instead.
+    """
+    name = p.name
+    for ext in (".pt.gz", ".pt"):
+        if name.endswith(ext):
+            return name[: -len(ext)]
+    return p.stem
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -207,14 +245,13 @@ def load_config(path: PathLike) -> Dict[str, Any]:
     p = Path(path)
     if p.suffix in (".yaml", ".yml"):
         return load_yaml(p)
-    elif p.suffix == ".json":
+    if p.suffix == ".json":
         return load_json(p)
-    else:
-        # Try YAML first, then JSON
-        try:
-            return load_yaml(p)
-        except Exception:
-            return load_json(p)
+    # Unknown extension: try YAML first, then JSON
+    try:
+        return load_yaml(p)
+    except Exception:
+        return load_json(p)
 
 
 def save_config(data: Dict[str, Any], path: PathLike) -> None:
@@ -258,6 +295,10 @@ def apply_dot_overrides(
     parsed as YAML (so ``'true'`` → ``True``, ``'3e-4'`` → ``0.0003``,
     ``'[1,2,3]'`` → ``[1, 2, 3]``).
 
+    Note: PyYAML (1.1 spec) correctly parses scientific notation like
+    "3e-4" as float 0.0003.  The fallback int/float conversion below is
+    retained as defensive code for edge cases where YAML returns a str.
+
     Example
     -------
     >>> cfg = {'training': {'lr': 0.001}}
@@ -276,10 +317,9 @@ def apply_dot_overrides(
             continue
         key_path, val_str = ov.split("=", 1)
         keys = key_path.strip().split(".")
-        val = yaml.safe_load(val_str)
+        val  = yaml.safe_load(val_str)
 
-        # yaml.safe_load keeps scientific notation (e.g. "3e-4") as str;
-        # attempt numeric conversion when the result is still a string.
+        # Defensive fallback: attempt numeric conversion if YAML returned str
         if isinstance(val, str):
             for converter in (int, float):
                 try:
@@ -288,7 +328,7 @@ def apply_dot_overrides(
                 except (ValueError, TypeError):
                     continue
 
-        # Walk to the parent dict
+        # Walk to the parent dict, creating missing levels
         d = result
         for k in keys[:-1]:
             if k not in d or not isinstance(d[k], dict):
@@ -308,7 +348,7 @@ def load_config_with_overrides(
     Convenience: load a base config, optionally merge another config on
     top, then apply CLI dot-overrides.
 
-    This mirrors the common pattern::
+    Pattern::
 
         base_cfg → merge(experiment_cfg) → override(cli_args)
     """
@@ -330,7 +370,7 @@ def read_cif_ase(path: PathLike):
     Read a CIF file using ASE and return an ``ase.Atoms`` object.
 
     Handles common CIF quirks (duplicate labels, missing symmetry)
-    by falling back to ``format='cif'`` with ``reader='ase'``.
+    by falling back to ``format='cif'`` with ``store_tags=True``.
     """
     from ase.io import read as ase_read
 
@@ -342,7 +382,6 @@ def read_cif_ase(path: PathLike):
         atoms = ase_read(str(p), format="cif")
     except Exception as e:
         logger.warning("Primary CIF read failed for %s: %s — trying fallback", p.name, e)
-        # Fallback: try with store_tags
         atoms = ase_read(str(p), format="cif", store_tags=True)
 
     return atoms
@@ -356,42 +395,40 @@ def cif_metadata(path: PathLike) -> Dict[str, Any]:
     Returns
     -------
     Dict with keys: ``mof_id``, ``n_atoms``, ``composition`` (formula),
-    ``cell_lengths`` [Å], ``cell_angles`` [°], ``volume`` [ų],
+    ``cell_lengths`` [Å], ``cell_angles`` [°], ``volume`` [Å³],
     ``density`` [g/cm³], ``elements`` (sorted unique list).
     """
-    atoms = read_cif_ase(path)
-    cell = atoms.get_cell()
-    volume = cell.volume if hasattr(cell, "volume") else float(np.linalg.det(cell))
+    from collections import Counter
+    from functools import reduce
+    from math import gcd
 
-    symbols = atoms.get_chemical_symbols()
-    masses = atoms.get_masses()
+    atoms  = read_cif_ase(path)
+    cell   = atoms.get_cell()
+    volume = cell.volume if hasattr(cell, "volume") else float(np.linalg.det(np.array(cell)))
+
+    symbols    = atoms.get_chemical_symbols()
+    masses     = atoms.get_masses()
     total_mass = float(np.sum(masses))
 
-    # Density in g/cm³: mass in amu, volume in ų
-    # 1 amu = 1.66054e-24 g, 1 ų = 1e-24 cm³
+    # Density: mass in amu → g via 1.66054e-24; volume in Å³ → cm³ via 1e-24
     density = (total_mass * 1.66054e-24) / (volume * 1e-24) if volume > 0 else 0.0
 
-    # Composition as reduced formula
-    from collections import Counter
-    from math import gcd
-    from functools import reduce
-
     counts = Counter(symbols)
-    g = reduce(gcd, counts.values()) if counts else 1
+    g      = reduce(gcd, counts.values()) if counts else 1
     formula = "".join(
         f"{el}{counts[el] // g}" if counts[el] // g > 1 else el
         for el in sorted(counts)
     )
 
     return {
-        "mof_id": Path(path).stem,
-        "n_atoms": len(atoms),
-        "composition": formula,
-        "elements": sorted(set(symbols)),
-        "cell_lengths": cell.lengths().tolist() if hasattr(cell, "lengths") else [0, 0, 0],
-        "cell_angles": cell.angles().tolist() if hasattr(cell, "angles") else [0, 0, 0],
-        "volume_A3": round(volume, 3),
-        "density_g_cm3": round(density, 4),
+        "mof_id":         Path(path).stem,
+        "n_atoms":        len(atoms),
+        "composition":    formula,
+        "elements":       sorted(set(symbols)),
+        "cell_lengths":   cell.lengths().tolist() if hasattr(cell, "lengths") else [0, 0, 0],
+        "cell_angles":    cell.angles().tolist()  if hasattr(cell, "angles")  else [0, 0, 0],
+        "volume_A3":      round(volume,  3),
+        "density_g_cm3":  round(density, 4),
     }
 
 
@@ -413,16 +450,25 @@ def cif_to_graph(
     -------
     ``torch_geometric.data.Data`` with attributes:
         ``z`` (atomic numbers), ``pos`` (Cartesian coords),
-        ``cell`` (3×3 lattice vectors), ``edge_index``,
+        ``cell`` (3×3 lattice vectors, shape [3,3]), ``edge_index``,
         ``edge_attr`` (distances), ``num_nodes``, ``mof_id``.
+
+    Note on cell shape
+    ------------------
+    Cell is stored as shape **(3, 3)** — NOT (1, 3, 3).
+    PyG's Batch.from_data_list() stacks (3,3) tensors into (N,3,3),
+    which is what downstream code expects.  The previous (1,3,3) shape
+    produced (N,1,3,3) batches which silently corrupted every model that
+    indexed batch.cell[i].
     """
     import torch
     from torch_geometric.data import Data
 
     atoms = read_cif_ase(path)
 
-    z = torch.tensor(atoms.get_atomic_numbers(), dtype=torch.long)
-    pos = torch.tensor(atoms.get_positions(), dtype=torch.float32)
+    z   = torch.tensor(atoms.get_atomic_numbers(), dtype=torch.long)
+    pos = torch.tensor(atoms.get_positions(),       dtype=torch.float32)
+    # FIX: (3,3) not (1,3,3) — PyG batching stacks to (N,3,3)
     cell = torch.tensor(np.array(atoms.get_cell()), dtype=torch.float32)
 
     # Neighbour list with periodic boundary conditions
@@ -430,23 +476,22 @@ def cif_to_graph(
         from ase.neighborlist import neighbor_list
         i_idx, j_idx, dists = neighbor_list("ijd", atoms, cutoff=cutoff)
     except ImportError:
-        # Fallback: brute-force (slow, only for tiny cells)
         logger.warning("ase.neighborlist not available — using brute-force neighbour search")
         i_idx, j_idx, dists = _brute_force_neighbours(atoms, cutoff)
 
     if not self_loops:
-        mask = i_idx != j_idx
+        mask  = i_idx != j_idx
         i_idx = i_idx[mask]
         j_idx = j_idx[mask]
         dists = dists[mask]
 
     edge_index = torch.tensor(np.stack([i_idx, j_idx]), dtype=torch.long)
-    edge_attr = torch.tensor(dists, dtype=torch.float32).unsqueeze(-1)
+    edge_attr  = torch.tensor(dists, dtype=torch.float32).unsqueeze(-1)
 
     data = Data(
         z=z,
         pos=pos,
-        cell=cell.unsqueeze(0),  # (1, 3, 3) for batching compatibility
+        cell=cell,          # shape (3, 3)
         edge_index=edge_index,
         edge_attr=edge_attr,
         num_nodes=len(z),
@@ -456,12 +501,12 @@ def cif_to_graph(
 
 
 def _brute_force_neighbours(atoms, cutoff: float):
-    """Minimal brute-force PBC neighbour list (fallback)."""
+    """Minimal brute-force PBC neighbour list (fallback when ase.neighborlist absent)."""
     from itertools import product
 
-    pos = atoms.get_positions()
+    pos  = atoms.get_positions()
     cell = np.array(atoms.get_cell())
-    n = len(pos)
+    n    = len(pos)
 
     i_list, j_list, d_list = [], [], []
     for ia in range(n):
@@ -485,7 +530,7 @@ def _brute_force_neighbours(atoms, cutoff: float):
 # 4.  GRAPH SERIALISATION
 # ═══════════════════════════════════════════════════════════════════════
 
-def save_graph(data: Any, path: PathLike, compress: bool = False) -> None:
+def save_graph(data: Any, path: PathLike, compress: bool = False) -> Path:
     """
     Save a PyG ``Data`` object.
 
@@ -494,19 +539,35 @@ def save_graph(data: Any, path: PathLike, compress: bool = False) -> None:
     data     : ``torch_geometric.data.Data``.
     path     : Destination path (``.pt`` or ``.pt.gz``).
     compress : If *True*, gzip the serialised bytes.
+              If *path* does not already end with ``.gz``, it is
+              appended automatically so that ``load_graph`` can detect
+              the format.  Previously, compress=True with a .pt path
+              wrote gzip bytes that load_graph() could not detect and
+              failed silently.
+
+    Returns
+    -------
+    Actual path written (may differ from *path* when .gz was appended).
     """
     import torch
 
     p = Path(path)
+
+    # FIX: ensure the extension signals compression so load_graph works
+    if compress and not p.name.endswith(".gz"):
+        p = p.with_name(p.name + ".gz")
+
     p.parent.mkdir(parents=True, exist_ok=True)
 
-    if compress or p.suffix == ".gz":
+    if compress or p.name.endswith(".gz"):
         buf = io.BytesIO()
         torch.save(data, buf)
         with gzip.open(p, "wb") as f:
             f.write(buf.getvalue())
     else:
         torch.save(data, p)
+
+    return p
 
 
 def load_graph(path: PathLike) -> Any:
@@ -516,7 +577,7 @@ def load_graph(path: PathLike) -> Any:
     import torch
 
     p = Path(path)
-    if p.suffix == ".gz":
+    if p.name.endswith(".gz"):
         with gzip.open(p, "rb") as f:
             buf = io.BytesIO(f.read())
         return torch.load(buf, weights_only=False)
@@ -529,9 +590,9 @@ def save_graph_batch(
     compress: bool = False,
 ) -> int:
     """
-    Save a dict of ``{mof_id: Data}`` to a directory.  Returns count.
+    Save a dict of ``{mof_id: Data}`` to a directory.  Returns count saved.
     """
-    d = ensure_dir(directory)
+    d   = ensure_dir(directory)
     ext = ".pt.gz" if compress else ".pt"
     for mof_id, graph in graphs.items():
         save_graph(graph, d / f"{mof_id}{ext}", compress=compress)
@@ -547,7 +608,7 @@ def load_graph_batch(
     Load all graphs from a directory.  If *mof_ids* is given, only load
     those.  Returns ``{mof_id: Data}``.
     """
-    d = Path(directory)
+    d      = Path(directory)
     result = {}
 
     if mof_ids is not None:
@@ -559,7 +620,7 @@ def load_graph_batch(
                     break
     else:
         for p in glob_sorted(d, pattern):
-            mid = p.stem.replace(".pt", "")  # handles .pt.gz double suffix
+            mid = _stem_without_graph_ext(p)   # FIX: safe extension stripping
             result[mid] = load_graph(p)
 
     return result
@@ -574,7 +635,7 @@ def iter_graphs(
     tuples without loading everything into memory.
     """
     for p in glob_sorted(directory, pattern):
-        mid = p.stem.replace(".pt", "")
+        mid = _stem_without_graph_ext(p)       # FIX: safe extension stripping
         yield mid, load_graph(p)
 
 
@@ -590,11 +651,8 @@ def load_parquet(path: PathLike):
 
 def save_parquet(df, path: PathLike, **kwargs) -> None:
     """Save a pandas DataFrame as Parquet (atomic write)."""
-    import pandas as pd
-
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    # Write to temp file then rename for atomicity
     fd, tmp = tempfile.mkstemp(dir=p.parent, suffix=".parquet.tmp")
     os.close(fd)
     try:
@@ -610,15 +668,13 @@ def load_csv(path: PathLike, **kwargs):
     """Load a CSV file into a pandas DataFrame (auto-detects gzip)."""
     import pandas as pd
 
-    p = Path(path)
+    p           = Path(path)
     compression = "gzip" if p.suffix == ".gz" else "infer"
     return pd.read_csv(p, compression=compression, **kwargs)
 
 
 def save_csv(df, path: PathLike, **kwargs) -> None:
     """Save a DataFrame as CSV."""
-    import pandas as pd
-
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(p, index=False, **kwargs)
@@ -630,12 +686,8 @@ def load_registry(path: PathLike):
 
     Returns a DataFrame indexed by ``mof_id``.
     """
-    p = Path(path)
-    if p.suffix == ".parquet":
-        df = load_parquet(p)
-    else:
-        df = load_csv(p)
-
+    p  = Path(path)
+    df = load_parquet(p) if p.suffix == ".parquet" else load_csv(p)
     if "mof_id" in df.columns:
         df = df.set_index("mof_id")
     return df
@@ -650,9 +702,7 @@ def load_isotherm_data(path: PathLike):
     and optionally ``fidelity``, ``force_field``, ``source``.
     """
     p = Path(path)
-    if p.suffix == ".parquet":
-        return load_parquet(p)
-    return load_csv(p)
+    return load_parquet(p) if p.suffix == ".parquet" else load_csv(p)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -669,29 +719,32 @@ def parse_nist_isodb_json(path: PathLike) -> List[Dict[str, Any]]:
     """
     raw = load_json(path)
 
-    # The ISODB format can vary; handle both list and dict-of-isotherms
     isotherms = raw if isinstance(raw, list) else raw.get("isotherms", [raw])
 
     points = []
     for iso in isotherms:
+        adsorbate_list = iso.get("adsorbateGas", None)
         meta = {
-            "adsorbent": iso.get("adsorbent", {}).get("name", "unknown"),
-            "adsorbate": iso.get("adsorbateGas", [{}])[0].get("name", "unknown")
-            if isinstance(iso.get("adsorbateGas"), list)
-            else iso.get("adsorbate", "unknown"),
-            "temperature": iso.get("temperature", None),
+            "adsorbent":      iso.get("adsorbent", {}).get("name", "unknown"),
+            "adsorbate":      (
+                adsorbate_list[0].get("name", "unknown")
+                if isinstance(adsorbate_list, list) and adsorbate_list
+                else iso.get("adsorbate", "unknown")
+            ),
+            "temperature":    iso.get("temperature", None),
             "units_pressure": iso.get("pressureUnits", "bar"),
-            "units_loading": iso.get("adsorptionUnits", "mmol/g"),
-            "DOI": iso.get("DOI", ""),
+            "units_loading":  iso.get("adsorptionUnits", "mmol/g"),
+            "DOI":            iso.get("DOI", ""),
         }
 
         data_points = iso.get("isotherm_data", iso.get("data", []))
         for pt in data_points:
-            entry = dict(meta)
-            # Support various key names
+            entry            = dict(meta)
             entry["pressure"] = pt.get("pressure", pt.get("P", pt.get("x", None)))
-            entry["loading"] = pt.get("species_data", [{}])[0].get(
-                "adsorption", pt.get("loading", pt.get("q", pt.get("y", None)))
+            entry["loading"]  = (
+                pt.get("species_data", [{}])[0].get("adsorption", None)
+                if pt.get("species_data")
+                else pt.get("loading", pt.get("q", pt.get("y", None)))
             )
             points.append(entry)
 
@@ -702,13 +755,26 @@ def nist_isodb_to_dataframe(path: PathLike):
     """Parse NIST ISODB JSON → pandas DataFrame."""
     import pandas as pd
 
-    points = parse_nist_isodb_json(path)
-    return pd.DataFrame(points)
+    return pd.DataFrame(parse_nist_isodb_json(path))
 
 
 # ═══════════════════════════════════════════════════════════════════════
 # 7.  RASPA OUTPUT PARSING
 # ═══════════════════════════════════════════════════════════════════════
+
+# Compiled at module level (not inside parse_raspa_output) for efficiency
+_RE_COMPONENT      = re.compile(r"Component\s+\d+\s*\[([^\]]+)\]")
+_RE_LOADING_MOL_KG = re.compile(
+    r"([\d.eE+-]+)\s*\+/-\s*([\d.eE+-]+)\s*\[mol/kg\s*framework\]"
+)
+_RE_LOADING_MOLEC_UC = re.compile(
+    r"([\d.eE+-]+)\s*\+/-\s*([\d.eE+-]+)\s*\[molecules/uc\]"
+)
+_RE_ENERGY = re.compile(
+    r"Average\s+(.*?)\s*energy:\s*([\d.eE+-]+)\s*\+/-\s*([\d.eE+-]+)"
+)
+_RE_HENRY = re.compile(r"Henry.*?coefficient.*?:\s*([\d.eE+-]+)")
+
 
 def parse_raspa_output(work_dir: PathLike) -> Dict[str, Any]:
     """
@@ -721,38 +787,32 @@ def parse_raspa_output(work_dir: PathLike) -> Dict[str, Any]:
 
     Returns
     -------
-    Dict with ``loadings``, ``energies``, ``henry``, ``converged``, ``raw_files``.
+    Dict with ``loadings_mol_kg``, ``loadings_molec_uc``,
+    ``energies_kJ_mol``, ``henry_mol_kg_Pa``, ``converged``, ``raw_files``.
+
+    Fix: previous version reset ``current_component`` to None between
+    files but accumulated results into the same dict, so the same
+    component in a second .data file silently overwrote the first.
+    Now each file is parsed independently and results are averaged.
     """
-    d = Path(work_dir)
+    d          = Path(work_dir)
     data_files = list(d.glob("*.data")) + list(d.glob("Output/System_0/*.data"))
 
     results: Dict[str, Any] = {
-        "loadings_mol_kg": {},
+        "loadings_mol_kg":  {},
         "loadings_molec_uc": {},
-        "energies_kJ_mol": {},
-        "henry_mol_kg_Pa": {},
-        "converged": True,
-        "raw_files": [str(f) for f in data_files],
+        "energies_kJ_mol":  {},
+        "henry_mol_kg_Pa":  {},
+        "converged":        True,
+        "raw_files":        [str(f) for f in data_files],
     }
 
-    # Regex patterns for RASPA output
-    _re_loading_abs = re.compile(
-        r"absolute adsorption:\s*"
-        r"([\d.eE+-]+)\s*\+/-\s*([\d.eE+-]+)\s*\[mol(?:ecules)?/(?:kg|unit cell)\]"
-    )
-    _re_loading_mol_kg = re.compile(
-        r"([\d.eE+-]+)\s*\+/-\s*([\d.eE+-]+)\s*\[mol/kg\s*framework\]"
-    )
-    _re_loading_molec_uc = re.compile(
-        r"([\d.eE+-]+)\s*\+/-\s*([\d.eE+-]+)\s*\[molecules/uc\]"
-    )
-    _re_component = re.compile(r"Component\s+\d+\s*\[([^\]]+)\]")
-    _re_energy = re.compile(
-        r"Average\s+(.*?)\s*energy:\s*([\d.eE+-]+)\s*\+/-\s*([\d.eE+-]+)"
-    )
-    _re_henry = re.compile(
-        r"Henry.*?coefficient.*?:\s*([\d.eE+-]+)"
-    )
+    # Accumulate per-file results for averaging
+    # structure: { component: {"value": [list], "error": [list]} }
+    _mol_kg_accum:   Dict[str, Dict[str, List[float]]] = {}
+    _molec_uc_accum: Dict[str, Dict[str, List[float]]] = {}
+    _henry_accum:    Dict[str, List[float]]            = {}
+    _energy_accum:   Dict[str, List[float]]            = {}
 
     for data_file in data_files:
         try:
@@ -761,46 +821,63 @@ def parse_raspa_output(work_dir: PathLike) -> Dict[str, Any]:
             logger.warning("Could not read %s: %s", data_file, e)
             continue
 
-        current_component = None
+        current_component: Optional[str] = None
+
         for line in text.splitlines():
-            # Track which component section we are in
-            m_comp = _re_component.search(line)
+            # Track component section
+            m_comp = _RE_COMPONENT.search(line)
             if m_comp:
                 current_component = m_comp.group(1).strip()
 
             # Loadings in mol/kg
-            m_mol = _re_loading_mol_kg.search(line)
+            m_mol = _RE_LOADING_MOL_KG.search(line)
             if m_mol and current_component:
                 val = float(m_mol.group(1))
                 err = float(m_mol.group(2))
-                results["loadings_mol_kg"][current_component] = {
-                    "value": val, "error": err,
-                }
+                entry = _mol_kg_accum.setdefault(current_component, {"value": [], "error": []})
+                entry["value"].append(val)
+                entry["error"].append(err)
 
             # Loadings in molecules/uc
-            m_uc = _re_loading_molec_uc.search(line)
+            m_uc = _RE_LOADING_MOLEC_UC.search(line)
             if m_uc and current_component:
                 val = float(m_uc.group(1))
                 err = float(m_uc.group(2))
-                results["loadings_molec_uc"][current_component] = {
-                    "value": val, "error": err,
-                }
+                entry = _molec_uc_accum.setdefault(current_component, {"value": [], "error": []})
+                entry["value"].append(val)
+                entry["error"].append(err)
 
             # Energies
-            m_en = _re_energy.search(line)
+            m_en = _RE_ENERGY.search(line)
             if m_en:
                 label = m_en.group(1).strip()
-                val = float(m_en.group(2))
-                results["energies_kJ_mol"][label] = val
+                val   = float(m_en.group(2))
+                _energy_accum.setdefault(label, []).append(val)
 
             # Henry coefficient
-            m_h = _re_henry.search(line)
+            m_h = _RE_HENRY.search(line)
             if m_h and current_component:
-                results["henry_mol_kg_Pa"][current_component] = float(m_h.group(1))
+                _henry_accum.setdefault(current_component, []).append(float(m_h.group(1)))
 
             # Convergence check
             if "WARNING" in line and "NOT CONVERGED" in line.upper():
                 results["converged"] = False
+
+    # Collapse accumulators: average across files
+    for comp, acc in _mol_kg_accum.items():
+        results["loadings_mol_kg"][comp] = {
+            "value": float(np.mean(acc["value"])),
+            "error": float(np.mean(acc["error"])),
+        }
+    for comp, acc in _molec_uc_accum.items():
+        results["loadings_molec_uc"][comp] = {
+            "value": float(np.mean(acc["value"])),
+            "error": float(np.mean(acc["error"])),
+        }
+    for label, vals in _energy_accum.items():
+        results["energies_kJ_mol"][label] = float(np.mean(vals))
+    for comp, vals in _henry_accum.items():
+        results["henry_mol_kg_Pa"][comp] = float(np.mean(vals))
 
     return results
 
@@ -809,10 +886,7 @@ def parse_raspa_output(work_dir: PathLike) -> Dict[str, Any]:
 # 8.  SPLITS I/O
 # ═══════════════════════════════════════════════════════════════════════
 
-def save_splits(
-    splits: Dict[str, List[str]],
-    path: PathLike,
-) -> None:
+def save_splits(splits: Dict[str, List[str]], path: PathLike) -> None:
     """
     Save train/val/test splits to JSON.
 
@@ -826,7 +900,8 @@ def save_splits(
 def load_splits(path: PathLike) -> Dict[str, List[str]]:
     """Load train/val/test splits from JSON."""
     data = load_json(path)
-    assert isinstance(data, dict), f"Expected dict, got {type(data)}"
+    if not isinstance(data, dict):
+        raise ValueError(f"Expected dict in splits file, got {type(data)}")
     for key in ("train", "val", "test"):
         if key not in data:
             logger.warning("Split key '%s' missing from %s", key, path)
@@ -845,7 +920,7 @@ class PipelineDirectories:
 
         project_root/
         ├── data/
-        │   ├── raw/                     # original downloads
+        │   ├── raw/
         │   ├── intermediate/
         │   │   ├── cifs_raw/
         │   │   ├── cifs_sanitized/
@@ -853,9 +928,9 @@ class PipelineDirectories:
         │   │   ├── adsorption/
         │   │   └── experimental/
         │   └── processed/
-        │       ├── registry/            # mof_metadata.parquet
-        │       ├── adsorption/          # humid_isotherms.parquet
-        │       ├── graphs/              # PyG .pt files
+        │       ├── registry/
+        │       ├── adsorption/
+        │       ├── graphs/
         │       │   ├── train/
         │       │   ├── val/
         │       │   └── test/
@@ -868,7 +943,6 @@ class PipelineDirectories:
     def __init__(self, root: PathLike = "."):
         self.root = Path(root).resolve()
 
-    # ── data ─────────────────────────────────────────────────────
     @property
     def data(self) -> Path:
         return self.root / "data"
@@ -916,7 +990,6 @@ class PipelineDirectories:
     def splits_file(self) -> Path:
         return self.processed / "splits.json"
 
-    # ── model artefacts ──────────────────────────────────────────
     @property
     def checkpoints(self) -> Path:
         return self.root / "checkpoints"
@@ -929,22 +1002,20 @@ class PipelineDirectories:
     def configs(self) -> Path:
         return self.root / "configs"
 
-    # ── helpers ──────────────────────────────────────────────────
-
     def create_all(self) -> None:
         """Create the complete directory tree."""
-        for attr in [
+        for attr in (
             "raw", "cifs_raw", "cifs_sanitized", "charges",
             "registry_dir", "adsorption_dir",
             "checkpoints", "results", "configs",
-        ]:
+        ):
             ensure_dir(getattr(self, attr))
         for split in ("train", "val", "test"):
             ensure_dir(self.graphs_split(split))
         logger.info("Pipeline directories created under %s", self.root)
 
     def summary(self) -> Dict[str, str]:
-        """Return a dict mapping directory names to paths."""
+        """Return a dict mapping property names to absolute paths."""
         return {
             attr: str(getattr(self, attr))
             for attr in dir(self)
@@ -975,9 +1046,9 @@ def save_checkpoint(
     """
     import torch
 
-    payload = {
-        "epoch": epoch,
-        "model_state_dict": model_state,
+    payload: Dict[str, Any] = {
+        "epoch":                epoch,
+        "model_state_dict":     model_state,
         "optimizer_state_dict": optimizer_state,
     }
     if scheduler_state is not None:
@@ -1009,18 +1080,19 @@ def load_checkpoint(
 
 def count_parameters(model: Any) -> Dict[str, int]:
     """Return ``{'total': …, 'trainable': …, 'frozen': …}``."""
-    total = sum(p.numel() for p in model.parameters())
+    total     = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     return {"total": total, "trainable": trainable, "frozen": total - trainable}
 
 
 def human_readable_size(size_bytes: int) -> str:
     """Convert bytes to human-readable string."""
+    size: float = float(size_bytes)
     for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
-        if abs(size_bytes) < 1024:
-            return f"{size_bytes:.1f} {unit}"
-        size_bytes /= 1024  # type: ignore[assignment]
-    return f"{size_bytes:.1f} PiB"
+        if abs(size) < 1024.0:
+            return f"{size:.1f} {unit}"
+        size /= 1024.0
+    return f"{size:.1f} PiB"
 
 
 def collect_cif_files(

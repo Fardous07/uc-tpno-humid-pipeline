@@ -1,55 +1,9 @@
-"""
-Thermodynamic Potential Neural Operator (TPNO).
-
-Physics-constrained neural operator that learns the grand potential
-Ω(μ, T; h) conditioned on a MOF embedding *h* and derives adsorption
-loadings by automatic differentiation:
-
-    nᵢ = −∂Ω / ∂μᵢ          (loadings from chemical potentials)
-
-The core of the operator is an **Input Convex Neural Network** (ICNN)
-whose weights along the passthrough path are constrained to be
-non-negative, guaranteeing that Ω is convex in (μ, T).  Convexity
-implies thermodynamic stability (the Gibbs–Duhem inequality) and
-ensures well-posed isotherms (monotonically increasing loading with
-chemical potential).
-
-Architecture overview
-─────────────────────
-1.  **Encoder** (external) — produces a MOF embedding h ∈ ℝ^{emb_dim}.
-2.  **FiLM conditioning** — maps h → (γ, β) that modulate the first
-    ICNN hidden layer, making the potential MOF-specific.
-3.  **ICNN** — learns Ω(μ, T) with guaranteed convexity in μ.
-4.  **Autograd differentiation** — computes n = −∂Ω/∂μ at zero extra
-    parameter cost; second derivatives give the Hessian for Maxwell-
-    relation regularisation.
-5.  **Aleatoric uncertainty head** — a separate MLP predicts per-
-    component log-variance from the MOF embedding (heteroscedastic
-    Gaussian noise model).
-6.  **Deep ensemble wrapper** — ``TPNOEnsemble`` trains M independent
-    copies and decomposes total uncertainty into epistemic (model
-    disagreement) and aleatoric (average noise) components.
-
-References
-──────────
-[1] Amos et al. (2017). Input Convex Neural Networks. ICML.
-[2] Perez et al. (2018). FiLM: Visual Reasoning with a General
-    Conditioning Layer. AAAI.
-[3] Lakshminarayanan et al. (2017). Simple and Scalable Predictive
-    Uncertainty Estimation using Deep Ensembles. NeurIPS.
-
-Author  : Rayhan (University of Bergen)
-Project : UC-TPNO — Uncertainty-Calibrated Thermodynamic Potential
-          Neural Operator for Humid Flue-Gas CO₂ Capture in MOFs
-License : MIT
-"""
-
 from __future__ import annotations
 
 import copy
 import math
-from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.autograd as autograd
@@ -57,39 +11,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# 1.  CONFIGURATION
-# ═══════════════════════════════════════════════════════════════════════
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
 
 @dataclass
 class TPNOConfig:
-    """
-    Hyperparameters for the Thermodynamic Potential Neural Operator.
-
-    Attributes
-    ──────────
-    emb_dim                 : Dimension of the MOF embedding from encoder.
-    hidden_dim              : Width of every ICNN hidden layer.
-    n_layers                : Number of ICNN hidden layers.
-    n_conditions            : Number of thermodynamic inputs
-                              (default 4: μ_CO₂, μ_N₂, μ_H₂O, T).
-    n_components            : Number of adsorbate species (CO₂, N₂, H₂O).
-    convex_constraint       : Method to enforce Uᵢ ≥ 0 weights.
-                              One of ``'softplus'``, ``'exp'``, ``'clamp'``.
-    film_conditioning       : Use FiLM to condition ICNN on MOF embedding.
-    dropout                 : Dropout probability.
-    use_layer_norm          : Apply LayerNorm inside ICNN hidden layers.
-    activation              : Activation function (``'swish'``, ``'relu'``,
-                              ``'gelu'``).
-    min_potential           : Additive floor on Ω for numerical stability.
-    """
-
     emb_dim: int = 128
     hidden_dim: int = 256
     n_layers: int = 4
-    n_conditions: int = 4
-    n_components: int = 3
-    convex_constraint: str = "softplus"
+    n_conditions: int = 4       # μ_CO2, μ_N2, μ_H2O, T
+    n_components: int = 3       # CO2, N2, H2O
+    convex_constraint: str = "softplus"   # "softplus" | "exp" | "clamp"
     film_conditioning: bool = True
     dropout: float = 0.1
     use_layer_norm: bool = True
@@ -97,19 +30,16 @@ class TPNOConfig:
     min_potential: float = 1e-6
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# 2.  ACTIVATION HELPER
-# ═══════════════════════════════════════════════════════════════════════
+# ---------------------------------------------------------------------------
+# Activations
+# ---------------------------------------------------------------------------
 
 class Swish(nn.Module):
-    """Swish / SiLU activation: x · σ(x)."""
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x * torch.sigmoid(x)
 
 
 def _make_activation(name: str) -> nn.Module:
-    """Return an activation module by name."""
     name = name.lower()
     if name in ("swish", "silu"):
         return Swish()
@@ -122,34 +52,35 @@ def _make_activation(name: str) -> nn.Module:
     raise ValueError(f"Unknown activation: {name}")
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# 3.  INPUT CONVEX NEURAL NETWORK  (ICNN)
-# ═══════════════════════════════════════════════════════════════════════
+# ---------------------------------------------------------------------------
+# ICNN  (Input Convex Neural Network)
+#
+# FIX: Replaced project_weights() + .data assignment with reparameterisation.
+#
+# OLD approach (broken gradient flow):
+#   - Stored raw weights W, projected them with softplus in torch.no_grad()
+#     by assigning to W.data inside forward().
+#   - Backward pass saw the projected values but NOT the softplus Jacobian,
+#     so the effective learning rate was wrong by a factor of softplus'(w-5).
+#
+# NEW approach (correct gradient flow):
+#   - Store raw (unconstrained) parameters.
+#   - Apply the non-negativity constraint inside the forward pass via
+#     _pos(raw_weight), so autograd differentiates through softplus correctly.
+#   - project_weights() is gone entirely.
+# ---------------------------------------------------------------------------
 
 class ICNN(nn.Module):
-    r"""
-    Input Convex Neural Network with guaranteed convexity in *x*.
+    """
+    Input Convex Neural Network.
 
-    Architecture (Amos et al., 2017)::
+    Ω(μ) is convex in μ because all weights on the z-passthrough paths
+    (U_raw, U_out_raw) are constrained to be non-negative via
+    reparameterisation:
+        W_pos = softplus(W_raw - 5) + ε
 
-        z₁   = σ( W₀ x + b₀ )
-        zᵢ₊₁ = σ( Uᵢ zᵢ  +  Wᵢ x  +  bᵢ )     i = 1 … k−1
-        y    =    Uₖ zₖ  +  Wₖ x  +  bₖ
-
-    where all **Uᵢ** weights are constrained to be **non-negative**.
-    This makes the network convex in *x* regardless of the sign of
-    the **Wᵢ** (skip-connection) weights.
-
-    Parameters
-    ----------
-    input_dim         : Dimension of the convex input *x*.
-    hidden_dim        : Width of every hidden layer.
-    n_layers          : Total number of hidden layers (≥ 1).
-    convex_constraint : ``'softplus'``, ``'exp'``, or ``'clamp'``.
-    dropout           : Dropout probability.
-    activation        : Activation function name.
-    use_layer_norm    : Apply LayerNorm after each hidden layer.
-    min_potential     : Additive floor on the output for positivity.
+    The skip connections from x use unconstrained weights (W_layers, W_out)
+    which does not break convexity.
     """
 
     def __init__(
@@ -164,31 +95,38 @@ class ICNN(nn.Module):
         min_potential: float = 1e-6,
     ):
         super().__init__()
-
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.n_layers = n_layers
         self.convex_constraint = convex_constraint
         self.use_layer_norm = use_layer_norm
         self._min_potential = min_potential
-
         self.act = _make_activation(activation)
 
-        # ── First layer (unrestricted weights) ───────────────────
+        # --- first layer (unconstrained — no z passthrough yet) ---
         self.W0 = nn.Linear(input_dim, hidden_dim)
         nn.init.xavier_uniform_(self.W0.weight, gain=1.0)
         nn.init.zeros_(self.W0.bias)
 
-        # ── Passthrough (U, non-negative) and skip (W) layers ───
-        self.U_layers = nn.ModuleList()
+        # --- hidden layers ---
+        # U_raw : raw parameters for the z-passthrough (constrained non-neg
+        #         via _pos() in forward — correct gradient flow)
+        # W_layers : skip connections from x (unconstrained)
+        self.U_raw    = nn.ParameterList()
+        self.U_bias   = nn.ParameterList()
         self.W_layers = nn.ModuleList()
         self.dropouts = nn.ModuleList()
-        self.norms = nn.ModuleList() if use_layer_norm else None
+        self.norms    = nn.ModuleList() if use_layer_norm else None
 
         for _ in range(n_layers - 1):
-            U = nn.Linear(hidden_dim, hidden_dim, bias=False)
-            self._init_nonneg(U)
-            self.U_layers.append(U)
+            # Initialise small positive so softplus(w - 5) ≈ 0
+            # → near-zero passthrough at the start of training
+            U_raw = nn.Parameter(torch.empty(hidden_dim, hidden_dim))
+            nn.init.uniform_(U_raw, 0.0, 0.1)
+            self.U_raw.append(U_raw)
+
+            U_b = nn.Parameter(torch.zeros(hidden_dim))
+            self.U_bias.append(U_b)
 
             W = nn.Linear(input_dim, hidden_dim)
             nn.init.xavier_uniform_(W.weight, gain=0.1)
@@ -199,9 +137,10 @@ class ICNN(nn.Module):
             if use_layer_norm:
                 self.norms.append(nn.LayerNorm(hidden_dim))
 
-        # ── Output layer ─────────────────────────────────────────
-        self.U_out = nn.Linear(hidden_dim, 1, bias=False)
-        self._init_nonneg(self.U_out)
+        # --- output layer ---
+        self.U_out_raw  = nn.Parameter(torch.empty(1, hidden_dim))
+        nn.init.uniform_(self.U_out_raw, 0.0, 0.1)
+        self.U_out_bias = nn.Parameter(torch.zeros(1))
 
         self.W_out = nn.Linear(input_dim, 1)
         nn.init.xavier_uniform_(self.W_out.weight, gain=0.01)
@@ -209,30 +148,17 @@ class ICNN(nn.Module):
 
         self.b_out = nn.Parameter(torch.zeros(1))
 
-    # ── weight helpers ───────────────────────────────────────────
-
-    @staticmethod
-    def _init_nonneg(layer: nn.Linear) -> None:
-        """Initialise weights to small positive values."""
-        nn.init.uniform_(layer.weight, 0.0, 0.1)
-
-    def _project_nonneg(self, w: torch.Tensor) -> torch.Tensor:
-        """Project a weight tensor to the non-negative cone."""
+    def _pos(self, w: torch.Tensor) -> torch.Tensor:
+        """
+        Non-negativity constraint applied IN the forward pass so that
+        autograd differentiates through it (correct gradient flow).
+        """
         if self.convex_constraint == "softplus":
             return F.softplus(w - 5.0) + 1e-6
         if self.convex_constraint == "exp":
             return torch.exp(w.clamp(max=10.0)) + 1e-6
-        # clamp (default)
+        # clamp — gradient is 0 when w < 0 (suboptimal but still valid)
         return w.clamp(min=0.0)
-
-    def project_weights(self) -> None:
-        """Apply convexity constraint to all U-path weight matrices."""
-        with torch.no_grad():
-            for U in self.U_layers:
-                U.weight.data = self._project_nonneg(U.weight.data)
-            self.U_out.weight.data = self._project_nonneg(self.U_out.weight.data)
-
-    # ── forward ──────────────────────────────────────────────────
 
     def forward(
         self,
@@ -240,19 +166,10 @@ class ICNN(nn.Module):
         film_params: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         """
-        Compute the convex potential Ω(x).
-
-        Parameters
-        ----------
-        x           : ``[B, input_dim]`` thermodynamic conditions.
-        film_params : Optional ``(γ, β)`` each ``[B, hidden_dim]``.
-
-        Returns
-        -------
-        ``[B, 1]`` grand-potential values (positive).
+        x           : [N, input_dim]
+        film_params : optional (gamma, beta) each [N, hidden_dim]
+        returns omega : [N, 1]  (strictly positive, convex in x)
         """
-        self.project_weights()
-
         # First layer
         z = self.W0(x)
         if film_params is not None:
@@ -260,64 +177,41 @@ class ICNN(nn.Module):
             z = z * gamma + beta
         z = self.act(z)
 
-        # Hidden layers
+        # Hidden layers — reparameterised U weights applied inline
         for i in range(self.n_layers - 1):
-            z_pass = self.U_layers[i](z)     # non-neg path
-            z_skip = self.W_layers[i](x)     # skip from input
+            W_pos  = self._pos(self.U_raw[i])              # [H, H] non-neg
+            z_pass = F.linear(z, W_pos, self.U_bias[i])   # z passthrough
+            z_skip = self.W_layers[i](x)                   # skip from x
             z = z_pass + z_skip
             if self.use_layer_norm:
                 z = self.norms[i](z)
             z = self.act(z)
             z = self.dropouts[i](z)
 
-        # Output
-        omega = self.U_out(z) + self.W_out(x) + self.b_out
+        # Output layer
+        W_out_pos = self._pos(self.U_out_raw)              # [1, H] non-neg
+        omega = (
+            F.linear(z, W_out_pos, self.U_out_bias)
+            + self.W_out(x)
+            + self.b_out
+        )
+        # Ensure Ω > 0 (grand potential is non-negative by convention)
         omega = F.softplus(omega) + self._min_potential
-
         return omega
 
-    def check_convexity(
-        self,
-        x: torch.Tensor,
-        y: torch.Tensor,
-        n_lambdas: int = 5,
-        tol: float = 1e-4,
-    ) -> bool:
-        """
-        Empirical convexity check: f(λx + (1−λ)y) ≤ λf(x) + (1−λ)f(y).
-        """
-        self.eval()
-        with torch.no_grad():
-            fx = self.forward(x)
-            fy = self.forward(y)
-            for lam in torch.linspace(0.1, 0.9, n_lambdas):
-                z = lam * x + (1 - lam) * y
-                fz = self.forward(z)
-                bound = lam * fx + (1 - lam) * fy
-                if (fz > bound + tol).any():
-                    return False
-        return True
 
-
-# ═══════════════════════════════════════════════════════════════════════
-# 4.  FiLM CONDITIONING
-# ═══════════════════════════════════════════════════════════════════════
+# ---------------------------------------------------------------------------
+# FiLM conditioning  (MOF embedding → scale/shift for ICNN first layer)
+# ---------------------------------------------------------------------------
 
 class FiLMConditioning(nn.Module):
     """
-    Feature-wise Linear Modulation (Perez et al., 2018).
-
-    Maps a MOF embedding **h** to scale (γ) and shift (β) vectors that
-    modulate the first hidden layer of the ICNN, making the potential
-    MOF-specific while preserving convexity in μ.
-
-    Initialised to the identity transformation (γ=1, β=0) so the
-    untrained model behaves like a plain ICNN.
+    Feature-wise Linear Modulation.
+    Near-identity initialisation: γ ≈ 1, β ≈ 0 at the start of training.
     """
 
     def __init__(self, emb_dim: int, hidden_dim: int, dropout: float = 0.1):
         super().__init__()
-
         self.gamma_net = nn.Sequential(
             nn.Linear(emb_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -332,74 +226,55 @@ class FiLMConditioning(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim),
         )
-
-        # Near-identity init
+        # Near-identity init: γ→1, β→0
         nn.init.zeros_(self.gamma_net[-1].weight)
         nn.init.ones_(self.gamma_net[-1].bias)
         nn.init.zeros_(self.beta_net[-1].weight)
         nn.init.zeros_(self.beta_net[-1].bias)
 
     def forward(self, h: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Parameters
-        ----------
-        h : ``[B, emb_dim]`` MOF embeddings.
-
-        Returns
-        -------
-        (γ, β) each ``[B, hidden_dim]``.
-        """
         return self.gamma_net(h), self.beta_net(h)
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# 5.  THERMODYNAMIC POTENTIAL NEURAL OPERATOR
-# ═══════════════════════════════════════════════════════════════════════
+# ---------------------------------------------------------------------------
+# ThermodynamicPotentialNO  (single model)
+# ---------------------------------------------------------------------------
 
 class ThermodynamicPotentialNO(nn.Module):
     """
-    Complete Thermodynamic Potential Neural Operator.
+    Thermodynamic Potential Neural Operator.
 
-    Combines an external encoder, FiLM conditioning, an ICNN for the
-    grand potential Ω, autograd-based loading derivation, and a
-    heteroscedastic uncertainty head.
+    Architecture
+    ------------
+    encoder(graph) → h ∈ ℝ^{emb_dim}                 (MOF embedding)
+    FiLM(h)        → (γ, β)                            (MOF-specific modulation)
+    ICNN(μ_norm; γ, β) → Ω(μ)                          (grand potential, convex)
+    n_i = −∂Ω/∂μ_i  via autograd                       (adsorption loadings)
 
-    Parameters
-    ----------
-    encoder : ``nn.Module``
-        Pre-built encoder (e.g. ``NequIPEncoder``) that maps a graph
-        batch to ``[B, emb_dim]``.
-    config  : ``TPNOConfig``
-        Operator hyperparameters.
+    Maxwell relations  ∂n_i/∂μ_j = ∂n_j/∂μ_i  are enforced by the Hessian
+    symmetry physics loss during training.
 
-    Accepted condition tensor shapes
-    ────────────────────────────────
-    * ``[B, n_conditions]``            — single condition per MOF.
-    * ``[B, P, n_conditions]``         — P condition points per MOF.
-
-    Output dict keys
-    ────────────────
-    * ``q_pred``  — ``[B, P, n_components]`` predicted loadings.
-    * ``omega``   — ``[B, P, 1]``            grand potential (opt.).
-    * ``sigma``   — ``[B, P, n_components]`` aleatoric std-dev (opt.).
-    * ``log_var`` — ``[B, n_components]``    log-variance (for NLL).
-    * ``hessian`` — ``[B, P, C, C]``         Hessian of Ω (opt.).
+    Fixes vs. previous version
+    --------------------------
+    1. ICNN uses reparameterisation instead of project_weights() so that
+       gradients flow correctly through the non-negativity constraint.
+    2. Hessian is computed from the FIRST autograd.grad call (no second
+       ICNN forward pass needed), cutting hessian computation cost in half.
+    3. Hessian cache removed — it was unreliable (id() reuse, non-unique
+       sum keys) and wrong to cache across training batches.
     """
 
     def __init__(self, encoder: nn.Module, config: TPNOConfig):
         super().__init__()
-
         self.config = config
         self.encoder = encoder
 
-        # ── FiLM ─────────────────────────────────────────────────
         self.film: Optional[FiLMConditioning] = None
         if config.film_conditioning:
             self.film = FiLMConditioning(
-                config.emb_dim, config.hidden_dim, config.dropout,
+                config.emb_dim, config.hidden_dim, config.dropout
             )
 
-        # ── ICNN ─────────────────────────────────────────────────
         self.icnn = ICNN(
             input_dim=config.n_conditions,
             hidden_dim=config.hidden_dim,
@@ -411,35 +286,38 @@ class ThermodynamicPotentialNO(nn.Module):
             min_potential=config.min_potential,
         )
 
-        # ── Aleatoric uncertainty head ───────────────────────────
+        # Aleatoric uncertainty head (heteroscedastic)
+        # Takes MOF embedding + condition to make sigma condition-aware
         self.log_var_net = nn.Sequential(
-            nn.Linear(config.emb_dim, config.hidden_dim),
+            nn.Linear(config.emb_dim + config.n_conditions, config.hidden_dim),
             nn.SiLU(),
             nn.Dropout(config.dropout),
             nn.Linear(config.hidden_dim, config.hidden_dim // 2),
             nn.SiLU(),
             nn.Linear(config.hidden_dim // 2, config.n_components),
         )
-        # Initialise to small uncertainty (log σ² ≈ −5 → σ ≈ 0.08)
+        # Init: start with small uncertainty (log_var ≈ -5 → σ ≈ 0.08)
         nn.init.zeros_(self.log_var_net[-1].weight)
         nn.init.constant_(self.log_var_net[-1].bias, -5.0)
 
-        # ── Normalisation buffers ────────────────────────────────
+        # Normalization buffers (set by set_normalization before training)
         self.register_buffer("mu_mean", torch.zeros(config.n_conditions))
-        self.register_buffer("mu_std", torch.ones(config.n_conditions))
-        self.register_buffer("q_mean", torch.zeros(config.n_components))
-        self.register_buffer("q_std", torch.ones(config.n_components))
+        self.register_buffer("mu_std",  torch.ones(config.n_conditions))
+        self.register_buffer("q_mean",  torch.zeros(config.n_components))
+        self.register_buffer("q_std",   torch.ones(config.n_components))
 
-    # ── normalisation ────────────────────────────────────────────
+    # ------------------------------------------------------------------
+    # Normalisation
+    # ------------------------------------------------------------------
 
     def set_normalization(
         self,
         mu_mean: torch.Tensor,
-        mu_std: torch.Tensor,
-        q_mean: torch.Tensor,
-        q_std: torch.Tensor,
+        mu_std:  torch.Tensor,
+        q_mean:  torch.Tensor,
+        q_std:   torch.Tensor,
     ) -> None:
-        """Set I/O normalisation statistics from the training set."""
+        """Call this BEFORE training with statistics from the training set."""
         self.mu_mean.copy_(mu_mean)
         self.mu_std.copy_(mu_std)
         self.q_mean.copy_(q_mean)
@@ -451,140 +329,172 @@ class ThermodynamicPotentialNO(nn.Module):
     def denormalize_q(self, q: torch.Tensor) -> torch.Tensor:
         return q * self.q_std + self.q_mean
 
-    # ── encoder control ──────────────────────────────────────────
+    # ------------------------------------------------------------------
+    # Utilities
+    # ------------------------------------------------------------------
 
     def freeze_encoder(self, freeze: bool = True) -> None:
-        """Freeze or unfreeze encoder parameters."""
         for p in self.encoder.parameters():
             p.requires_grad = not freeze
 
-    # ── forward ──────────────────────────────────────────────────
+    @property
+    def num_parameters(self) -> Dict[str, int]:
+        total     = sum(p.numel() for p in self.parameters())
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        return {"total": total, "trainable": trainable, "frozen": total - trainable}
+
+    # ------------------------------------------------------------------
+    # Core _icnn_forward helper  (shared by forward and forward_with_embedding)
+    # ------------------------------------------------------------------
+
+    def _icnn_forward(
+        self,
+        h_flat: torch.Tensor,        # [B*P, emb_dim]
+        cond_flat: torch.Tensor,     # [B*P, n_conditions]  (UN-normalised)
+        B: int,
+        P: int,
+        return_potential: bool,
+        return_uncertainty: bool,
+        return_hessian: bool,
+        h_for_sigma: torch.Tensor,   # [B, emb_dim]  (for log_var_net)
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Shared computation kernel used by both forward() and
+        forward_with_embedding().
+        """
+        n_comp = self.config.n_components
+        cond_norm = self.normalize_mu(cond_flat)   # [B*P, D]
+
+        need_graph = self.training or return_hessian
+
+        with torch.enable_grad():
+            # Detach and re-attach so we always have a fresh leaf for grad
+            mu = cond_norm.detach().requires_grad_(True)
+
+            film_params: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+            if self.film is not None:
+                film_params = self.film(h_flat)
+
+            omega_flat = self.icnn(mu, film_params)   # [B*P, 1]
+
+            # n_i = −∂Ω/∂μ_i
+            grads = autograd.grad(
+                outputs=omega_flat,
+                inputs=mu,
+                grad_outputs=torch.ones_like(omega_flat),
+                create_graph=need_graph,
+                retain_graph=need_graph,
+            )[0]                                      # [B*P, D]
+
+            q_norm = -grads[:, :n_comp]               # [B*P, n_comp]
+
+            # FIX: Hessian computed HERE from the first grad call.
+            # No second ICNN forward needed — saves ~50% compute.
+            if return_hessian:
+                rows: List[torch.Tensor] = []
+                for i in range(n_comp):
+                    row_i = autograd.grad(
+                        outputs=q_norm[:, i].sum(),
+                        inputs=mu,
+                        retain_graph=True,
+                        create_graph=self.training,
+                    )[0][:, :n_comp]                  # [B*P, n_comp]
+                    rows.append(row_i)
+                # [B*P, n_comp, n_comp]
+                hess_flat = torch.stack(rows, dim=1)
+
+        # --- reshape and denormalise ---
+        q_pred = self.denormalize_q(q_norm.reshape(B, P, n_comp))
+
+        output: Dict[str, torch.Tensor] = {"q_pred": q_pred}
+
+        if return_potential:
+            output["omega"] = omega_flat.reshape(B, P, 1)
+
+        if return_hessian:
+            output["hessian"] = hess_flat.reshape(B, P, n_comp, n_comp)
+
+        if return_uncertainty:
+            # Condition-aware aleatoric uncertainty:
+            # concatenate MOF embedding with normalised conditions
+            cond_mean = cond_norm.reshape(B, P, -1).mean(dim=1)   # [B, D]
+            sigma_input = torch.cat([h_for_sigma, cond_mean], dim=-1)  # [B, emb+D]
+            log_var = self.log_var_net(sigma_input)                # [B, n_comp]
+            sigma   = torch.exp(0.5 * log_var)                    # [B, n_comp]
+            output["log_var"] = log_var
+            output["sigma"]   = sigma.unsqueeze(1).expand(-1, P, -1)  # [B,P,n_comp]
+
+        return output
+
+    # ------------------------------------------------------------------
+    # forward  (runs encoder internally)
+    # ------------------------------------------------------------------
 
     def forward(
         self,
         graphs: Any,
         conditions: torch.Tensor,
         *,
-        return_potential: bool = False,
+        return_potential:   bool = False,
         return_uncertainty: bool = True,
-        return_hessian: bool = False,
+        return_hessian:     bool = False,
     ) -> Dict[str, torch.Tensor]:
         """
-        Full forward pass: encoder → FiLM → ICNN → autograd → loadings.
-
-        Parameters
-        ----------
-        graphs             : Batched graph input accepted by ``self.encoder``.
-        conditions         : ``[B, n_cond]`` or ``[B, P, n_cond]``.
-        return_potential   : Include ``'omega'`` in output.
-        return_uncertainty : Include ``'sigma'`` and ``'log_var'``.
-        return_hessian     : Include ``'hessian'`` (expensive).
-
-        Returns
-        -------
-        Dict — see class docstring for keys.
+        graphs     : torch_geometric Batch
+        conditions : [B, P, D] or [B, D] (single condition)
         """
-        # Ensure 3-D conditions
         if conditions.dim() == 2:
             conditions = conditions.unsqueeze(1)
-
         B, P, C = conditions.shape
-        n_comp = self.config.n_components
 
-        # ── Encode MOF ───────────────────────────────────────────
-        h = self.encoder(graphs)                       # [B, emb_dim]
-        h_exp = h.unsqueeze(1).expand(-1, P, -1)      # [B, P, emb_dim]
+        h = self.encoder(graphs)                          # [B, emb_dim]
+        h_exp  = h.unsqueeze(1).expand(-1, P, -1)
+        h_flat = h_exp.reshape(B * P, -1)                # [B*P, emb_dim]
+        cond_flat = conditions.reshape(B * P, C)
 
-        # ── Flatten for ICNN ─────────────────────────────────────
-        cond_flat = conditions.reshape(B * P, C)       # [BP, C]
-        h_flat = h_exp.reshape(B * P, -1)              # [BP, emb_dim]
+        return self._icnn_forward(
+            h_flat, cond_flat, B, P,
+            return_potential, return_uncertainty, return_hessian,
+            h_for_sigma=h,
+        )
 
-        # Normalise conditions
-        cond_norm = self.normalize_mu(cond_flat)
+    # ------------------------------------------------------------------
+    # forward_with_embedding  (encoder already run externally)
+    # ------------------------------------------------------------------
 
-        # ---------- CRITICAL: Enable gradients for autograd ----------
-        with torch.enable_grad():
-            # Create a new leaf tensor that requires grad
-            cond_norm_grad = cond_norm.detach().requires_grad_(True)
+    def forward_with_embedding(
+        self,
+        mof_embedding: torch.Tensor,
+        conditions:    torch.Tensor,
+        *,
+        return_potential:   bool = False,
+        return_uncertainty: bool = True,
+        return_hessian:     bool = False,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Use when the encoder has already been run (e.g. in ensemble with
+        shared encoder) to avoid re-running it for every ensemble member.
 
-            # ── FiLM parameters ──────────────────────────────────────
-            film_params: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
-            if self.film is not None:
-                film_params = self.film(h_flat)
+        mof_embedding : [B, emb_dim]
+        conditions    : [B, P, D] or [B, D]
+        """
+        if conditions.dim() == 2:
+            conditions = conditions.unsqueeze(1)
+        B, P, C = conditions.shape
 
-            # ── ICNN forward (gradient-enabled) ──────────────────────
-            omega_flat = self.icnn(cond_norm_grad, film_params)  # [BP, 1]
+        h_exp  = mof_embedding.unsqueeze(1).expand(-1, P, -1)
+        h_flat = h_exp.reshape(B * P, -1)
+        cond_flat = conditions.reshape(B * P, C)
 
-            # ── Safety: ensure gradients exist ───────────────────────
-            if not omega_flat.requires_grad:
-                raise RuntimeError(
-                    "TPNO requires gradients to compute adsorption "
-                    "(n = -∂Ω/∂μ). Do not call under torch.no_grad()."
-                )
+        return self._icnn_forward(
+            h_flat, cond_flat, B, P,
+            return_potential, return_uncertainty, return_hessian,
+            h_for_sigma=mof_embedding,
+        )
 
-            # ── Loadings via autograd: nᵢ = −∂Ω/∂μᵢ ─────────────────
-            grad_outputs = torch.ones_like(omega_flat)
-            grads = autograd.grad(
-                outputs=omega_flat,
-                inputs=cond_norm_grad,
-                grad_outputs=grad_outputs,
-                create_graph=self.training or return_hessian,
-                retain_graph=self.training or return_hessian,
-            )[0]  # [BP, C]
-
-            # Take only the first n_components columns (the μ dimensions)
-            q_norm = -grads[:, :n_comp]                     # [BP, n_comp]
-
-        # ── Reshape & denormalise ────────────────────────────────
-        q_pred = q_norm.reshape(B, P, n_comp)
-        q_pred = self.denormalize_q(q_pred)
-
-        output: Dict[str, torch.Tensor] = {"q_pred": q_pred}
-
-        # ── Potential (reuse omega_flat from grad block) ─────────
-        if return_potential:
-            output["omega"] = omega_flat.reshape(B, P, 1)
-
-        # ── Aleatoric uncertainty ────────────────────────────────
-        if return_uncertainty:
-            log_var = self.log_var_net(h)                # [B, n_comp]
-            sigma = torch.exp(0.5 * log_var)             # std-dev
-            output["log_var"] = log_var
-            output["sigma"] = sigma.unsqueeze(1).expand(-1, P, -1)
-
-        # ── Hessian (expensive, recomputed) ─────────────────────
-        if return_hessian:
-            with torch.enable_grad():
-                cond_norm_grad = cond_norm.detach().requires_grad_(True)
-                if self.film is not None:
-                    film_params = self.film(h_flat)
-                else:
-                    film_params = None
-                omega_flat = self.icnn(cond_norm_grad, film_params)
-                grad_outputs = torch.ones_like(omega_flat)
-                grads = autograd.grad(
-                    outputs=omega_flat,
-                    inputs=cond_norm_grad,
-                    grad_outputs=grad_outputs,
-                    create_graph=self.training,
-                    retain_graph=self.training,
-                )[0]
-                q_norm = -grads[:, :n_comp]
-                rows = []
-                for i in range(n_comp):
-                    row_i = autograd.grad(
-                        outputs=q_norm[:, i].sum(),
-                        inputs=cond_norm_grad,
-                        retain_graph=True,
-                        create_graph=self.training,
-                    )[0][:, :n_comp]
-                    rows.append(row_i)
-                hess = torch.stack(rows, dim=1)  # [BP, n_comp, n_comp]
-            output["hessian"] = hess.reshape(B, P, n_comp, n_comp)
-
-        return output
-
-    # ── Standalone Hessian (re-runs encoder) ─────────────────────
+    # ------------------------------------------------------------------
+    # Hessian convenience  (for physics loss — no caching)
+    # ------------------------------------------------------------------
 
     def get_hessian(
         self,
@@ -592,19 +502,24 @@ class ThermodynamicPotentialNO(nn.Module):
         conditions: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Compute the Hessian ∂²Ω / ∂μᵢ∂μⱼ without needing a prior
-        forward pass.  Useful for regularisation in the loss function.
+        Return ∂n_i/∂μ_j — shape [B, P, n_comp, n_comp].
 
-        Returns ``[B, P, n_comp, n_comp]``.
+        Note: hessian caching was removed because id() reuse after GC and
+        non-unique sum-based keys caused stale cache hits.  This function
+        is only called during physics loss computation (once per batch)
+        so the overhead is negligible.
         """
         out = self.forward(
             graphs, conditions,
             return_hessian=True,
             return_uncertainty=False,
+            return_potential=False,
         )
         return out["hessian"]
 
-    # ── Potential surface for visualisation ───────────────────────
+    # ------------------------------------------------------------------
+    # Potential surface  (visualisation / analysis)
+    # ------------------------------------------------------------------
 
     @torch.no_grad()
     def get_potential_surface(
@@ -615,172 +530,311 @@ class ThermodynamicPotentialNO(nn.Module):
         T: float = 313.0,
     ) -> Dict[str, Any]:
         """
-        Generate the full 3-D potential surface Ω(μ_CO₂, μ_N₂, μ_H₂O)
-        at fixed temperature for one MOF.
+        Compute Ω and loadings on a dense 3-D μ grid (for one MOF).
+        Returns numpy arrays for plotting.
 
-        Returns a dict with NumPy arrays ``mu``, ``omega``,
-        ``q_co2``, ``q_n2``, ``q_h2o``.
+        Note: @no_grad() is on the outer scope, but _icnn_forward uses
+        torch.enable_grad() internally so autograd.grad still works.
         """
+        import numpy as np
         device = next(self.parameters()).device
         mu = torch.linspace(mu_range[0], mu_range[1], n_points, device=device)
         mu1, mu2, mu3 = torch.meshgrid(mu, mu, mu, indexing="ij")
-
+        S = n_points
         cond = torch.stack(
             [mu1.flatten(), mu2.flatten(), mu3.flatten(),
-             torch.full_like(mu1.flatten(), T)],
+             torch.full((S**3,), T, device=device)],
             dim=1,
-        ).unsqueeze(0)  # [1, n³, 4]
+        ).unsqueeze(0)                               # [1, S^3, 4]
 
         out = self.forward(
             graphs, cond,
-            return_potential=True, return_uncertainty=False,
+            return_potential=True,
+            return_uncertainty=False,
+            return_hessian=False,
         )
-
-        S = n_points
         return {
-            "mu": mu.cpu().numpy(),
+            "mu":    mu.cpu().numpy(),
             "omega": out["omega"].squeeze(0).reshape(S, S, S).cpu().numpy(),
             "q_co2": out["q_pred"][0, :, 0].reshape(S, S, S).cpu().numpy(),
-            "q_n2": out["q_pred"][0, :, 1].reshape(S, S, S).cpu().numpy(),
+            "q_n2":  out["q_pred"][0, :, 1].reshape(S, S, S).cpu().numpy(),
             "q_h2o": out["q_pred"][0, :, 2].reshape(S, S, S).cpu().numpy(),
         }
 
-    # ── Introspection ────────────────────────────────────────────
 
-    @property
-    def num_parameters(self) -> Dict[str, int]:
-        total = sum(p.numel() for p in self.parameters())
-        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        return {"total": total, "trainable": trainable, "frozen": total - trainable}
-
-    def extra_repr(self) -> str:
-        c = self.config
-        return (
-            f"emb_dim={c.emb_dim}, hidden_dim={c.hidden_dim}, "
-            f"n_layers={c.n_layers}, n_conditions={c.n_conditions}, "
-            f"n_components={c.n_components}, convex={c.convex_constraint}, "
-            f"film={c.film_conditioning}"
-        )
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# 6.  DEEP ENSEMBLE
-# ═══════════════════════════════════════════════════════════════════════
+# ---------------------------------------------------------------------------
+# TPNOEnsemble
+# ---------------------------------------------------------------------------
 
 class TPNOEnsemble(nn.Module):
     """
-    Deep ensemble of ``ThermodynamicPotentialNO`` models for epistemic
-    uncertainty quantification (Lakshminarayanan et al., 2017).
+    Ensemble of M independent TPNO models for epistemic UQ.
 
-    Each member is independently initialised (and optionally trained on
-    bootstrap resamples).  At inference time the ensemble provides:
+    When share_encoder=True:
+    - The encoder runs ONCE per forward call (not M times).
+    - Each ensemble member's ICNN + FiLM are independent.
+    - ~M× speedup in encoder inference vs. running all M models separately.
 
-    * **Mean prediction** — average across members.
-    * **Epistemic uncertainty** — standard deviation across members
-      (model disagreement).
-    * **Aleatoric uncertainty** — average of per-member σ.
-    * **Total uncertainty** — √(σ²_epi + σ²_ale).
-
-    Parameters
-    ----------
-    config       : Shared ``TPNOConfig``.
-    encoder      : Encoder template (deep-copied for each member).
-    n_models     : Ensemble size (typically 3–10).
-    share_encoder: If *True*, all members share one encoder (cheaper).
+    FIX: when share_encoder=True, the shared encoder is stored as a plain
+    Python attribute (not a registered nn.Module submodule) to prevent the
+    same parameters appearing in self.parameters() multiple times — once via
+    self._shared_encoder and once via each model.encoder.  In PyTorch < 2.0
+    there is no automatic deduplication, so the optimizer would apply the
+    encoder update n_models+1 times per step.  Storing it outside the module
+    registry avoids double-registration while keeping gradients flowing
+    correctly (the encoder IS registered inside each model in self.models,
+    and all models share the SAME encoder object, so it IS trained).
     """
 
     def __init__(
         self,
-        config: TPNOConfig,
-        encoder: nn.Module,
-        n_models: int = 5,
+        config:        TPNOConfig,
+        encoder:       nn.Module,
+        n_models:      int = 5,
         share_encoder: bool = False,
     ):
         super().__init__()
-
-        self.n_models = n_models
+        self.n_models      = n_models
         self.share_encoder = share_encoder
 
         if share_encoder:
-            self.shared_encoder = encoder
+            # FIX: store as plain attribute, NOT as a registered submodule,
+            # to avoid duplicate parameter registration in self.parameters().
+            # The encoder IS still registered inside self.models[0].encoder
+            # (all models share the same object), so it will be trained.
+            self._shared_encoder_ref: Optional[nn.Module] = encoder
         else:
-            self.shared_encoder = None
+            self._shared_encoder_ref = None
 
         self.models = nn.ModuleList()
         for _ in range(n_models):
             enc = encoder if share_encoder else copy.deepcopy(encoder)
             self.models.append(ThermodynamicPotentialNO(enc, config))
 
-    # ── forward ──────────────────────────────────────────────────
+    def set_normalization(
+        self,
+        mu_mean: torch.Tensor,
+        mu_std:  torch.Tensor,
+        q_mean:  torch.Tensor,
+        q_std:   torch.Tensor,
+    ) -> None:
+        for model in self.models:
+            model.set_normalization(mu_mean, mu_std, q_mean, q_std)
 
     def forward(
         self,
-        graphs: Any,
+        graphs:     Any,
         conditions: torch.Tensor,
         *,
         return_all: bool = False,
     ) -> Dict[str, torch.Tensor]:
-        """
-        Ensemble forward pass.
-
-        Returns
-        -------
-        Dict with keys: ``q_pred``, ``epistemic``, ``aleatoric``,
-        ``total_uncertainty``, and optionally ``all_predictions``.
-        """
-        preds: List[torch.Tensor] = []
+        preds:  List[torch.Tensor] = []
         sigmas: List[torch.Tensor] = []
 
-        for model in self.models:
-            out = model(
-                graphs, conditions,
-                return_uncertainty=True, return_potential=False,
-            )
-            preds.append(out["q_pred"])
-            sigmas.append(out.get("sigma", torch.zeros_like(out["q_pred"])))
+        if self.share_encoder and self._shared_encoder_ref is not None:
+            # Run encoder once, pass embedding to each member's ICNN
+            h = self._shared_encoder_ref(graphs)
+            for model in self.models:
+                out = model.forward_with_embedding(
+                    h, conditions,
+                    return_uncertainty=True,
+                    return_potential=False,
+                )
+                preds.append(out["q_pred"])
+                sigmas.append(out.get("sigma", torch.zeros_like(out["q_pred"])))
+        else:
+            for model in self.models:
+                out = model.forward(
+                    graphs, conditions,
+                    return_uncertainty=True,
+                    return_potential=False,
+                )
+                preds.append(out["q_pred"])
+                sigmas.append(out.get("sigma", torch.zeros_like(out["q_pred"])))
 
-        pred_stack = torch.stack(preds, dim=0)    # [M, B, P, C]
-        sigma_stack = torch.stack(sigmas, dim=0)  # [M, B, P, C]
+        pred_stack  = torch.stack(preds,  dim=0)   # [M, B, P, C]
+        sigma_stack = torch.stack(sigmas, dim=0)   # [M, B, P, C]
 
-        mean_pred = pred_stack.mean(dim=0)
-        epistemic = pred_stack.std(dim=0)
-        aleatoric = sigma_stack.mean(dim=0)
-        total = torch.sqrt(epistemic.pow(2) + aleatoric.pow(2))
+        mean_pred = pred_stack.mean(dim=0)          # [B, P, C]
+        epistemic = pred_stack.std(dim=0)           # [B, P, C]
+        aleatoric = sigma_stack.mean(dim=0)         # [B, P, C]
+        total     = (epistemic.pow(2) + aleatoric.pow(2)).sqrt()
 
         result: Dict[str, torch.Tensor] = {
-            "q_pred": mean_pred,
-            "epistemic": epistemic,
-            "aleatoric": aleatoric,
+            "q_pred":            mean_pred,
+            "epistemic":         epistemic,
+            "aleatoric":         aleatoric,
             "total_uncertainty": total,
         }
         if return_all:
             result["all_predictions"] = pred_stack
-            result["all_sigma"] = sigma_stack
-
+            result["all_sigma"]       = sigma_stack
         return result
 
-    # ── delegation helpers ───────────────────────────────────────
-
-    def set_normalization(self, *args, **kwargs) -> None:
-        """Propagate normalisation stats to every member."""
-        for m in self.models:
-            m.set_normalization(*args, **kwargs)
-
-    def get_hessian(self, graphs: Any, conditions: torch.Tensor) -> torch.Tensor:
-        """Mean Hessian across ensemble members."""
-        hessians = [m.get_hessian(graphs, conditions) for m in self.models]
-        return torch.stack(hessians).mean(dim=0)
+    def get_hessian(
+        self, graphs: Any, conditions: torch.Tensor
+    ) -> torch.Tensor:
+        """Average Hessian across ensemble members."""
+        return torch.stack(
+            [m.get_hessian(graphs, conditions) for m in self.models]
+        ).mean(dim=0)
 
     @property
     def num_parameters(self) -> Dict[str, int]:
-        total = sum(p.numel() for p in self.parameters())
+        total     = sum(p.numel() for p in self.parameters())
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
         return {"total": total, "trainable": trainable, "frozen": total - trainable}
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# 7.  PUBLIC API
-# ═══════════════════════════════════════════════════════════════════════
+# ---------------------------------------------------------------------------
+# Thermodynamic validator  (run every N epochs — no_grad on outer scope)
+# ---------------------------------------------------------------------------
+
+class ThermodynamicValidator:
+    """
+    Post-hoc validation of thermodynamic consistency.
+
+    NOTE: methods do NOT use @torch.no_grad().  TPNO derives loadings via
+    autograd.grad(omega, mu) internally; torch.no_grad() would silently
+    prevent requires_grad_(True) on mu from working and crash that call.
+    Call model.eval() before using this validator — that is sufficient
+    to disable dropout / batchnorm tracking without breaking autograd.
+    """
+
+    def __init__(self, n_test_points: int = 100):
+        self.n_test_points = n_test_points
+
+    def check_convexity(
+        self,
+        model:      nn.Module,
+        graphs:     Any,
+        conditions: torch.Tensor,
+        n_pairs:    int = 200,
+    ) -> Dict[str, float]:
+        """
+        Jensen's inequality check: Ω(λc1 + (1-λ)c2) ≤ λΩ(c1) + (1-λ)Ω(c2)
+        """
+        B, P = conditions.shape[:2]
+        D    = conditions.shape[-1]
+        device = conditions.device
+
+        out   = model(graphs, conditions, return_potential=True, return_uncertainty=False)
+        omega = out["omega"]                          # [B, P, 1]
+
+        idx1 = torch.randint(0, P, (B, n_pairs), device=device)
+        idx2 = torch.randint(0, P, (B, n_pairs), device=device)
+        lam  = torch.rand(B, n_pairs, 1, device=device)
+
+        c1 = conditions.gather(1, idx1.unsqueeze(-1).expand(-1, -1, D))
+        c2 = conditions.gather(1, idx2.unsqueeze(-1).expand(-1, -1, D))
+        o1 = omega.gather(1, idx1.unsqueeze(-1))
+        o2 = omega.gather(1, idx2.unsqueeze(-1))
+
+        c_interp   = lam * c1 + (1 - lam) * c2
+        out_interp = model(graphs, c_interp,
+                           return_potential=True, return_uncertainty=False)
+        o_interp   = out_interp["omega"]
+
+        bound      = lam * o1 + (1 - lam) * o2
+        violations = F.relu(o_interp - bound - 1e-4).squeeze(-1)
+
+        return {
+            "convexity_violation_rate": (violations > 0).float().mean().item(),
+            "mean_convexity_violation": violations.mean().item(),
+            "max_convexity_violation":  violations.max().item(),
+        }
+
+    def check_monotonicity(
+        self,
+        model:      nn.Module,
+        graphs:     Any,
+        conditions: torch.Tensor,
+    ) -> Dict[str, Any]:
+        """
+        Check ∂n_i/∂μ_i ≥ 0 for each component.
+        """
+        out = model(graphs, conditions, return_uncertainty=False)
+        q   = out["q_pred"]
+        mu  = conditions[..., : q.shape[-1]]
+
+        mu_diff    = mu[:, 1:] - mu[:, :-1]
+        q_diff     = q[:, 1:]  - q[:, :-1]
+        mask       = (mu_diff > 0).float()
+        violations = (q_diff < -1e-6).float() * mask
+
+        return {
+            "monotonicity_violation_rate":   violations.mean().item(),
+            "monotonicity_by_component":     violations.mean(dim=(0, 1)).cpu().tolist(),
+        }
+
+    def check_henry_region(
+        self,
+        model:         nn.Module,
+        graphs:        Any,
+        low_pressure:  float = 1e-3,
+        high_pressure: float = 1e-2,
+        T:             float = 313.0,
+        n_components:  int   = 3,
+    ) -> Dict[str, float]:
+        """
+        Verify Henry's law: q(P_high)/q(P_low) ≈ P_high/P_low.
+        Only checks CO2 and N2 (H2O at very low μ is numerically unstable).
+
+        FIX: conditions tensor size now reads from model.config.n_conditions
+        instead of the previous hardcoded 4, so the validator works correctly
+        when the model is built with a non-default number of conditions.
+        """
+        device = next(model.parameters()).device
+        mu_lo  = float(torch.tensor(low_pressure).log())
+        mu_hi  = float(torch.tensor(high_pressure).log())
+
+        # FIX: use model.config.n_conditions instead of hardcoded 4
+        n_cond = model.config.n_conditions
+        cond   = torch.zeros(2, n_cond, device=device)
+        cond[0, :n_components] = mu_lo
+        cond[1, :n_components] = mu_hi
+        cond[:, -1] = T
+        # Set H2O very low to avoid numerical instability in ratio check
+        if n_components >= 3:
+            cond[:, 2] = -50.0
+        cond = cond.unsqueeze(0)                    # [1, 2, n_cond]
+
+        out = model(graphs, cond, return_uncertainty=False)
+        q   = out["q_pred"]                         # [1, 2, n_comp]
+
+        expected = high_pressure / low_pressure
+        # Only check CO2 (idx 0) and N2 (idx 1) — both physically meaningful
+        ratio = q[0, 1, :2] / (q[0, 0, :2] + 1e-8)   # [2]
+        error = (ratio - expected).abs() / expected
+
+        return {
+            "henry_mean_error_co2_n2": error.mean().item(),
+            "henry_co2_ratio":         ratio[0].item(),
+            "henry_n2_ratio":          ratio[1].item(),
+            "expected_ratio":          expected,
+        }
+
+    def check_maxwell_relations(
+        self,
+        model:      nn.Module,
+        graphs:     Any,
+        conditions: torch.Tensor,
+    ) -> Dict[str, float]:
+        """
+        Check Hessian symmetry ∂n_i/∂μ_j ≈ ∂n_j/∂μ_i.
+        Requires model to support return_hessian=True.
+        """
+        out  = model(graphs, conditions,
+                     return_hessian=True, return_uncertainty=False)
+        hess = out["hessian"]                        # [B, P, C, C]
+        asym = (hess - hess.transpose(-1, -2)).abs()
+        return {
+            "maxwell_mean_asymmetry": asym.mean().item(),
+            "maxwell_max_asymmetry":  asym.max().item(),
+        }
+
+
+# ---------------------------------------------------------------------------
 
 __all__ = [
     "TPNOConfig",
@@ -789,4 +843,5 @@ __all__ = [
     "FiLMConditioning",
     "ThermodynamicPotentialNO",
     "TPNOEnsemble",
+    "ThermodynamicValidator",
 ]

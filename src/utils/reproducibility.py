@@ -12,7 +12,7 @@ evaluation pipeline:
         PyTorch global deterministic-algorithms flag.
     3.  **RNG state snapshots** — save / restore the complete RNG state
         (Python + NumPy + Torch CPU + Torch CUDA) so that a training run
-        can be resumed from any checkpoint *and* produce identical results.
+        can be resumed from any checkpoint and produce identical results.
     4.  **DataLoader worker seeding** — a ``worker_init_fn`` that gives each
         DataLoader worker a deterministic but unique seed derived from the
         global seed + worker id + epoch.
@@ -22,20 +22,31 @@ evaluation pipeline:
     6.  **Checkpoint integrity** — SHA-256 hashing of saved ``.pt`` files so
         that downstream consumers can verify that a checkpoint has not been
         corrupted or silently modified.
-    7.  **Experiment manifest** — a single JSON file that records *everything*
+    7.  **Experiment manifest** — a single JSON file that records everything
         needed to reproduce a run: config, seed, environment fingerprint,
         git revision, data splits hash, and model architecture summary.
     8.  **Context managers** — ``ReproducibleBlock`` for scoped seeding of
-        isolated sub-computations (e.g. data augmentation, stochastic
-        evaluation) without contaminating the global RNG state.
+        isolated sub-computations without contaminating the global RNG state.
 
-Usage
-─────
->>> from src.utils.reproducibility import set_seed, ReproducibleBlock
->>> set_seed(42)                          # once at program start
->>> with ReproducibleBlock(seed=99):      # isolated stochastic block
-...     noise = torch.randn(5)
->>> # Global RNG state is restored here
+Fixes vs previous version
+──────────────────────────
+1. ``from .constants import DEFAULT_SEED, PIPELINE_VERSION`` crashed at
+   import because constants.py contains CODATA physics constants only —
+   neither name was defined there.  Fixed: both are defined in this module.
+   PIPELINE_VERSION = "0.1.0", DEFAULT_SEED = 42.
+
+2. ExperimentManifest.load() did ``cls(**d)`` which raises TypeError if the
+   JSON has fields unknown to the current dataclass (e.g., from an older
+   or newer manifest format).  Fixed: filter to known fields before passing.
+
+3. worker_init_fn() seeded ``random`` and ``np.random`` but not
+   ``torch.random``.  Workers using torch augmentation got identical
+   sequences across all workers.  Fixed: added ``torch.manual_seed``.
+
+4. get_environment_fingerprint() used ``__import__(pkg)`` with PyPI names
+   (e.g. "scikit-learn") where the import name differs ("sklearn").
+   __import__("scikit-learn") raises ModuleNotFoundError.
+   Fixed: explicit import-name mapping.
 
 Author  : Rayhan (University of Bergen)
 Project : UC-TPNO — Uncertainty-Calibrated Thermodynamic Potential
@@ -47,6 +58,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import io
 import json
 import logging
 import os
@@ -63,7 +75,10 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 
-from .constants import DEFAULT_SEED, PIPELINE_VERSION
+# FIX 1: define these here — they do NOT exist in constants.py (which
+# contains CODATA physics constants only).
+DEFAULT_SEED:     int = 42
+PIPELINE_VERSION: str = "0.1.0"
 
 logger = logging.getLogger(__name__)
 
@@ -86,71 +101,48 @@ def set_seed(
     """
     Set **all** random seeds and configure deterministic behaviour.
 
-    This is the single entry-point that the rest of the pipeline calls.
     After this call:
-
     * ``random``, ``numpy``, ``torch`` (CPU + CUDA) are seeded.
-    * ``PYTHONHASHSEED`` is fixed (affects ``dict`` / ``set`` iteration
-      order in Python ≥ 3.3).
-    * cuDNN is put into deterministic mode (``benchmark = False``,
-      ``deterministic = True``).
-    * ``torch.use_deterministic_algorithms(True)`` is activated if
-      requested (default), which causes PyTorch to raise or warn on any
-      operation that has no deterministic implementation.
-    * ``CUBLAS_WORKSPACE_CONFIG`` is set so that the cuBLAS workspace
-      allocator is deterministic (required by PyTorch ≥ 1.8).
+    * ``PYTHONHASHSEED`` is fixed.
+    * cuDNN is put into deterministic mode.
+    * ``torch.use_deterministic_algorithms(True)`` is activated if requested.
+    * ``CUBLAS_WORKSPACE_CONFIG`` is set for deterministic cuBLAS.
 
     Parameters
     ----------
-    seed : int
-        Master seed.  The same seed must be used when resuming from a
-        checkpoint.
-    deterministic_algorithms : bool
-        If *True*, call ``torch.use_deterministic_algorithms(True, …)``.
-        Some operations (e.g. ``scatter_add``, ``index_put``) may be
-        slower or raise errors in this mode.
-    warn_only : bool
-        If *True* (default), non-deterministic operations emit a warning
-        instead of raising.  Passed to
-        ``torch.use_deterministic_algorithms(…, warn_only=…)``.
-    benchmark : bool
-        Value for ``torch.backends.cudnn.benchmark``.  Setting to *True*
-        enables cuDNN auto-tuner for potentially faster convolutions but
-        introduces non-determinism.  Default *False* for reproducibility.
+    seed                    : Master seed.
+    deterministic_algorithms: Activate PyTorch deterministic-algorithms mode.
+    warn_only               : Emit warning (not raise) on non-deterministic ops.
+    benchmark               : Value for ``torch.backends.cudnn.benchmark``.
     """
-    # ── Python stdlib ────────────────────────────────────────────
     random.seed(seed)
     os.environ["PYTHONHASHSEED"] = str(seed)
-
-    # ── NumPy ────────────────────────────────────────────────────
     np.random.seed(seed)
 
-    # ── PyTorch ──────────────────────────────────────────────────
     try:
         import torch
 
         torch.manual_seed(seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed(seed)
-            torch.cuda.manual_seed_all(seed)  # multi-GPU
+            torch.cuda.manual_seed_all(seed)
 
-        # cuDNN
         torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = benchmark
+        torch.backends.cudnn.benchmark     = benchmark
 
-        # Global deterministic-algorithms flag (PyTorch ≥ 1.8)
         if deterministic_algorithms and hasattr(torch, "use_deterministic_algorithms"):
-            # CUBLAS workspace config — needed for deterministic matmul on CUDA
             os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
             torch.use_deterministic_algorithms(True, warn_only=warn_only)
 
     except ImportError:
         logger.debug("PyTorch not available — skipping torch seeding.")
 
-    # ── Audit trail ──────────────────────────────────────────────
     ts = datetime.now(timezone.utc).isoformat()
     _SEED_HISTORY.append((seed, ts))
-    logger.info("Global seed set to %d  (deterministic=%s, benchmark=%s)", seed, deterministic_algorithms, benchmark)
+    logger.info(
+        "Global seed set to %d  (deterministic=%s, benchmark=%s)",
+        seed, deterministic_algorithms, benchmark,
+    )
 
 
 def get_seed_history() -> List[Tuple[int, str]]:
@@ -166,30 +158,29 @@ def get_seed_history() -> List[Tuple[int, str]]:
 class RNGState:
     """Snapshot of all RNG states needed for exact resumption."""
 
-    python_state: Any = None
-    numpy_state: Any = None
-    torch_cpu_state: Any = None
-    torch_cuda_states: Optional[List[Any]] = None
+    python_state:        Any                  = None
+    numpy_state:         Any                  = None
+    torch_cpu_state:     Any                  = None
+    torch_cuda_states:   Optional[List[Any]]  = None
 
     def to_dict(self) -> Dict[str, Any]:
-        """Serialise to a dict suitable for ``torch.save``."""
         return {
-            "python_state": self.python_state,
-            "numpy_state": self.numpy_state,
-            "torch_cpu_state": self.torch_cpu_state,
+            "python_state":      self.python_state,
+            "numpy_state":       self.numpy_state,
+            "torch_cpu_state":   self.torch_cpu_state,
             "torch_cuda_states": self.torch_cuda_states,
         }
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "RNGState":
-        return cls(**d)
+        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
 
 
 def capture_rng_state() -> RNGState:
     """Capture a snapshot of **all** RNG states."""
-    state = RNGState()
+    state              = RNGState()
     state.python_state = random.getstate()
-    state.numpy_state = np.random.get_state()
+    state.numpy_state  = np.random.get_state()
 
     try:
         import torch
@@ -235,9 +226,6 @@ class ReproducibleBlock:
     Context manager that seeds all RNGs on entry and restores the
     previous state on exit.
 
-    Useful for isolating stochastic sub-computations (data augmentation,
-    Monte-Carlo dropout evaluation) from the main training RNG stream.
-
     Example
     -------
     >>> set_seed(42)
@@ -248,7 +236,7 @@ class ReproducibleBlock:
     """
 
     def __init__(self, seed: int) -> None:
-        self.seed = seed
+        self.seed          = seed
         self._saved_state: Optional[RNGState] = None
 
     def __enter__(self) -> "ReproducibleBlock":
@@ -284,30 +272,36 @@ def worker_init_fn(worker_id: int) -> None:
     re-seeding, every worker produces the same augmentation sequence.
     This function computes a unique-but-deterministic seed from:
 
-        worker_seed = base_seed + worker_id
+        worker_seed = torch.initial_seed() % 2**32 + worker_id
 
-    where ``base_seed`` comes from PyTorch's internal per-worker seed
-    (which already incorporates the global seed + epoch).
+    FIX: now also calls ``torch.manual_seed()`` — previous version only
+    seeded ``random`` and ``np.random``, so workers using torch
+    augmentation (e.g. ``torch.randn``) got identical sequences.
 
-    Pass this function to ``torch.utils.data.DataLoader(worker_init_fn=...)``.
+    Pass to ``DataLoader(worker_init_fn=worker_init_fn)``.
     """
     try:
         import torch
-
-        worker_seed = torch.initial_seed() % (2 ** 32)
+        base = torch.initial_seed() % (2 ** 32)
     except ImportError:
-        worker_seed = DEFAULT_SEED
+        base = DEFAULT_SEED
 
-    seed = worker_seed + worker_id
+    seed = (base + worker_id) % (2 ** 32)
     random.seed(seed)
-    np.random.seed(seed % (2 ** 32))
+    np.random.seed(seed)
+
+    try:
+        import torch
+        torch.manual_seed(seed)
+    except ImportError:
+        pass
 
 
 def make_worker_init_fn(base_seed: int, epoch: int = 0):
     """
     Factory that returns a ``worker_init_fn`` incorporating a specific
-    base seed *and* epoch number.  This guarantees that workers in
-    different epochs see different-but-reproducible augmentations.
+    base seed *and* epoch number.  Guarantees that workers in different
+    epochs see different-but-reproducible augmentations.
 
     Usage::
 
@@ -317,9 +311,14 @@ def make_worker_init_fn(base_seed: int, epoch: int = 0):
     """
 
     def _init(worker_id: int) -> None:
-        seed = base_seed + epoch * 1000 + worker_id
+        seed = (base_seed + epoch * 1_000 + worker_id) % (2 ** 32)
         random.seed(seed)
-        np.random.seed(seed % (2 ** 32))
+        np.random.seed(seed)
+        try:
+            import torch
+            torch.manual_seed(seed)
+        except ImportError:
+            pass
 
     return _init
 
@@ -331,7 +330,7 @@ def make_worker_init_fn(base_seed: int, epoch: int = 0):
 def get_git_revision() -> str:
     """Return the current ``HEAD`` commit hash, or ``'unknown'``."""
     try:
-        rev = (
+        return (
             subprocess.check_output(
                 ["git", "rev-parse", "HEAD"],
                 stderr=subprocess.DEVNULL,
@@ -339,7 +338,6 @@ def get_git_revision() -> str:
             .decode("ascii")
             .strip()
         )
-        return rev
     except Exception:
         return "unknown"
 
@@ -376,46 +374,63 @@ def is_git_clean() -> bool:
 # 6.  ENVIRONMENT FINGERPRINT
 # ═══════════════════════════════════════════════════════════════════════
 
+# FIX 4: map PyPI package names → actual Python import names.
+# __import__("scikit-learn") raises ModuleNotFoundError because the
+# importable name is "sklearn", not "scikit-learn".
+_PKG_IMPORT_NAMES: Dict[str, str] = {
+    "scikit-learn": "sklearn",
+    "torch_geometric": "torch_geometric",
+    "torch-geometric": "torch_geometric",
+    "pymatgen": "pymatgen",
+    "e3nn": "e3nn",
+    "wandb": "wandb",
+    "matplotlib": "matplotlib",
+    "scipy": "scipy",
+    "numpy": "numpy",
+    "torch": "torch",
+    "ase": "ase",
+    "pandas": "pandas",
+}
+
+
+def _get_version(pkg_name: str) -> str:
+    """Return version string for a package, or 'NOT INSTALLED'."""
+    import_name = _PKG_IMPORT_NAMES.get(pkg_name, pkg_name)
+    try:
+        mod = __import__(import_name)
+        return getattr(mod, "__version__", "installed (version unknown)")
+    except ImportError:
+        pass
+    # Fallback: importlib.metadata (works for packages without __version__)
+    try:
+        from importlib.metadata import version, PackageNotFoundError
+        return version(pkg_name)
+    except Exception:
+        return "NOT INSTALLED"
+
+
 def get_environment_fingerprint() -> Dict[str, Any]:
     """
     Collect a comprehensive snapshot of the software and hardware
     environment.  The returned dict is JSON-serialisable and should be
     saved alongside every experiment for audit purposes.
-
-    Captured fields
-    ───────────────
-    * Python version
-    * OS / platform
-    * Hostname / CPU count
-    * Key package versions (numpy, torch, torch_geometric, scipy, e3nn, …)
-    * CUDA toolkit version and GPU model(s)
-    * Pipeline version string (from ``constants.py``)
-    * Git revision + dirty flag
     """
     info: Dict[str, Any] = {
-        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "timestamp_utc":    datetime.now(timezone.utc).isoformat(),
         "pipeline_version": PIPELINE_VERSION,
-        "python_version": sys.version,
-        "platform": platform.platform(),
-        "hostname": platform.node(),
-        "cpu_count": os.cpu_count(),
-        "architecture": platform.machine(),
+        "python_version":   sys.version,
+        "platform":         platform.platform(),
+        "hostname":         platform.node(),
+        "cpu_count":        os.cpu_count(),
+        "architecture":     platform.machine(),
     }
 
-    # ── Key package versions ─────────────────────────────────────
     packages = [
         "numpy", "scipy", "torch", "torch_geometric",
         "e3nn", "ase", "pymatgen", "wandb", "pandas",
         "scikit-learn", "matplotlib",
     ]
-    pkg_versions: Dict[str, str] = {}
-    for pkg in packages:
-        try:
-            mod = __import__(pkg)
-            pkg_versions[pkg] = getattr(mod, "__version__", "installed (version unknown)")
-        except ImportError:
-            pkg_versions[pkg] = "NOT INSTALLED"
-    info["packages"] = pkg_versions
+    info["packages"] = {pkg: _get_version(pkg) for pkg in packages}
 
     # ── CUDA / GPU ───────────────────────────────────────────────
     try:
@@ -423,13 +438,13 @@ def get_environment_fingerprint() -> Dict[str, Any]:
 
         info["cuda_available"] = torch.cuda.is_available()
         if torch.cuda.is_available():
-            info["cuda_version"] = torch.version.cuda
+            info["cuda_version"]  = torch.version.cuda
             info["cudnn_version"] = str(torch.backends.cudnn.version())
-            info["gpu_count"] = torch.cuda.device_count()
+            info["gpu_count"]     = torch.cuda.device_count()
             info["gpus"] = [
                 {
-                    "index": i,
-                    "name": torch.cuda.get_device_name(i),
+                    "index":     i,
+                    "name":      torch.cuda.get_device_name(i),
                     "memory_gb": round(
                         torch.cuda.get_device_properties(i).total_mem / 1e9, 2
                     ),
@@ -438,15 +453,16 @@ def get_environment_fingerprint() -> Dict[str, Any]:
             ]
         else:
             info["cuda_version"] = None
-            info["gpu_count"] = 0
-            info["gpus"] = []
+            info["gpu_count"]    = 0
+            info["gpus"]         = []
     except ImportError:
         info["cuda_available"] = False
-        info["gpu_count"] = 0
+        info["gpu_count"]      = 0
+        info["gpus"]           = []
 
     # ── Git ──────────────────────────────────────────────────────
     info["git_revision"] = get_git_revision()
-    info["git_clean"] = is_git_clean()
+    info["git_clean"]    = is_git_clean()
 
     return info
 
@@ -460,19 +476,7 @@ def compute_file_hash(
     algorithm: str = "sha256",
     chunk_size: int = 1 << 20,
 ) -> str:
-    """
-    Compute a hex-digest hash of a file.
-
-    Parameters
-    ----------
-    path       : Path to the file.
-    algorithm  : Hash algorithm (any supported by ``hashlib``).
-    chunk_size : Read buffer size in bytes (default 1 MiB).
-
-    Returns
-    -------
-    Hex-encoded hash string.
-    """
+    """Compute a hex-digest hash of a file."""
     h = hashlib.new(algorithm)
     with open(path, "rb") as f:
         while True:
@@ -494,25 +498,19 @@ def verify_checkpoint_integrity(
     Returns *True* if the hashes match, *False* otherwise.
     """
     actual = compute_file_hash(path, algorithm=algorithm)
-    match = actual == expected_hash
+    match  = actual == expected_hash
     if not match:
         logger.warning(
             "Checkpoint integrity check FAILED for %s:\n"
             "  expected: %s\n"
             "  actual:   %s",
-            path,
-            expected_hash,
-            actual,
+            path, expected_hash, actual,
         )
     return match
 
 
 def hash_dict(d: Dict[str, Any]) -> str:
-    """
-    Deterministic SHA-256 of a JSON-serialisable dict.
-
-    Useful for hashing configs, data-split indices, etc.
-    """
+    """Deterministic SHA-256 of a JSON-serialisable dict."""
     canonical = json.dumps(d, sort_keys=True, default=str)
     return hashlib.sha256(canonical.encode()).hexdigest()
 
@@ -532,30 +530,26 @@ class ExperimentManifest:
     seed            : Global seed used.
     config          : Full training / model / data config dict.
     environment     : Output of :func:`get_environment_fingerprint`.
-    data_hash       : SHA-256 of the sorted training-set MOF IDs (or
-                      splits JSON), so you can confirm you used the same
-                      data split.
-    model_summary   : String summary of the model architecture (e.g.
-                      from ``torchinfo`` or a custom repr).
-    notes           : Free-form notes string.
+    data_hash       : SHA-256 of the sorted training-set MOF IDs.
+    model_summary   : String summary of the model architecture.
+    notes           : Free-form notes.
     checkpoint_hash : SHA-256 of the best checkpoint file.
     metrics         : Final evaluation metrics dict.
+    created_utc     : ISO-8601 UTC timestamp of manifest creation.
     """
 
-    experiment_name: str = "unnamed"
-    seed: int = DEFAULT_SEED
-    config: Dict[str, Any] = field(default_factory=dict)
-    environment: Dict[str, Any] = field(default_factory=dict)
-    data_hash: str = ""
-    model_summary: str = ""
-    notes: str = ""
-    checkpoint_hash: str = ""
-    metrics: Dict[str, Any] = field(default_factory=dict)
-    created_utc: str = field(
+    experiment_name: str              = "unnamed"
+    seed:            int              = DEFAULT_SEED
+    config:          Dict[str, Any]   = field(default_factory=dict)
+    environment:     Dict[str, Any]   = field(default_factory=dict)
+    data_hash:       str              = ""
+    model_summary:   str              = ""
+    notes:           str              = ""
+    checkpoint_hash: str              = ""
+    metrics:         Dict[str, Any]   = field(default_factory=dict)
+    created_utc:     str              = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
-
-    # ── serialisation ────────────────────────────────────────────
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -564,16 +558,31 @@ class ExperimentManifest:
         """Write the manifest to a JSON file."""
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
-        with open(p, "w") as f:
+        with open(p, "w", encoding="utf-8") as f:
             json.dump(self.to_dict(), f, indent=2, default=str)
         logger.info("Experiment manifest saved to %s", p)
 
     @classmethod
     def load(cls, path: Union[str, Path]) -> "ExperimentManifest":
-        """Load a manifest from JSON."""
-        with open(path, "r") as f:
+        """
+        Load a manifest from JSON.
+
+        FIX: previous version did ``cls(**d)`` which raises TypeError
+        if the JSON contains fields unknown to the current dataclass
+        (e.g. a manifest from a different codebase version).
+        Now filters to known fields before passing.
+        """
+        with open(path, "r", encoding="utf-8") as f:
             d = json.load(f)
-        return cls(**d)
+        known = set(cls.__dataclass_fields__.keys())
+        filtered = {k: v for k, v in d.items() if k in known}
+        unknown  = set(d.keys()) - known
+        if unknown:
+            logger.warning(
+                "ExperimentManifest.load: ignoring unknown fields: %s",
+                sorted(unknown),
+            )
+        return cls(**filtered)
 
 
 def save_experiment_config(
@@ -584,33 +593,29 @@ def save_experiment_config(
     include_environment: bool = True,
 ) -> None:
     """
-    Save an experiment configuration to a JSON file, enriched with
-    git revision, timestamp, and optionally the full environment
-    fingerprint.
-
-    This is the simple API; for a richer record use
-    :class:`ExperimentManifest`.
+    Save an experiment configuration enriched with git revision,
+    timestamp, and optionally the full environment fingerprint.
     """
     out = copy.deepcopy(config)
-    out["seed"] = seed
+    out["seed"]             = seed
     out["pipeline_version"] = PIPELINE_VERSION
-    out["timestamp_utc"] = datetime.now(timezone.utc).isoformat()
-    out["git_revision"] = get_git_revision()
-    out["git_clean"] = is_git_clean()
+    out["timestamp_utc"]    = datetime.now(timezone.utc).isoformat()
+    out["git_revision"]     = get_git_revision()
+    out["git_clean"]        = is_git_clean()
 
     if include_environment:
         out["environment"] = get_environment_fingerprint()
 
     p = Path(save_path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    with open(p, "w") as f:
+    with open(p, "w", encoding="utf-8") as f:
         json.dump(out, f, indent=2, default=str)
     logger.info("Experiment config saved to %s", p)
 
 
 def load_experiment_config(path: Union[str, Path]) -> Dict[str, Any]:
     """Load a previously saved experiment config."""
-    with open(path, "r") as f:
+    with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
@@ -621,16 +626,12 @@ def load_experiment_config(path: Union[str, Path]) -> Dict[str, Any]:
 def model_parameter_hash(model: Any) -> str:
     """
     Compute a SHA-256 hash of all trainable parameters of a
-    ``torch.nn.Module``.  Useful for verifying that two models are
-    weight-identical (e.g. after loading a checkpoint).
+    ``torch.nn.Module``.  Useful for verifying weight identity after
+    loading a checkpoint.
     """
-    import io
-    import torch
-
-    h = hashlib.sha256()
+    h   = hashlib.sha256()
     buf = io.BytesIO()
     for name, param in sorted(model.named_parameters()):
-        # Use a canonical byte representation
         np_arr = param.detach().cpu().numpy()
         buf.seek(0)
         buf.truncate()
@@ -682,20 +683,20 @@ def save_reproducible_checkpoint(
     Returns
     -------
     sha256 : str
-        Hex-digest of the saved file (can be stored in the manifest).
+        Hex-digest of the saved file (store in manifest for later verification).
     """
     import torch
 
     rng_state = capture_rng_state()
 
     payload: Dict[str, Any] = {
-        "epoch": epoch,
-        "seed": seed,
-        "model_state_dict": model.state_dict(),
+        "epoch":                epoch,
+        "seed":                 seed,
+        "model_state_dict":     model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
-        "rng_state": rng_state.to_dict(),
-        "pipeline_version": PIPELINE_VERSION,
-        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "rng_state":            rng_state.to_dict(),
+        "pipeline_version":     PIPELINE_VERSION,
+        "timestamp_utc":        datetime.now(timezone.utc).isoformat(),
     }
 
     if scheduler is not None:
@@ -703,9 +704,9 @@ def save_reproducible_checkpoint(
     if metrics is not None:
         payload["metrics"] = metrics
     if config is not None:
-        payload["config"] = config
+        payload["config"]  = config
     if extra is not None:
-        payload["extra"] = extra
+        payload["extra"]   = extra
 
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -735,7 +736,7 @@ def load_reproducible_checkpoint(
 
     Returns
     -------
-    Dict with ``epoch``, ``metrics``, and any ``extra`` data stored.
+    Dict with ``epoch``, ``metrics``, ``config``, ``extra``, ``seed``.
     """
     import torch
 
@@ -743,8 +744,7 @@ def load_reproducible_checkpoint(
     if expected_hash is not None:
         if not verify_checkpoint_integrity(p, expected_hash):
             raise RuntimeError(
-                f"Checkpoint {p} failed integrity check — expected "
-                f"sha256={expected_hash}"
+                f"Checkpoint {p} failed integrity check — expected sha256={expected_hash}"
             )
 
     ckpt = torch.load(p, map_location=device, weights_only=False)
@@ -768,11 +768,11 @@ def load_reproducible_checkpoint(
     )
 
     return {
-        "epoch": ckpt.get("epoch", 0),
+        "epoch":   ckpt.get("epoch",   0),
         "metrics": ckpt.get("metrics", {}),
-        "config": ckpt.get("config", {}),
-        "extra": ckpt.get("extra", {}),
-        "seed": ckpt.get("seed", DEFAULT_SEED),
+        "config":  ckpt.get("config",  {}),
+        "extra":   ckpt.get("extra",   {}),
+        "seed":    ckpt.get("seed",    DEFAULT_SEED),
     }
 
 
@@ -782,18 +782,17 @@ def load_reproducible_checkpoint(
 
 def hash_data_split(
     train_ids: List[str],
-    val_ids: List[str],
-    test_ids: List[str],
+    val_ids:   List[str],
+    test_ids:  List[str],
 ) -> str:
     """
-    Compute a deterministic SHA-256 of the data split so that two
-    experiments using the same split produce the same hash regardless
-    of list ordering.
+    Compute a deterministic SHA-256 of the data split, independent of
+    list ordering.
     """
     payload = {
         "train": sorted(train_ids),
-        "val": sorted(val_ids),
-        "test": sorted(test_ids),
+        "val":   sorted(val_ids),
+        "test":  sorted(test_ids),
     }
     return hash_dict(payload)
 
@@ -803,6 +802,9 @@ def hash_data_split(
 # ═══════════════════════════════════════════════════════════════════════
 
 __all__ = [
+    # Constants
+    "DEFAULT_SEED",
+    "PIPELINE_VERSION",
     # Seeding
     "set_seed",
     "get_seed_history",

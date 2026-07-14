@@ -98,7 +98,7 @@ class NeuralSurrogateConfig:
     activation    : ``'relu'``, ``'silu'``, or ``'gelu'``.
     dropout       : Dropout rate.
     lr            : Learning rate.
-    epochs        : Training epochs.
+    epochs        : Training epochs (= L-BFGS maxiter).
     batch_size    : Mini-batch size.
     weight_decay  : L2 regularisation.
     early_stop    : Patience for early stopping (0 = disabled).
@@ -117,6 +117,15 @@ class NeuralSurrogateConfig:
 # ═══════════════════════════════════════════════════════════════════════
 # 2.  KERNEL FUNCTIONS
 # ═══════════════════════════════════════════════════════════════════════
+
+def _sq_dist(X1: np.ndarray, X2: np.ndarray) -> np.ndarray:
+    """Squared Euclidean distance matrix [N1, N2]."""
+    X1sq = (X1 ** 2).sum(axis=1, keepdims=True)
+    X2sq = (X2 ** 2).sum(axis=1, keepdims=True)
+    return (X1sq + X2sq.T - 2.0 * X1 @ X2.T).clip(min=0.0)
+    # clip(min=0): floating-point cancellation can produce tiny negatives
+    # on the diagonal; clipping keeps kernels valid without affecting results.
+
 
 def rbf_kernel(
     X1: np.ndarray,
@@ -151,13 +160,6 @@ def matern52_kernel(
     dist = np.sqrt(_sq_dist(X1, X2).clip(min=1e-30))
     r = np.sqrt(5.0) * dist / length_scale
     return signal_var * (1.0 + r + r ** 2 / 3.0) * np.exp(-r)
-
-
-def _sq_dist(X1: np.ndarray, X2: np.ndarray) -> np.ndarray:
-    """Squared Euclidean distance matrix [N1, N2]."""
-    X1sq = (X1 ** 2).sum(axis=1, keepdims=True)
-    X2sq = (X2 ** 2).sum(axis=1, keepdims=True)
-    return X1sq + X2sq.T - 2.0 * X1 @ X2.T
 
 
 _KERNEL_FNS = {
@@ -532,6 +534,14 @@ class NeuralSurrogate:
         Returns
         -------
         Dict with ``"final_loss"`` and ``"n_train"``.
+
+        FIX: removed dead ``loss_and_grad`` function that was defined
+        but never passed to ``optimize.minimize`` (which used
+        ``_loss_only`` with ``jac=False`` instead).  The dead code
+        also called ``optimize.approx_fprime`` internally, which would
+        have made gradient evaluation O(n_params) × slower than
+        needed.  The optimizer now explicitly uses ``jac=False`` and
+        scipy's built-in finite-difference gradient.
         """
         X = np.asarray(X, dtype=np.float64)
         Y = np.asarray(Y, dtype=np.float64)
@@ -566,24 +576,10 @@ class NeuralSurrogate:
             self._biases.append(np.zeros(out_d))
 
         wd = self.config.weight_decay
-
-        def loss_and_grad(flat):
-            self._unpack_params(flat, layer_dims)
-            pred = self._forward(Xn)
-            residual = pred - Yn
-            loss = 0.5 * np.mean(residual ** 2)
-
-            # L2 regularisation
-            if wd > 0:
-                for W in self._weights:
-                    loss += 0.5 * wd * np.sum(W ** 2)
-
-            # Numerical gradient (for L-BFGS; exact grad is complex)
-            grad = optimize.approx_fprime(flat, lambda p: self._loss_only(p, Xn, Yn, layer_dims, wd), 1e-5)
-            return loss, grad
-
         x0 = self._pack_params()
 
+        # FIX: removed the dead loss_and_grad() function that was never
+        # called.  Using _loss_only with jac=False (scipy finite-diff gradient).
         result = optimize.minimize(
             lambda p: self._loss_only(p, Xn, Yn, layer_dims, wd),
             x0,

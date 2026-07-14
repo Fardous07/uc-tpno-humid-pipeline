@@ -303,7 +303,7 @@ class BET:
 @dataclass
 class InterpolatedIsotherm:
     """
-    Isotherm from tabular (P, q) data with log-linear interpolation.
+    Isotherm from tabular (P, q) data with piecewise-linear interpolation.
 
     Useful when no analytical model fits well, or for simulation-
     generated isotherms.

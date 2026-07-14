@@ -8,8 +8,7 @@ humidity) to the internal representation consumed by the TPNO operator
 
 Key capabilities
 ────────────────
-•  Peng–Robinson cubic EOS — fully implemented solver (the original
-   reference code left ``solve_pr_eos`` as a stub).
+•  Peng–Robinson cubic EOS — fully implemented solver.
 •  Pure-component fugacity via ideal-gas, Peng–Robinson, or truncated
    second-virial methods.
 •  *Mixture* fugacity via Peng–Robinson with van-der-Waals one-fluid
@@ -22,8 +21,17 @@ Key capabilities
 •  Adsorption loading unit conversions (mmol/g, cm³(STP)/g, mg/g,
    molecules/uc, wt%).
 
-Every public function is type-annotated, accepts both ``float`` and
-``np.ndarray``, and is covered by the test suite in ``tests/test_chemistry.py``.
+BUG FIX (this version)
+──────────────────────
+Previous version: build_condition_vector used mu_dict.get("H2O", 0.0).
+μ = 0 corresponds to f = 1 bar of water — physically wrong for dry
+conditions, which poisoned the grand-potential surface with a false
+"1 bar water" signal on every dry training point.
+
+Fix: when a species has zero or absent mole fraction, replace with
+TRACE_Y = 1e-10 before computing fugacities so the resulting μ is
+very negative (physically meaningful "essentially absent") rather than
+zero (physically "1 bar present").
 
 Author  : Rayhan (University of Bergen)
 Project : UC-TPNO — Uncertainty-Calibrated Thermodynamic Potential
@@ -65,10 +73,16 @@ from .constants import (
 # Type alias for "scalar or array"
 ArrayLike = Union[float, np.ndarray]
 
+# Trace mole fraction used for "absent" species so that the resulting μ
+# is physically very negative rather than the erroneous μ = 0 (= 1 bar).
+# 1e-10 → f ≈ 1e-10 bar → μ ≈ RT·ln(1e-10) ≈ −59 kJ/mol at 313 K.
+_TRACE_Y: float = 1e-10
+
 # ═══════════════════════════════════════════════════════════════════════
 # 1.  PENG–ROBINSON EQUATION OF STATE
 # ═══════════════════════════════════════════════════════════════════════
-# R must be in  bar·L·mol⁻¹·K⁻¹  for the PR EOS when P is in bar.
+
+# R in bar·L·mol⁻¹·K⁻¹ for the PR EOS when P is in bar.
 _R_PR: float = 8.314462618e-2   # 0.08314… bar·L/(mol·K)
 
 # ── Binary interaction parameters k_ij ────────────────────────────────
@@ -103,10 +117,8 @@ def _pr_params_pure(species: GasSpecies, temperature: float) -> Tuple[float, flo
     Pc = species.critical_pressure
     w  = species.acentric_factor
     Tr = temperature / Tc
-
     kappa = 0.37464 + 1.54226 * w - 0.26992 * w ** 2
-    alpha = (1.0 + kappa * (1.0 - math.sqrt(Tr))) ** 2
-
+    alpha = (1.0 + kappa * (1.0 - math.sqrt(max(Tr, 1e-6)))) ** 2
     a = 0.45724 * (_R_PR ** 2) * (Tc ** 2) / Pc * alpha
     b = 0.07780 * _R_PR * Tc / Pc
     return a, b
@@ -115,7 +127,6 @@ def _pr_params_pure(species: GasSpecies, temperature: float) -> Tuple[float, flo
 def solve_pr_cubic(A: float, B: float) -> float:
     """
     Solve the Peng–Robinson cubic in Z:
-
         Z³ − (1 − B)Z² + (A − 3B² − 2B)Z − (AB − B² − B³) = 0
 
     and return the *vapour-phase* (largest real positive) root.
@@ -133,17 +144,15 @@ def solve_pr_cubic(A: float, B: float) -> float:
     c1 = A - 3.0 * B * B - 2.0 * B
     c0 = -(A * B - B * B - B ** 3)
 
-    # Solve Z³ + c2·Z² + c1·Z + c0 = 0  via numpy roots
     roots = np.roots([1.0, c2, c1, c0])
 
-    # Keep real, positive roots
+    # Keep real, positive roots above co-volume B (vapour phase)
     real_roots = []
     for r in roots:
         if abs(r.imag) < 1e-10 and r.real > B:
             real_roots.append(r.real)
 
     if not real_roots:
-        # Fall-back: ideal-gas limit
         warnings.warn(
             "PR cubic yielded no valid roots — returning Z = 1 (ideal-gas).",
             RuntimeWarning,
@@ -151,7 +160,6 @@ def solve_pr_cubic(A: float, B: float) -> float:
         )
         return 1.0
 
-    # Vapour root = largest root
     return float(max(real_roots))
 
 
@@ -166,16 +174,15 @@ def _fugacity_pr_pure(
 ) -> float:
     """Fugacity [bar] of a pure species via Peng–Robinson EOS."""
     a, b = _pr_params_pure(species, temperature)
-
-    A = a * pressure / (_R_PR * temperature) ** 2
-    B = b * pressure / (_R_PR * temperature)
-
-    Z = solve_pr_cubic(A, B)
+    RT  = _R_PR * temperature
+    A   = a * pressure / RT ** 2
+    B   = b * pressure / RT
+    Z   = solve_pr_cubic(A, B)
 
     sqrt2 = math.sqrt(2.0)
     arg_num = Z + (1.0 + sqrt2) * B
     arg_den = Z + (1.0 - sqrt2) * B
-    # Guard against log of non-positive numbers
+
     if arg_num <= 0 or arg_den <= 0 or (Z - B) <= 0:
         return pressure  # degenerate → ideal
 
@@ -195,25 +202,19 @@ def _fugacity_virial_pure(
 ) -> float:
     """
     Fugacity [bar] via the truncated second-virial (Pitzer) correlation.
-
-    Uses the generalised Pitzer correlation:
         B·Pc/(R·Tc) = B⁰ + ω·B¹
     where  B⁰ = 0.083 − 0.422/Tr^1.6
            B¹ = 0.139 − 0.172/Tr^4.2
-
     Ref: Poling et al. §4-5.
     """
     Tc = species.critical_temperature
     Pc = species.critical_pressure
     w  = species.acentric_factor
-    Tr = temperature / Tc
-
+    Tr = max(temperature / Tc, 0.3)  # clamp for sub-critical
     B0 = 0.083 - 0.422 / (Tr ** 1.6)
     B1 = 0.139 - 0.172 / (Tr ** 4.2)
-    B_over_RTc = (B0 + w * B1) / Pc          # L mol⁻¹  (roughly)
-    B = B_over_RTc * _R_PR * Tc               # L mol⁻¹
-
-    # ln(φ) = B·P / (R·T)
+    B_over_RTc = (B0 + w * B1) / Pc
+    B = B_over_RTc * _R_PR * Tc
     ln_phi = B * pressure / (_R_PR * temperature)
     return pressure * math.exp(ln_phi)
 
@@ -243,7 +244,6 @@ def pressure_to_fugacity(
     if method == "ideal":
         return pressure  # f = P
 
-    # Vectorise: ensure we can iterate even over scalars
     p_arr = np.atleast_1d(np.asarray(pressure, dtype=np.float64))
     t_arr = np.broadcast_to(
         np.atleast_1d(np.asarray(temperature, dtype=np.float64)), p_arr.shape
@@ -260,7 +260,6 @@ def pressure_to_fugacity(
         [fn(float(p), float(t), species) for p, t in zip(p_arr.ravel(), t_arr.ravel())]
     ).reshape(p_arr.shape)
 
-    # Return scalar if input was scalar
     if np.ndim(pressure) == 0 and result.ndim >= 1 and result.size == 1:
         return float(result.item())
     return result
@@ -276,16 +275,13 @@ def fugacity_to_pressure(
 ) -> ArrayLike:
     """
     Invert fugacity → pressure via Newton iteration on the EOS.
-
-    Uses *pressure_to_fugacity* as the forward model and iterates to
-    find P such that  f(P, T) = f_target.
+    Uses *pressure_to_fugacity* as the forward model.
     """
     f_target = np.atleast_1d(np.asarray(fugacity, dtype=np.float64))
     t_arr = np.broadcast_to(
         np.atleast_1d(np.asarray(temperature, dtype=np.float64)), f_target.shape
     )
 
-    # Initial guess: ideal-gas  P ≈ f
     P = f_target.copy()
     for _ in range(max_iter):
         f_calc = np.atleast_1d(
@@ -294,7 +290,6 @@ def fugacity_to_pressure(
         residual = f_calc - f_target
         if np.max(np.abs(residual)) < tol:
             break
-        # Secant-style update (simple damped)
         dfdP = np.where(np.abs(P) > EPS, f_calc / P, 1.0)
         P = P - residual / (dfdP + EPS)
         P = np.clip(P, EPS, None)
@@ -320,68 +315,65 @@ def mixture_fugacity_pr(
     Parameters
     ----------
     y           : Mole-fraction dict, e.g. ``{'CO2': 0.15, 'N2': 0.75, 'H2O': 0.10}``.
+                  Species with mole fraction < _TRACE_Y are treated as trace
+                  (replaced with _TRACE_Y) so that the resulting μ is very
+                  negative rather than the erroneous zero.
     pressure    : Total pressure [bar].
     temperature : Temperature [K].
 
     Returns
     -------
     Dict mapping each species formula to its fugacity [bar].
-
-    Notes
-    -----
-    Mixing rules:
-        a_mix = ΣᵢΣⱼ yᵢyⱼ √(aᵢaⱼ)(1 − kᵢⱼ)
-        b_mix = Σᵢ yᵢbᵢ
-
-    Ref: [1] §8-5 of Poling et al.
     """
-    species_list = list(y.keys())
-    n = len(species_list)
+    # --- Sanitise composition: replace zeros with trace so μ ≠ 0 -------
+    y_safe: Dict[str, float] = {}
+    for s, yi in y.items():
+        y_safe[s] = max(float(yi), _TRACE_Y)
+    total = sum(y_safe.values())
+    y_safe = {s: v / total for s, v in y_safe.items()}
+
+    species_list = list(y_safe.keys())
 
     # Pure parameters
-    a_pure = {}
-    b_pure = {}
+    a_pure: Dict[str, float] = {}
+    b_pure: Dict[str, float] = {}
     for s in species_list:
         sp = GAS_REGISTRY[s]
         a_pure[s], b_pure[s] = _pr_params_pure(sp, temperature)
 
-    # Mixture parameters
+    # Mixture parameters (vdW1f mixing rules)
     a_mix = 0.0
-    for i, si in enumerate(species_list):
-        for j, sj in enumerate(species_list):
+    for si in species_list:
+        for sj in species_list:
             kij = _get_kij(si, sj)
             aij = math.sqrt(a_pure[si] * a_pure[sj]) * (1.0 - kij)
-            a_mix += y[si] * y[sj] * aij
+            a_mix += y_safe[si] * y_safe[sj] * aij
 
-    b_mix = sum(y[s] * b_pure[s] for s in species_list)
+    b_mix = sum(y_safe[s] * b_pure[s] for s in species_list)
 
     RT = _R_PR * temperature
     A_mix = a_mix * pressure / RT ** 2
     B_mix = b_mix * pressure / RT
-
     Z = solve_pr_cubic(A_mix, B_mix)
 
     sqrt2 = math.sqrt(2.0)
+    arg_num = Z + (1.0 + sqrt2) * B_mix
+    arg_den = Z + (1.0 - sqrt2) * B_mix
 
-    # Per-component ln(φ_k)
     fugacities: Dict[str, float] = {}
     for k in species_list:
-        # ∂(n²a_mix)/∂n_k at constant nⱼ≠k  = 2 Σⱼ yⱼ a_kj
+        if arg_num <= 0 or arg_den <= 0 or (Z - B_mix) <= 0:
+            fugacities[k] = y_safe[k] * pressure
+            continue
+
+        # ∂(n²a_mix)/∂n_k = 2 Σⱼ yⱼ a_kj
         sum_ya_k = 0.0
         for j in species_list:
             kij = _get_kij(k, j)
             akj = math.sqrt(a_pure[k] * a_pure[j]) * (1.0 - kij)
-            sum_ya_k += y[j] * akj
+            sum_ya_k += y_safe[j] * akj
 
         bk = b_pure[k]
-
-        arg_num = Z + (1.0 + sqrt2) * B_mix
-        arg_den = Z + (1.0 - sqrt2) * B_mix
-
-        if arg_num <= 0 or arg_den <= 0 or (Z - B_mix) <= 0:
-            fugacities[k] = y[k] * pressure
-            continue
-
         ln_phi_k = (
             bk / b_mix * (Z - 1.0)
             - math.log(Z - B_mix)
@@ -390,7 +382,7 @@ def mixture_fugacity_pr(
             * math.log(arg_num / arg_den)
         )
         phi_k = math.exp(ln_phi_k)
-        fugacities[k] = y[k] * phi_k * pressure
+        fugacities[k] = y_safe[k] * phi_k * pressure
 
     return fugacities
 
@@ -398,6 +390,7 @@ def mixture_fugacity_pr(
 # ═══════════════════════════════════════════════════════════════════════
 # 4.  CHEMICAL-POTENTIAL CONVERSIONS
 # ═══════════════════════════════════════════════════════════════════════
+
 # μ = μ° + R·T·ln(f / f°)   with f° = 1 bar  (ideal-gas standard state)
 
 def fugacity_to_chemical_potential(
@@ -408,9 +401,13 @@ def fugacity_to_chemical_potential(
     Convert fugacity [bar] → excess chemical potential [kJ mol⁻¹].
 
     μ − μ° = R·T·ln(f / 1 bar)
+
+    Note: for trace species (f ≈ 1e-10 bar), μ ≈ -59 kJ/mol at 313 K,
+    which correctly represents "essentially absent".
     """
     f = np.asarray(fugacity, dtype=np.float64)
     T = np.asarray(temperature, dtype=np.float64)
+    # Clamp to LOG_EPS (1e-12) so log never hits -inf
     mu = R_kJ * T * np.log(np.maximum(f, LOG_EPS))
     if np.ndim(fugacity) == 0 and np.ndim(mu) >= 1 and mu.size == 1:
         return float(mu.item())
@@ -468,9 +465,14 @@ def mixture_pressure_to_chemical_potentials(
     This is the *primary entry point* used by the data pipeline to
     convert raw (P, T, y) conditions into the μ-vector fed to TPNO.
 
+    Zero or absent mole fractions are treated as _TRACE_Y (1e-10) so
+    that absent species receive a physically meaningful very-negative μ
+    rather than μ = 0 (which would incorrectly imply f = 1 bar).
+
     Parameters
     ----------
     y           : Mole fractions  {'CO2': …, 'N2': …, 'H2O': …}.
+                  Missing species are treated as absent (trace).
     pressure    : Total pressure [bar].
     temperature : Temperature [K].
 
@@ -480,7 +482,7 @@ def mixture_pressure_to_chemical_potentials(
     """
     fug = mixture_fugacity_pr(y, pressure, temperature)
     return {
-        gas: fugacity_to_chemical_potential(f, temperature)
+        gas: float(fugacity_to_chemical_potential(f, temperature))
         for gas, f in fug.items()
     }
 
@@ -488,6 +490,10 @@ def mixture_pressure_to_chemical_potentials(
 # ═══════════════════════════════════════════════════════════════════════
 # 5.  BUILD TPNO CONDITION VECTOR
 # ═══════════════════════════════════════════════════════════════════════
+
+# All three species the TPNO operator tracks, in fixed order.
+_TPNO_SPECIES: List[str] = ["CO2", "N2", "H2O"]
+
 
 def build_condition_vector(
     pressure: float,
@@ -499,30 +505,50 @@ def build_condition_vector(
     Build the 4-D condition vector  [μ_CO₂, μ_N₂, μ_H₂O, T]  that the
     TPNO operator expects as input.
 
+    BUG FIX: previous version used mu_dict.get("H2O", 0.0), which gave
+    μ = 0 (≡ f = 1 bar) for dry conditions.  This version always computes
+    all three μ values using a trace mole fraction (_TRACE_Y = 1e-10) for
+    absent species, yielding a physically meaningful very-negative μ.
+
     Parameters
     ----------
     pressure    : Total pressure [bar].
     temperature : Temperature [K].
     y           : Mole fractions  {'CO2': …, 'N2': …, 'H2O': …}.
-    method      : Fugacity method.
+                  Missing keys are treated as absent (mole fraction → 0).
+    method      : Fugacity method (``'peng_robinson'``, ``'virial'``,
+                  ``'ideal'``).
 
     Returns
     -------
     np.ndarray of shape (4,).
     """
+    # Ensure all three species are present with at least trace concentration
+    y_full: Dict[str, float] = {}
+    for s in _TPNO_SPECIES:
+        yi = float(y.get(s, 0.0))
+        y_full[s] = max(yi, _TRACE_Y)  # absent → trace, not zero
+
+    # Normalise so mole fractions sum to 1
+    total = sum(y_full.values())
+    y_full = {s: v / total for s, v in y_full.items()}
+
     if method == "peng_robinson":
-        mu_dict = mixture_pressure_to_chemical_potentials(y, pressure, temperature)
+        mu_dict = mixture_pressure_to_chemical_potentials(
+            y_full, pressure, temperature
+        )
     else:
-        # Fall back to pure-component fugacities scaled by partial pressure
+        # Pure-component fallback: partial pressure × EOS correction
         mu_dict = {}
-        for gas in ["CO2", "N2", "H2O"]:
-            yi = y.get(gas, 0.0)
-            pi = yi * pressure
-            fi = pressure_to_fugacity(max(pi, LOG_EPS), temperature, gas=gas, method=method)
-            mu_dict[gas] = fugacity_to_chemical_potential(fi, temperature)
+        for s in _TPNO_SPECIES:
+            pi = y_full[s] * pressure
+            fi = pressure_to_fugacity(
+                max(pi, LOG_EPS), temperature, gas=s, method=method
+            )
+            mu_dict[s] = float(fugacity_to_chemical_potential(fi, temperature))
 
     return np.array(
-        [mu_dict.get("CO2", 0.0), mu_dict.get("N2", 0.0), mu_dict.get("H2O", 0.0), temperature],
+        [mu_dict["CO2"], mu_dict["N2"], mu_dict["H2O"], temperature],
         dtype=np.float64,
     )
 
@@ -537,8 +563,45 @@ def build_condition_grid(
     Vectorised version of :func:`build_condition_vector` over a pressure
     array.  Returns shape ``(len(pressures), 4)``.
     """
-    rows = [build_condition_vector(float(p), temperature, y, method) for p in pressures]
+    rows = [
+        build_condition_vector(float(p), temperature, y, method)
+        for p in pressures
+    ]
     return np.stack(rows, axis=0)
+
+
+def build_condition_vector_from_rh(
+    rh: float,
+    temperature: float,
+    total_pressure: float = 1.013,
+    y_co2_dry: float = 0.15,
+    method: str = "peng_robinson",
+) -> np.ndarray:
+    """
+    Convert relative humidity + operating conditions → TPNO condition vector.
+
+    This is the convenience entry point for humid flue-gas scenarios.
+    Internally calls :func:`relative_humidity_to_mole_fraction` then
+    :func:`build_condition_vector`.
+
+    Parameters
+    ----------
+    rh              : Relative humidity ∈ [0, 1].
+    temperature     : Temperature [K].
+    total_pressure  : Total pressure [bar].  Default 1.013 bar (post-FGD).
+    y_co2_dry       : CO₂ mole fraction in the *dry* flue gas.  Default 0.15.
+    method          : Fugacity method.
+
+    Returns
+    -------
+    np.ndarray of shape (4,):  [μ_CO₂, μ_N₂, μ_H₂O, T]
+    """
+    y_h2o = float(relative_humidity_to_mole_fraction(rh, temperature, total_pressure))
+    y_dry = 1.0 - y_h2o
+    y_co2 = y_co2_dry * y_dry
+    y_n2  = y_dry - y_co2
+    y = {"CO2": y_co2, "N2": y_n2, "H2O": y_h2o}
+    return build_condition_vector(total_pressure, temperature, y, method)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -548,7 +611,6 @@ def build_condition_grid(
 def water_saturation_pressure_antoine(temperature: ArrayLike) -> ArrayLike:
     """
     Saturation pressure of water [bar] via Antoine equation.
-
     Uses the constants stored in :pydata:`H2O.antoine_*` from
     ``constants.py`` (NIST, valid ~255–373 K).
     """
@@ -562,7 +624,6 @@ def water_saturation_pressure_antoine(temperature: ArrayLike) -> ArrayLike:
 def water_saturation_pressure_buck(temperature: ArrayLike) -> ArrayLike:
     """
     Saturation pressure of water [bar] via the Buck (1981) equation.
-
     More accurate than Antoine above ~320 K.
 
         P_sat [hPa] = 6.1121 · exp[ (18.678 − T_C/234.5) · T_C / (257.14 + T_C) ]
@@ -572,7 +633,7 @@ def water_saturation_pressure_buck(temperature: ArrayLike) -> ArrayLike:
     T = np.asarray(temperature, dtype=np.float64)
     Tc = T - 273.15
     P_hPa = 6.1121 * np.exp((18.678 - Tc / 234.5) * Tc / (257.14 + Tc))
-    P_bar = P_hPa / 1000.0  # hPa → bar
+    P_bar = P_hPa / 1000.0
     if np.ndim(temperature) == 0:
         return float(P_bar.item()) if P_bar.ndim >= 1 else float(P_bar)
     return P_bar
@@ -615,9 +676,7 @@ def mole_fraction_to_relative_humidity(
     total_pressure: float = 1.013,
     saturation_method: str = "antoine",
 ) -> ArrayLike:
-    """
-    Convert water mole fraction y_H₂O → relative humidity (0–1).
-    """
+    """Convert water mole fraction y_H₂O → relative humidity (0–1)."""
     if saturation_method == "buck":
         P_sat = water_saturation_pressure_buck(temperature)
     else:
@@ -625,8 +684,8 @@ def mole_fraction_to_relative_humidity(
 
     y_w = np.asarray(y_w, dtype=np.float64)
     P_w = y_w * total_pressure
-    rh = P_w / np.maximum(P_sat, EPS)
-    rh = np.clip(rh, 0.0, 1.0)
+    rh  = P_w / np.maximum(P_sat, EPS)
+    rh  = np.clip(rh, 0.0, 1.0)
 
     if np.ndim(y_w) == 0 and np.ndim(rh) >= 1 and rh.size == 1:
         return float(rh.item())
@@ -647,10 +706,12 @@ def flue_gas_composition(
     -------
     ``{'CO2': …, 'N2': …, 'H2O': …}`` summing to 1.0.
     """
-    y_H2O = relative_humidity_to_mole_fraction(rh, temperature, total_pressure)
+    y_H2O = float(
+        relative_humidity_to_mole_fraction(rh, temperature, total_pressure)
+    )
     y_dry = 1.0 - y_H2O
     y_CO2 = y_CO2_dry * y_dry
-    y_N2 = y_dry - y_CO2
+    y_N2  = y_dry - y_CO2
     return {"CO2": y_CO2, "N2": y_N2, "H2O": y_H2O}
 
 
@@ -696,11 +757,9 @@ def wt_pct_to_mol_kg(
 ) -> ArrayLike:
     """
     Weight-percent loading → mol kg⁻¹.
-
     wt% = 100 · m_ads / (m_ads + m_sorbent)
     """
     wt = np.asarray(wt, dtype=np.float64)
-    # mg adsorbate per g sorbent  =  wt/(100-wt) * 1000
     mg_g = wt / (100.0 - wt + EPS) * 1000.0
     return mg_g / molar_mass
 
@@ -716,10 +775,8 @@ def molecules_per_uc_to_mol_kg(
     ----------
     n_molec      : Loading in molecules per unit cell.
     uc_mass_g_mol: Molar mass of one unit cell [g mol⁻¹].
-                   (Sum of atomic masses × number of formula units.)
     """
     n = np.asarray(n_molec, dtype=np.float64)
-    # 1 molecule/uc = 1/N_A mol per uc;  uc mass in kg = uc_mass_g_mol / 1000
     return n * 1000.0 / uc_mass_g_mol
 
 
@@ -735,8 +792,9 @@ def compressibility_factor_pr(
     """Return Z from PR EOS for a pure gas."""
     species = GAS_REGISTRY[gas]
     a, b = _pr_params_pure(species, temperature)
-    A = a * pressure / (_R_PR * temperature) ** 2
-    B = b * pressure / (_R_PR * temperature)
+    RT = _R_PR * temperature
+    A = a * pressure / RT ** 2
+    B = b * pressure / RT
     return solve_pr_cubic(A, B)
 
 
@@ -748,14 +806,12 @@ def gas_density(
 ) -> float:
     """
     Molar density [mol L⁻¹] of a gas at given (P, T).
-
     Uses PR EOS if ``method='peng_robinson'``, else ideal-gas law.
     """
     if method == "peng_robinson":
         Z = compressibility_factor_pr(pressure, temperature, gas)
     else:
         Z = 1.0
-    # PV = ZnRT  →  n/V = P / (Z·R·T)
     return pressure / (Z * _R_PR * temperature)
 
 
@@ -770,14 +826,13 @@ def clausius_clapeyron_qst(
     """
     Estimate isosteric heat of adsorption Q_st [kJ mol⁻¹] from a set of
     (ln P, 1/T) points at constant loading via Clausius–Clapeyron:
-
         Q_st = −R · d(ln P) / d(1/T)
 
     A simple least-squares linear fit is used.
     """
     if len(ln_p) < 2:
         return 0.0
-    coeffs = np.polyfit(inv_T, ln_p, 1)  # slope = d(ln P)/d(1/T)
+    coeffs = np.polyfit(inv_T, ln_p, 1)
     slope = coeffs[0]
     return -R_kJ * slope   # kJ mol⁻¹
 
@@ -787,7 +842,7 @@ def clausius_clapeyron_qst(
 # ═══════════════════════════════════════════════════════════════════════
 
 __all__ = [
-    # EOS internals (exposed for testing / advanced use)
+    # EOS internals
     "solve_pr_cubic",
     "compressibility_factor_pr",
     "gas_density",
@@ -802,9 +857,10 @@ __all__ = [
     "pressure_to_chemical_potential",
     "chemical_potential_to_pressure",
     "mixture_pressure_to_chemical_potentials",
-    # Condition-vector builder (TPNO entry point)
+    # Condition-vector builders (TPNO entry points)
     "build_condition_vector",
     "build_condition_grid",
+    "build_condition_vector_from_rh",
     # Humidity
     "water_saturation_pressure_antoine",
     "water_saturation_pressure_buck",

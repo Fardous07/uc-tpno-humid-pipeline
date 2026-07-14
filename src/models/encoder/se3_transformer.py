@@ -38,7 +38,7 @@ References
 
 Author  : Rayhan (University of Bergen)
 Project : UC-TPNO — Uncertainty-Calibrated Thermodynamic Potential
-          Neural Operator for Humid Flue-Gas CO₂ Capture in MOFs
+          Neural Operator for Humid Flue-Gas CO2 Capture in MOFs
 License : MIT
 """
 
@@ -52,9 +52,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-# ═══════════════════════════════════════════════════════════════════════
+# =======================================================================
 # Lazy dependency gate
-# ═══════════════════════════════════════════════════════════════════════
+# =======================================================================
 
 def _require_e3nn():
     try:
@@ -79,9 +79,9 @@ def _require_scatter():
         ) from e
 
 
-# ═══════════════════════════════════════════════════════════════════════
+# =======================================================================
 # 1.  BUILDING BLOCKS
-# ═══════════════════════════════════════════════════════════════════════
+# =======================================================================
 
 class RadialBasisSE3(nn.Module):
     """Gaussian RBFs with polynomial cutoff envelope."""
@@ -116,9 +116,9 @@ class RadialMLP(nn.Module):
         return self.net(rbf)
 
 
-# ═══════════════════════════════════════════════════════════════════════
+# =======================================================================
 # 2.  SE(3)-TRANSFORMER LAYER
-# ═══════════════════════════════════════════════════════════════════════
+# =======================================================================
 
 class SE3TransformerLayer(nn.Module):
     """
@@ -169,8 +169,7 @@ class SE3TransformerLayer(nn.Module):
         # Self-interaction (linear skip)
         self.self_interaction = o3.Linear(self.irreps_in, self.irreps_out)
 
-        # Scalar attention gate
-        # Extract scalar dim from irreps_in for Q/K
+        # Scalar attention gate — Q/K operate on l=0 channels only
         scalar_dim = sum(mul for mul, ir in self.irreps_in if ir.l == 0)
         d_head = max(scalar_dim // n_heads, 1)
         self.q_proj = nn.Linear(scalar_dim, d_head * n_heads, bias=False)
@@ -188,7 +187,7 @@ class SE3TransformerLayer(nn.Module):
         self.bn = BatchNorm(self.irreps_out)
         self.dropout = nn.Dropout(drop_rate)
 
-        # Store scalar slice indices
+        # Scalar slice end index (l=0 channels are laid out first)
         self._scalar_end = scalar_dim
 
     def _extract_scalars(self, x: torch.Tensor) -> torch.Tensor:
@@ -206,41 +205,38 @@ class SE3TransformerLayer(nn.Module):
         src, dst = edge_index
         n_nodes = x.shape[0]
 
-        # ── Tensor-product messages ──────────────────────────────
-        tp_weights = self.radial_mlp(edge_rbf)  # [E, weight_numel]
-        msg = self.tp(x[src], edge_sh, tp_weights)  # [E, irreps_out.dim]
+        # Tensor-product messages
+        tp_weights = self.radial_mlp(edge_rbf)          # [E, weight_numel]
+        msg = self.tp(x[src], edge_sh, tp_weights)       # [E, irreps_out.dim]
 
-        # ── Scalar attention ─────────────────────────────────────
+        # Scalar attention
         x_scalar = self._extract_scalars(x)
         q = self.q_proj(x_scalar).reshape(n_nodes, self.n_heads, self.d_head)
         k = self.k_proj(x_scalar).reshape(n_nodes, self.n_heads, self.d_head)
 
         scores = (q[dst] * k[src]).sum(dim=-1) / math.sqrt(self.d_head)
-        scores = scores + self.attn_radial(edge_rbf)  # [E, H]
+        scores = scores + self.attn_radial(edge_rbf)     # [E, H]
 
-        # Cutoff mask
-        mask = (edge_lengths < 1e6).float().unsqueeze(-1)  # always true unless pruned
-        scores_exp = torch.exp(scores - scores.max()) * mask
+        # Softmax per destination node (subtract global max for numerical stability;
+        # the constant cancels within each destination group's ratio)
+        scores_exp = torch.exp(scores - scores.max())
         denom = self.scatter(scores_exp, dst, dim=0, dim_size=n_nodes, reduce="sum")
-        attn = scores_exp / (denom[dst] + 1e-8)  # [E, H]
+        attn = scores_exp / (denom[dst] + 1e-8)          # [E, H]
 
-        # Average attention across heads → scalar gate [E, 1]
-        gate = attn.mean(dim=-1, keepdim=True)
+        # Average heads → scalar gate, then gate equivariant messages
+        gate = attn.mean(dim=-1, keepdim=True)            # [E, 1]
+        msg = msg * gate                                   # [E, irreps_out.dim]
 
-        # Gated messages
-        msg = msg * gate  # [E, irreps_out.dim]
-
-        # ── Aggregate + residual + norm ──────────────────────────
+        # Aggregate + residual + norm
         agg = self.scatter(msg, dst, dim=0, dim_size=n_nodes, reduce="sum")
         agg = self.dropout(agg)
-
         skip = self.self_interaction(x)
         return self.bn(agg + skip)
 
 
-# ═══════════════════════════════════════════════════════════════════════
+# =======================================================================
 # 3.  SE(3)-TRANSFORMER ENCODER
-# ═══════════════════════════════════════════════════════════════════════
+# =======================================================================
 
 class SE3TransformerEncoder(nn.Module):
     """
@@ -288,7 +284,7 @@ class SE3TransformerEncoder(nn.Module):
         # Node embedding
         self.node_emb = nn.Embedding(n_species, emb_dim)
 
-        # Build irreps string for hidden layers
+        # Build hidden irreps string
         vec_dim = emb_dim // 2
         if lmax >= 2:
             irreps_str = f"{emb_dim}x0e + {vec_dim}x1o + {vec_dim}x2e"
@@ -332,8 +328,6 @@ class SE3TransformerEncoder(nn.Module):
             nn.LayerNorm(emb_dim),
         )
 
-    # ── Edge vectors with PBC ────────────────────────────────────
-
     def _edge_vectors(
         self,
         pos: torch.Tensor,
@@ -351,8 +345,6 @@ class SE3TransformerEncoder(nn.Module):
             vec = vec - torch.round(frac) @ cell.float()
         lengths = vec.norm(dim=-1).clamp(min=1e-8)
         return vec, lengths
-
-    # ── Data unpacking ───────────────────────────────────────────
 
     @staticmethod
     def _unpack(data: Any) -> Tuple[torch.Tensor, ...]:
@@ -373,8 +365,6 @@ class SE3TransformerEncoder(nn.Module):
         if batch is None:
             batch = torch.zeros(len(z), dtype=torch.long, device=z.device)
         return z, pos, ei, cell, shifts, batch
-
-    # ── Forward ──────────────────────────────────────────────────
 
     def forward(self, data: Any) -> torch.Tensor:
         """
@@ -400,7 +390,7 @@ class SE3TransformerEncoder(nn.Module):
         edge_sh = self.sh(vec / lengths.unsqueeze(-1))
         edge_rbf = self.rbf(lengths)
 
-        # Cutoff mask
+        # Zero out features beyond cutoff
         mask = (lengths < self.cutoff).float().unsqueeze(-1)
         edge_sh = edge_sh * mask
         edge_rbf = edge_rbf * mask
@@ -421,9 +411,9 @@ class SE3TransformerEncoder(nn.Module):
         return {"total": total, "trainable": trainable, "frozen": total - trainable}
 
 
-# ═══════════════════════════════════════════════════════════════════════
+# =======================================================================
 # PUBLIC API
-# ═══════════════════════════════════════════════════════════════════════
+# =======================================================================
 
 __all__ = [
     "SE3TransformerEncoder",

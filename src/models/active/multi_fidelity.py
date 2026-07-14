@@ -177,8 +177,37 @@ class FidelityCorrelation:
         self.n_fidelities = n_fidelities
         self.min_pairs = min_pairs
 
-        # Paired observations: (fid_low, fid_high) → [(y_low, y_high), ...]
+        # Paired observations stored with normalised key (lo, hi):
+        # value is always (y_for_lo_fidelity, y_for_hi_fidelity)
         self._pairs: Dict[Tuple[int, int], List[Tuple[float, float]]] = {}
+
+    # ── Internal helper ──────────────────────────────────────────
+
+    def _normalise_and_store(
+        self,
+        fid_a: int,
+        fid_b: int,
+        y_a: float,
+        y_b: float,
+    ) -> None:
+        """
+        Store a pair with a canonical (low, high) key, swapping
+        y values if the caller passed fids in the wrong order.
+
+        FIX: original code normalised the key but kept y values in
+        call order.  When fid_a > fid_b the y's were stored reversed
+        relative to the key, so correlation() and scaling_factor()
+        would regress in the wrong direction.
+        """
+        if fid_a <= fid_b:
+            key = (fid_a, fid_b)
+            pair = (y_a, y_b)
+        else:
+            key = (fid_b, fid_a)
+            pair = (y_b, y_a)     # swap so key[0]-fidelity is always first
+        self._pairs.setdefault(key, []).append(pair)
+
+    # ── Public API ───────────────────────────────────────────────
 
     def add_pair(
         self,
@@ -188,8 +217,7 @@ class FidelityCorrelation:
         y_high: float,
     ) -> None:
         """Record a paired observation at two fidelities (same x)."""
-        key = (min(fid_low, fid_high), max(fid_low, fid_high))
-        self._pairs.setdefault(key, []).append((y_low, y_high))
+        self._normalise_and_store(fid_low, fid_high, y_low, y_high)
 
     def add_pairs_batch(
         self,
@@ -199,16 +227,21 @@ class FidelityCorrelation:
         y_high: np.ndarray,
     ) -> None:
         """Add a batch of paired observations."""
-        key = (min(fid_low, fid_high), max(fid_low, fid_high))
-        self._pairs.setdefault(key, [])
         for yl, yh in zip(y_low.ravel(), y_high.ravel()):
-            self._pairs[key].append((float(yl), float(yh)))
+            self._normalise_and_store(fid_low, fid_high, float(yl), float(yh))
 
     def correlation(self, fid_low: int, fid_high: int) -> Optional[float]:
         """
         Pearson correlation between fid_low and fid_high.
 
-        Returns ``None`` if fewer than ``min_pairs`` observations.
+        Returns ``None`` if fewer than ``min_pairs`` observations or
+        if either series has near-zero variance (correlation undefined).
+
+        FIX: original returned 1.0 for constant series.  If one series
+        is constant and the other is not, they are uncorrelated (not
+        perfectly correlated).  Returning 1.0 would cause the selector
+        to blindly trust a useless fidelity.  Return None instead so
+        the caller falls back to the highest fidelity.
         """
         key = (min(fid_low, fid_high), max(fid_low, fid_high))
         pairs = self._pairs.get(key, [])
@@ -221,7 +254,8 @@ class FidelityCorrelation:
         std_l = y_l.std()
         std_h = y_h.std()
         if std_l < 1e-12 or std_h < 1e-12:
-            return 1.0  # constant → perfectly correlated
+            # Variance undefined → correlation undefined; return None
+            return None
 
         return float(np.corrcoef(y_l, y_h)[0, 1])
 
@@ -262,10 +296,6 @@ class AutoRegressiveModel(nn.Module):
 
     Each δₜ is modelled as a small MLP correction.  ρₜ is a learnable
     scalar (or can be fixed from ``FidelityCorrelation``).
-
-    This provides a principled way to **transfer** cheap low-fidelity
-    predictions to the high-fidelity target, learning only the
-    residual correction δ.
 
     Parameters
     ----------
@@ -361,7 +391,13 @@ class AutoRegressiveModel(nn.Module):
         Returns
         -------
         ``[B, 1]`` predictions.
+
+        FIX: cast fidelities to long before comparison.
+        ``unique().tolist()`` on a float tensor returns Python floats;
+        comparing a float tensor with int(fid) works by accident in
+        PyTorch but is brittle.  Explicit .long() makes the intent clear.
         """
+        fidelities = fidelities.long()
         unique_fids = fidelities.unique().tolist()
         out = torch.zeros(x.shape[0], 1, device=x.device, dtype=x.dtype)
 

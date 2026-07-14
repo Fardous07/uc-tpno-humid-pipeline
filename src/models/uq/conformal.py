@@ -189,6 +189,10 @@ class DensityRatioEstimator:
     ``P(target | x) / P(source | x)``, clipped for stability.
 
     Supported classifiers: ``'gbm'`` (default), ``'rf'``, ``'logistic'``.
+
+    FIX: original code normalised weights BEFORE clipping, so clipping
+    destroyed the normalisation.  Correct order: clip first, then
+    normalise to mean 1 so that the weighted quantile is well-scaled.
     """
 
     def __init__(
@@ -239,8 +243,11 @@ class DensityRatioEstimator:
         proba = self._clf.predict_proba(X)
         p_src, p_tgt = proba[:, 0], proba[:, 1]
         w = p_tgt / (p_src + 1e-8)
-        w = w / w.mean()                          # normalise to mean 1
-        w = np.clip(w, self.clip[0], self.clip[1])  # clip extremes
+        # FIX: clip BEFORE normalising so the clipped weights still have
+        # mean 1 and the weighted quantile is correctly scaled.
+        # Original: normalise then clip → clipping broke normalisation.
+        w = np.clip(w, self.clip[0], self.clip[1])
+        w = w / w.mean()    # normalise to mean 1 after clipping
         return w
 
 
@@ -272,17 +279,31 @@ def _weighted_quantile(
     alpha: float,
 ) -> float:
     """
-    Weighted quantile: find the smallest *q* such that the cumulative
-    weight of scores ≤ q exceeds ``(1−α)(1 + 1/n)``.
+    Weighted conformal quantile: the smallest score s such that the
+    cumulative normalised weight of all calibration scores ≤ s
+    exceeds ``(1−α)(1 + 1/n)``.
+
+    FIX: original used ``np.interp`` (linear interpolation between
+    scores), which can return a value strictly between two calibration
+    scores.  The conformal guarantee requires the *step-function*
+    quantile — the actual smallest calibration score that pushes
+    cumulative weight over the target level.  Fixed to use
+    ``np.searchsorted`` on the sorted cumulative weights.
     """
     n = len(scores)
     target = (1 - alpha) * (1 + 1.0 / n)
 
     idx = np.argsort(scores)
     sorted_scores = scores[idx]
-    cum_w = np.cumsum(weights[idx] / weights.sum())
+    sorted_weights = weights[idx]
+    cum_w = np.cumsum(sorted_weights / sorted_weights.sum())
 
-    return float(np.interp(target, cum_w, sorted_scores))
+    # Find the first index where cumulative weight reaches target
+    pos = np.searchsorted(cum_w, target, side="left")
+    if pos >= len(sorted_scores):
+        # All scores needed; return the largest
+        return float(sorted_scores[-1])
+    return float(sorted_scores[pos])
 
 
 # ── Split conformal ─────────────────────────────────────────────────
