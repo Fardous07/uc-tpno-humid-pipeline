@@ -218,6 +218,7 @@ def main() -> None:
     parser.add_argument("--seed",         type=int,   default=42)
     parser.add_argument("--no-early-stopping", dest="early_stopping", action="store_false")
     parser.add_argument("--patience",     type=int,   default=None)
+    parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--grad-accum",   type=int,   default=None)
     args = parser.parse_args()
 
@@ -544,6 +545,9 @@ def main() -> None:
 
     callbacks.on_train_begin(trainer)
     try:
+        if args.resume:
+            trainer.load_checkpoint(args.resume)
+            print(f"Resumed from {args.resume}")
         history = trainer.fit(
             n_epochs=trainer_cfg.n_epochs,
             callback=epoch_callback,

@@ -48,14 +48,18 @@ data:
   seed: 42
 
 model:
+  emb_dim: 32
+  cutoff: 4.0
+  n_rbf: 8
+  n_ensemble: 2
   # --- Encoder configuration ---
   encoder: nequip                # Options: nequip, equiformer, gemnet, se3_transformer
   encoder_config:
     n_species: 100
-    emb_dim: 64                  # 64 is good start; 128 for final model
+    emb_dim: 32                  # 64 is good start; 128 for final model
     n_layers: 2                  # 2-4 layers; start with 2 for faster training
     lmax: 1                      # 0=scalars only, 1=vectors, 2=tensors
-    cutoff: 6.0                  # Angstroms
+    cutoff: 4.0                  # Angstroms
     use_pbc: true
     avg_num_neighbours: 50.0
   
@@ -73,7 +77,7 @@ model:
   
   # --- Ensemble configuration ---
   ensemble:
-    n_models: 5                  # Ensemble size for UQ
+    n_models: 2                  # Ensemble size for UQ
     share_encoder: true          # Share encoder weights (faster inference)
     n_samples: 30                # Monte Carlo samples for SWAG
 
@@ -102,7 +106,7 @@ training:
   patience: 40
   
   # --- Mixed precision ---
-  mixed_precision: true          # Use AMP for faster training
+  use_amp: true          # Use AMP for faster training
   
   # =========================================================================
   # PHYSICS-INFORMED LOSS WEIGHTS (RECOMMENDED - START CONSERVATIVE)

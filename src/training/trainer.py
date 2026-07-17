@@ -63,6 +63,7 @@ class TrainConfig:
     patience: int = 20
     checkpoint_dir: str = "checkpoints"
     checkpoint_freq: int = 10
+    gradient_accumulation_steps: int = 1
     use_wandb: bool = False
     wandb_project: str = "uc-tpno"
     wandb_run_name: Optional[str] = None
@@ -434,7 +435,7 @@ class TPNOTrainer:
         for i, batch in enumerate(self.train_loader):
             graphs, conditions, targets, mask = self._to_device(batch, self.device)
 
-            with torch.cuda.amp.autocast(enabled=self._scaler is not None):
+            with torch.amp.autocast("cuda", enabled=self._scaler is not None):
                 predictions = self.model(
                     graphs,
                     conditions,

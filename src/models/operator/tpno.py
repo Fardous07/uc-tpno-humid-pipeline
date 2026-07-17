@@ -627,6 +627,9 @@ class TPNOEnsemble(nn.Module):
         conditions: torch.Tensor,
         *,
         return_all: bool = False,
+        return_uncertainty: bool = True,
+        return_potential: bool = False,
+        return_hessian: bool = False,
     ) -> Dict[str, torch.Tensor]:
         preds:  List[torch.Tensor] = []
         sigmas: List[torch.Tensor] = []
