@@ -186,8 +186,14 @@ def make_epoch_callback(
             weights = physics_scheduler.get_current_weights()
             logger.debug("Physics weights @ epoch %d: %s", epoch, weights)
 
-        if adaptive_weights is not None and "physics" in metrics:
-            adaptive_weights.update_weights(metrics["physics"])
+        if adaptive_weights is not None:
+            physics_dict = {
+                k.replace("train/physics_", ""): v
+                for k, v in metrics.items()
+                if k.startswith("train/physics_")
+            }
+            if physics_dict:
+                adaptive_weights.update_weights(physics_dict)
 
         callback_runner.on_epoch_end(epoch, metrics, trainer)
 
@@ -337,6 +343,7 @@ def main() -> None:
         "cutoff":    model_cfg.get("cutoff",           6.0),
         "n_rbf":     model_cfg.get("n_rbf",            32),
         "use_pbc":   model_cfg.get("use_pbc",          True),
+        "avg_num_neighbours": model_cfg.get("avg_num_neighbours", 15.0),
     }
     encoder = EncoderAdapter.from_config(
         encoder_config,

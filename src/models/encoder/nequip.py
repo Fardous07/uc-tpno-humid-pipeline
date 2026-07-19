@@ -459,6 +459,7 @@ class NequIPEncoder(nn.Module):
         n_rbf: int = 32,
         cutoff: float = 5.0,
         use_pbc: bool = True,
+        avg_num_neighbours: float = 15.0,
         *,
         config: Optional[NequIPConfig] = None,
     ):
@@ -476,6 +477,7 @@ class NequIPEncoder(nn.Module):
                 n_rbf=n_rbf,
                 cutoff=cutoff,
                 use_pbc=use_pbc,
+                avg_num_neighbours=avg_num_neighbours,
             )
 
         self.config = c

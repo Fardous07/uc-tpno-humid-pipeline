@@ -93,9 +93,12 @@ def _compute_regression_metrics(
     diff = y_pred - y_true
     mae = float(np.mean(np.abs(diff)))
     rmse = float(np.sqrt(np.mean(diff ** 2)))
-    ss_res = float(np.sum(diff ** 2))
-    ss_tot = float(np.sum((y_true - y_true.mean()) ** 2))
-    r2 = 1.0 - ss_res / (ss_tot + 1e-12)
+    r2_per = []
+    for ci in range(y_true.shape[-1]):
+        ss_res = float(np.sum((y_pred[:, ci] - y_true[:, ci]) ** 2))
+        ss_tot = float(np.sum((y_true[:, ci] - y_true[:, ci].mean()) ** 2))
+        r2_per.append(1.0 - ss_res / (ss_tot + 1e-12))
+    r2 = float(np.mean(r2_per))
     return {"mae": mae, "rmse": rmse, "r2": r2}
 
 

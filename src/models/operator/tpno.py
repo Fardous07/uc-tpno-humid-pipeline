@@ -227,7 +227,7 @@ class FiLMConditioning(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
         )
         # Near-identity init: γ→1, β→0
-        nn.init.zeros_(self.gamma_net[-1].weight)
+        nn.init.normal_(self.gamma_net[-1].weight, std=0.01)
         nn.init.ones_(self.gamma_net[-1].bias)
         nn.init.zeros_(self.beta_net[-1].weight)
         nn.init.zeros_(self.beta_net[-1].bias)
