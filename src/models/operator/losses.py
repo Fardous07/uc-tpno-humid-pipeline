@@ -262,12 +262,18 @@ class ThermodynamicLoss(nn.Module):
         if conditions.dim() == 2:
             conditions = conditions.unsqueeze(1)
 
-        # --- Data loss (mask applied inside helper) ---
+        # --- Data loss in NORMALIZED units (per-component balance) ---
+        base = model.models[0] if hasattr(model, "models") else model
+        q_std  = base.q_std.to(q_pred.device)
+        q_mean = base.q_mean.to(q_pred.device)
+        q_pred_n  = (q_pred  - q_mean) / (q_std + 1e-8)
+        targets_n = (targets - q_mean) / (q_std + 1e-8)
+
         sigma = predictions.get("sigma")
         if c.use_nll and sigma is not None:
-            d_loss = data_loss_nll(q_pred, targets, sigma, mask=mask)
+            d_loss = data_loss_nll(q_pred_n, targets_n, sigma, mask=mask)
         else:
-            d_loss = data_loss_mse(q_pred, targets, mask=mask)
+            d_loss = data_loss_mse(q_pred_n, targets_n, mask=mask)
 
         physics: Dict[str, torch.Tensor] = {}
         total = c.lambda_data * d_loss

@@ -73,7 +73,8 @@ model:
     share_encoder: true
   n_ensemble: 2
   n_layers: 2
-  n_rbf: 8
+  n_rbf: 32
+  avg_num_neighbours: 15.0
   tpno_config:
     activation: swish
     convex_constraint: softplus
@@ -162,8 +163,8 @@ training:
   optimizer: adamw
   patience: 200
   physics_loss:
-    adaptive_weights: true
-    lambda_competition: 0.1
+    adaptive_weights: false
+    lambda_competition: 0.0
     lambda_gibbs_duhem: 0.0
     lambda_henry: 0.02
     lambda_hessian: 0.0
@@ -175,7 +176,8 @@ training:
   scheduler: cosine_warm_restarts
   scheduler_T0: 30
   scheduler_T_mult: 2
-  use_amp: true
+  use_amp: false
+  use_nll: false
   warmup_epochs: 30
   weight_decay: 0.0001
 uq:
