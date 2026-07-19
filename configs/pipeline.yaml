@@ -176,7 +176,7 @@ training:
   scheduler: cosine_warm_restarts
   scheduler_T0: 30
   scheduler_T_mult: 2
-  use_amp: false
+  use_amp: true
   use_nll: false
   warmup_epochs: 30
   weight_decay: 0.0001

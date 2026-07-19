@@ -367,7 +367,11 @@ class ThermodynamicPotentialNO(nn.Module):
 
         need_graph = self.training or return_hessian
 
-        with torch.enable_grad():
+        # ICNN + derivatives run in fp32 even when the encoder uses AMP:
+        # autograd-derived loadings are too precision-sensitive for fp16.
+        with torch.enable_grad(), torch.amp.autocast("cuda", enabled=False):
+            h_flat = h_flat.float()
+            cond_norm = cond_norm.float()
             # Detach and re-attach so we always have a fresh leaf for grad
             mu = cond_norm.detach().requires_grad_(True)
 
