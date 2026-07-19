@@ -1,296 +1,210 @@
-# =============================================================================
-# UC-TPNO Pipeline Configuration
-# Thermodynamic Potential Neural Operator for Humid Flue-Gas CO₂ Capture in MOFs
-# =============================================================================
-# 
-# Version: 2.0 (Fixed & Optimized)
-# Date: 2026-07-05
-#
-# CHANGELOG:
-# - Fixed syntax error in training.lambda_hessian (was 0.01 -> now 0.01)
-# - Added physics loss warm-up configuration
-# - Added adaptive loss weighting parameters
-# - Added mixed precision training flags
-# - Added data validation settings
-# - Added experiment tracking
-# =============================================================================
-
-data:
-  # --- Raw data directories ---
-  raw_dir: data/raw
-  core_mof_dir: data/raw/core_mof_2019
-  arc_mof_dir: data/raw/arc_mof_charges
-  mofx_db_dir: data/raw/mofx_db
-  
-  # --- Intermediate data ---
-  intermediate_dir: data/intermediate
-  sanitized_cif_dir: data/intermediate/cifs_sanitized
-  
-  # --- Processed data ---
-  processed_dir: data/processed
-  graph_dir: data/processed/graphs
-  adsorption_dir: data/processed/adsorption
-  registry_parquet: data/mof_registry.parquet
-  splits_file: experiments/run_001/splits.json
-  adsorption_parquet: data/processed/adsorption/adsorption_training.parquet
-  
-  # --- Dataset configuration ---
-  dataset:
-    lazy_loading: true           # Load data on-demand for large datasets
-    shuffle_selection: true      # Shuffle CIFs before selecting subset
-    max_core_mofs: 500           # 0 = all, recommended 500-1000 for training
-    max_arc_mofs: 500            # 0 = all, recommended 500-1000 for training
-  
-  # --- Splitting ---
-  split_method: random           # Options: random, scaffold, humidity
-  test_size: 0.1
-  val_size: 0.1
-  seed: 42
-
-model:
-  emb_dim: 32
-  cutoff: 4.0
-  n_rbf: 8
-  n_ensemble: 2
-  # --- Encoder configuration ---
-  encoder: nequip                # Options: nequip, equiformer, gemnet, se3_transformer
-  encoder_config:
-    n_species: 100
-    emb_dim: 32                  # 64 is good start; 128 for final model
-    n_layers: 2                  # 2-4 layers; start with 2 for faster training
-    lmax: 1                      # 0=scalars only, 1=vectors, 2=tensors
-    cutoff: 4.0                  # Angstroms
-    use_pbc: true
-    avg_num_neighbours: 50.0
-  
-  # --- TPNO operator configuration ---
-  tpno_config:
-    n_conditions: 4              # μ_CO₂, μ_N₂, μ_H₂O, T
-    n_components: 3              # CO₂, N₂, H₂O
-    hidden_dim: 128              # Width of ICNN hidden layers
-    n_layers: 3                  # Depth of ICNN
-    convex_constraint: softplus  # Options: softplus, exp, clamp
-    film_conditioning: true      # MOF-specific modulation
-    dropout: 0.15
-    use_layer_norm: true
-    activation: swish            # Options: swish, relu, gelu
-  
-  # --- Ensemble configuration ---
-  ensemble:
-    n_models: 2                  # Ensemble size for UQ
-    share_encoder: true          # Share encoder weights (faster inference)
-    n_samples: 30                # Monte Carlo samples for SWAG
-
-training:
-  # --- Basic training parameters ---
-  n_epochs: 500                  # Increase to 1000-2000 for final model
-  batch_size: 4                  # Start with 4, increase if VRAM allows
-  lr: 3.0e-4                     # Learning rate
-  optimizer: adamw               # Options: adam, adamw, sgd
-  weight_decay: 1.0e-4
-  
-  # --- Learning rate schedule ---
-  scheduler: cosine_warm_restarts  # Options: cosine, step, plateau, none
-  scheduler_T0: 30               # Initial restart period (epochs)
-  scheduler_T_mult: 2            # Multiplicative increase in restart period
-  warmup_epochs: 30              # Warm-up period for physics losses
-  
-  # --- Gradient handling ---
-  grad_clip: 1.0
-  gradient_accumulation_steps: 1  # Increase if batch_size small
-  
-  # --- Checkpointing ---
-  checkpoint_dir: experiments/run_001/checkpoints
-  checkpoint_freq: 10
-  early_stopping: true
-  patience: 40
-  
-  # --- Mixed precision ---
-  use_amp: true          # Use AMP for faster training
-  
-  # =========================================================================
-  # PHYSICS-INFORMED LOSS WEIGHTS (RECOMMENDED - START CONSERVATIVE)
-  # =========================================================================
-  # IMPORTANT: These weights control how strongly physics constraints are enforced.
-  # Start with conservative values and ramp up if training is stable.
-  # 
-  # Strategy for physics loss weighting:
-  # 1. First 30 epochs: weights are linearly ramped from 0 to target values
-  #    (see warmup_epochs above)
-  # 2. Monitor validation loss - if it increases sharply, reduce weights
-  # 3. For final model, these values should be:
-  #    - lambda_hessian: 0.05-0.1  (Maxwell relations)
-  #    - lambda_monotonic: 0.05-0.1 (Monotonicity, ICNN already guarantees this)
-  #    - lambda_henry: 0.005-0.01  (Henry's law)
-  #    - lambda_competition: 0.05  (Cross-species competition)
-  #    - lambda_gibbs_duhem: 0.0   (Set >0 only after convergence)
-  # =========================================================================
-  
-  physics_loss:
-    # --- Conservative start (recommended for first run) ---
-    lambda_hessian: 0.01          # was 0.0 - Maxwell relation symmetry
-    lambda_monotonic: 0.05        # was 0.0 - explicit monotonicity (ICNN already guarantees this architecturally, but the loss term helps gradient signal)
-    lambda_henry: 0.005           # was 0.0 - Henry's law low-pressure limit
-    lambda_competition: 0.05      # Cross-species competition (keep as is)
-    lambda_gibbs_duhem: 0.0       # Gibbs-Duhem consistency (enable after convergence)
-    
-    # --- Adaptive loss weighting ---
-    adaptive_weights: true        # Automatically balance loss terms
-    weight_smoothing: 0.9         # Exponential moving average smoothing
-    weight_update_freq: 10        # Update adaptive weights every N steps
-    
-    # --- Validation checks ---
-    validate_physics: true        # Run physics validation during training
-    validation_freq: 50           # Check physics consistency every N epochs
-
-uq:
-  # --- Conformal prediction configuration ---
-  alpha: 0.1                     # 90% confidence intervals
-  conformal_method: mondrian     # Options: split, weighted, mondrian, cv
-  score_method: normalized       # Options: absolute, normalized, studentized
-  n_bins: 5                      # For Mondrian conformal
-  cal_size: 0.2                  # Fraction for calibration set
-  
-  # --- Density ratio estimation (for weighted conformal) ---
-  density_ratio: gbm             # Options: gbm, rf, logistic
-  weight_clip: [0.1, 10.0]       # Clip weights to prevent extreme values
-  
-  # --- Calibration evaluation ---
-  evaluate_calibration: true
-  calibration_freq: 20           # Evaluate calibration every N epochs
-
 active_learning:
-  # --- Multi-fidelity Bayesian Optimization ---
-  enable: true                   # Run active learning loop
-  n_init: 20                     # Initial cold-start MOFs
-  n_iterations: 50               # BO iterations
-  n_candidates: 10               # Candidates per iteration
-  budget: 500                    # Total MOFs to evaluate
-  acquisition: qEHVI             # Options: qEI, qNEI, qEHVI, ucb, uncertainty
-  
-  # --- Fidelity management ---
-  multi_fidelity: true
+  acquisition: qEHVI
+  budget: 500
+  enable: true
   fidelity_levels:
-    gctmmc:
-      cost: 0.1                  # CPU-hours
-      noise: 0.10                # Expected noise
-    gcmc_short:
-      cost: 1.0
-      noise: 0.05
     gcmc_long:
       cost: 5.0
       noise: 0.02
-  
-  # --- Fidelity selection ---
-  fidelity_selector: cost_ratio  # Options: cost_ratio, budget_aware, information_gain
-  rho_threshold: 0.85            # Minimum correlation to trust cheap fidelity
-
-simulation:
-  # --- RASPA configuration ---
-  raspa_path: /path/to/raspa/bin/simulate
-  raspa_data_dir: /path/to/raspa/share/raspa
-  forcefield: GenericMOFs        # Or ExampleMOFsForceField
-  
-  # --- GCMC parameters ---
-  gcmc:
-    n_cycles: 5000               # Production cycles
-    n_init: 2500                 # Initialization cycles
-    cutoff: 12.0                 # Angstroms
-    use_charges: false           # Framework charges (false for initial screening)
-    timeout: 7200                # Seconds
-    keep_workspaces: false       # Clean up after simulation
-  
-  # --- GC-TMMC parameters ---
-  gctmmc:
-    n_cycles: 50000              # More cycles for TMMC
-    n_init: 10000
-    N_max: 200                   # Maximum molecules in pore
-    bias_update: 10000
-  
-  # --- Thermodynamic conditions ---
-  conditions:
-    temperatures: [298.15, 313.15, 333.15]  # K
-    pressures: [0.1, 0.5, 1.0, 5.0, 10.0]   # bar
-    relative_humidity: [0.0, 0.05, 0.15]     # fraction
-    dry_co2_fraction: 0.15                   # CO₂ in dry flue gas
-
-results:
-  # --- Output directories ---
-  run_dir: experiments/run_001
-  figures_dir: results/figures
-  logs_dir: experiments/run_001/logs
-  metrics_dir: experiments/run_001/metrics
-  
-  # --- Logging ---
-  log_level: INFO                # DEBUG, INFO, WARNING, ERROR
-  log_to_file: true
-  log_to_wandb: false            # Set to true for Weights & Biases
-  wandb_project: uc-tpno
-  wandb_entity: your_username
-  
-  # --- Metrics to compute ---
-  metrics:
-    regression: [mae, rmse, r2, mape]
-    uncertainty: [ece, coverage_90, sharpness, nll, crps]
-    pareto: [hypervolume, pareto_fraction, spacing]
-  
-  # --- Figures to generate ---
-  figures:
-    parity: true
-    isotherms: true
-    calibration: true
-    residuals: true
-    pareto: true
-    training_curves: true
-    benchmark_comparison: true
-
-experiment:
-  # --- Experiment tracking ---
-  name: uc_tpno_run_001
-  description: "TPNO training with conservative physics losses (0.01/0.05/0.005)"
-  tags:
-    - baseline
-    - physics-informed
-    - humid_flue_gas
-    - co2_capture
-  
-  # --- Reproducibility ---
+    gcmc_short:
+      cost: 1.0
+      noise: 0.05
+    gctmmc:
+      cost: 0.1
+      noise: 0.1
+  fidelity_selector: cost_ratio
+  multi_fidelity: true
+  n_candidates: 10
+  n_init: 20
+  n_iterations: 50
+  rho_threshold: 0.85
+data:
+  adsorption_dir: data/processed/adsorption
+  adsorption_parquet: data/processed/adsorption/adsorption_training.parquet
+  arc_mof_dir: data/raw/arc_mof_charges
+  core_mof_dir: data/raw/core_mof_2019
+  dataset:
+    lazy_loading: true
+    max_arc_mofs: 500
+    max_core_mofs: 500
+    shuffle_selection: true
+  graph_dir: data/processed/graphs
+  intermediate_dir: data/intermediate
+  mofx_db_dir: data/raw/mofx_db
+  processed_dir: data/processed
+  raw_dir: data/raw
+  registry_parquet: data/mof_registry.parquet
+  sanitized_cif_dir: data/intermediate/cifs_sanitized
   seed: 42
-  deterministic: true
-  cudnn_deterministic: true
+  split_method: random
+  splits_file: experiments/run_001/splits.json
+  test_size: 0.1
+  val_size: 0.1
+experiment:
   cudnn_benchmark: false
-  
-  # --- Hardware ---
-  device: cuda                   # Options: cuda, cpu, mps
-  num_workers: 4                 # DataLoader workers
+  cudnn_deterministic: true
+  description: TPNO training with conservative physics losses (0.01/0.05/0.005)
+  deterministic: true
+  device: cuda
+  name: uc_tpno_run_001
+  num_workers: 4
   pin_memory: true
-
-# =============================================================================
-# VALIDATION CHECKS
-# =============================================================================
-# These are run automatically during training to ensure thermodynamic
-# consistency and physical plausibility.
-
+  seed: 42
+  tags:
+  - baseline
+  - physics-informed
+  - humid_flue_gas
+  - co2_capture
+model:
+  cutoff: 4.0
+  emb_dim: 64
+  encoder: nequip
+  encoder_config:
+    avg_num_neighbours: 50.0
+    cutoff: 4.0
+    emb_dim: 32
+    lmax: 1
+    n_layers: 2
+    n_species: 100
+    use_pbc: true
+  ensemble:
+    n_models: 2
+    n_samples: 30
+    share_encoder: true
+  n_ensemble: 3
+  n_layers: 2
+  n_rbf: 8
+  tpno_config:
+    activation: swish
+    convex_constraint: softplus
+    dropout: 0.15
+    film_conditioning: true
+    hidden_dim: 128
+    n_components: 3
+    n_conditions: 4
+    n_layers: 3
+    use_layer_norm: true
+results:
+  figures:
+    benchmark_comparison: true
+    calibration: true
+    isotherms: true
+    pareto: true
+    parity: true
+    residuals: true
+    training_curves: true
+  figures_dir: results/figures
+  log_level: INFO
+  log_to_file: true
+  log_to_wandb: false
+  logs_dir: experiments/run_001/logs
+  metrics:
+    pareto:
+    - hypervolume
+    - pareto_fraction
+    - spacing
+    regression:
+    - mae
+    - rmse
+    - r2
+    - mape
+    uncertainty:
+    - ece
+    - coverage_90
+    - sharpness
+    - nll
+    - crps
+  metrics_dir: experiments/run_001/metrics
+  run_dir: experiments/run_001
+  wandb_entity: your_username
+  wandb_project: uc-tpno
+simulation:
+  conditions:
+    dry_co2_fraction: 0.15
+    pressures:
+    - 0.1
+    - 0.5
+    - 1.0
+    - 5.0
+    - 10.0
+    relative_humidity:
+    - 0.0
+    - 0.05
+    - 0.15
+    temperatures:
+    - 298.15
+    - 313.15
+    - 333.15
+  forcefield: GenericMOFs
+  gcmc:
+    cutoff: 12.0
+    keep_workspaces: false
+    n_cycles: 5000
+    n_init: 2500
+    timeout: 7200
+    use_charges: false
+  gctmmc:
+    N_max: 200
+    bias_update: 10000
+    n_cycles: 50000
+    n_init: 10000
+  raspa_data_dir: /path/to/raspa/share/raspa
+  raspa_path: /path/to/raspa/bin/simulate
+training:
+  batch_size: 1
+  checkpoint_dir: experiments/run_001/checkpoints
+  checkpoint_freq: 10
+  early_stopping: true
+  grad_clip: 1.0
+  gradient_accumulation_steps: 1
+  lr: 0.0003
+  n_epochs: 600
+  optimizer: adamw
+  patience: 200
+  physics_loss:
+    adaptive_weights: true
+    lambda_competition: 0.1
+    lambda_gibbs_duhem: 0.0
+    lambda_henry: 0.02
+    lambda_hessian: 0.0
+    lambda_monotonic: 0.1
+    validate_physics: true
+    validation_freq: 50
+    weight_smoothing: 0.9
+    weight_update_freq: 10
+  scheduler: cosine_warm_restarts
+  scheduler_T0: 30
+  scheduler_T_mult: 2
+  use_amp: true
+  warmup_epochs: 30
+  weight_decay: 0.0001
+uq:
+  alpha: 0.1
+  cal_size: 0.2
+  calibration_freq: 20
+  conformal_method: mondrian
+  density_ratio: gbm
+  evaluate_calibration: true
+  n_bins: 5
+  score_method: normalized
+  weight_clip:
+  - 0.1
+  - 10.0
 validation:
-  # --- Thermodynamic checks ---
-  thermodynamic:
-    check_convexity: true
-    check_monotonicity: true
-    check_henry_region: true
-    check_gibbs_duhem: false    # Expensive, enable only for analysis
-    check_selectivity_trends: true
-    check_tolerance: 1e-4
-  
-  # --- Data quality checks ---
   data_quality:
+    check_distribution_shift: true
     check_missing: true
     check_outliers: true
     check_variance: true
-    check_distribution_shift: true
-  
-  # --- Residual analysis ---
   residual_analysis:
-    check_normality: true
-    check_heteroscedasticity: true
     check_autocorrelation: true
+    check_heteroscedasticity: true
+    check_normality: true
     check_out_of_distribution: true
+  thermodynamic:
+    check_convexity: true
+    check_gibbs_duhem: false
+    check_henry_region: true
+    check_monotonicity: true
+    check_selectivity_trends: true
+    check_tolerance: 1e-4
