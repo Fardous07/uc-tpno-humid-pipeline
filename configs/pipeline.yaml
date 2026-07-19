@@ -71,7 +71,7 @@ model:
     n_models: 2
     n_samples: 30
     share_encoder: true
-  n_ensemble: 3
+  n_ensemble: 2
   n_layers: 2
   n_rbf: 8
   tpno_config:
