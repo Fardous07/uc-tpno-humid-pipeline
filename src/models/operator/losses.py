@@ -21,6 +21,7 @@ class LossConfig:
     lambda_henry:       float = 0.005
     lambda_competition: float = 0.05
     lambda_gibbs_duhem: float = 0.0
+    lambda_aux:         float = 0.3
     henry_mu_threshold: float = -5.0   # μ < threshold → Henry region
     use_nll:            bool  = True
 
@@ -277,6 +278,15 @@ class ThermodynamicLoss(nn.Module):
 
         physics: Dict[str, torch.Tensor] = {}
         total = c.lambda_data * d_loss
+
+        # Auxiliary direct-head loss (trains the encoder with a
+        # first-order signal; the ICNN remains the physics predictor)
+        q_aux = predictions.get("q_aux")
+        if q_aux is not None and getattr(c, "lambda_aux", 0.0) > 0:
+            q_aux_n = (q_aux - q_mean) / (q_std + 1e-8)
+            aux_loss = data_loss_mse(q_aux_n, targets_n, mask=mask)
+            physics["aux"] = aux_loss
+            total = total + c.lambda_aux * aux_loss
 
         # --- Hessian symmetry (Maxwell relations) ---
         if c.lambda_hessian > 0:

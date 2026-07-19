@@ -182,6 +182,11 @@ class ICNN(nn.Module):
             W_pos  = self._pos(self.U_raw[i])              # [H, H] non-neg
             z_pass = F.linear(z, W_pos, self.U_bias[i])   # z passthrough
             z_skip = self.W_layers[i](x)                   # skip from x
+            if film_params is not None:
+                # Modulate the affine-in-x skip term: stays affine in x,
+                # so ICNN convexity is preserved while every layer is
+                # conditioned on the MOF embedding.
+                z_skip = z_skip * gamma + beta
             z = z_pass + z_skip
             if self.use_layer_norm:
                 z = self.norms[i](z)
@@ -300,6 +305,18 @@ class ThermodynamicPotentialNO(nn.Module):
         nn.init.zeros_(self.log_var_net[-1].weight)
         nn.init.constant_(self.log_var_net[-1].bias, -5.0)
 
+        # Auxiliary direct head: [h, mu_norm] -> q_norm.
+        # Provides a FIRST-ORDER gradient path to the encoder (the ICNN
+        # path only reaches the encoder via a mixed second derivative,
+        # which caused encoder collapse in run_003).
+        self.aux_head = nn.Sequential(
+            nn.Linear(config.emb_dim + config.n_conditions, config.hidden_dim),
+            nn.SiLU(),
+            nn.Linear(config.hidden_dim, config.hidden_dim),
+            nn.SiLU(),
+            nn.Linear(config.hidden_dim, config.n_components),
+        )
+
         # Normalization buffers (set by set_normalization before training)
         self.register_buffer("mu_mean", torch.zeros(config.n_conditions))
         self.register_buffer("mu_std",  torch.ones(config.n_conditions))
@@ -411,6 +428,12 @@ class ThermodynamicPotentialNO(nn.Module):
         q_pred = self.denormalize_q(q_norm.reshape(B, P, n_comp))
 
         output: Dict[str, torch.Tensor] = {"q_pred": q_pred}
+
+        # Auxiliary direct prediction (first-order encoder gradient path)
+        q_aux_norm = self.aux_head(
+            torch.cat([h_flat.float(), cond_norm.float()], dim=-1)
+        )
+        output["q_aux"] = self.denormalize_q(q_aux_norm.reshape(B, P, n_comp))
 
         if return_potential:
             output["omega"] = omega_flat.reshape(B, P, 1)
@@ -637,6 +660,7 @@ class TPNOEnsemble(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         preds:  List[torch.Tensor] = []
         sigmas: List[torch.Tensor] = []
+        auxs:   List[torch.Tensor] = []
 
         if self.share_encoder and self._shared_encoder_ref is not None:
             # Run encoder once, pass embedding to each member's ICNN
@@ -649,6 +673,8 @@ class TPNOEnsemble(nn.Module):
                 )
                 preds.append(out["q_pred"])
                 sigmas.append(out.get("sigma", torch.zeros_like(out["q_pred"])))
+                if "q_aux" in out:
+                    auxs.append(out["q_aux"])
         else:
             for model in self.models:
                 out = model.forward(
@@ -658,6 +684,8 @@ class TPNOEnsemble(nn.Module):
                 )
                 preds.append(out["q_pred"])
                 sigmas.append(out.get("sigma", torch.zeros_like(out["q_pred"])))
+                if "q_aux" in out:
+                    auxs.append(out["q_aux"])
 
         pred_stack  = torch.stack(preds,  dim=0)   # [M, B, P, C]
         sigma_stack = torch.stack(sigmas, dim=0)   # [M, B, P, C]
@@ -668,6 +696,8 @@ class TPNOEnsemble(nn.Module):
         total     = (epistemic.pow(2) + aleatoric.pow(2)).sqrt()
 
         result: Dict[str, torch.Tensor] = {
+            "q_aux":             (torch.stack(auxs, dim=0).mean(dim=0)
+                                  if auxs else mean_pred),
             "q_pred":            mean_pred,
             "epistemic":         epistemic,
             "aleatoric":         aleatoric,
