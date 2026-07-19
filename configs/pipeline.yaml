@@ -57,7 +57,7 @@ experiment:
   - co2_capture
 model:
   cutoff: 4.0
-  emb_dim: 64
+  emb_dim: 48
   encoder: nequip
   encoder_config:
     avg_num_neighbours: 50.0
