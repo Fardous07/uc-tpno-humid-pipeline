@@ -183,11 +183,12 @@ class EncoderAdapter(nn.Module):
         self._enc_dim = enc_dim
         self._target_dim = target_dim or enc_dim
 
-        # Projection
-        if self._target_dim != enc_dim:
-            self.proj = nn.Linear(enc_dim, self._target_dim)
-        else:
-            self.proj = nn.Identity()
+        # Global structural descriptors are concatenated to the GNN
+        # embedding BEFORE projection.  They carry MOF identity at full
+        # scale and bypass the pooling/normalisation washout that
+        # collapsed the pure-GNN embeddings (diagnosed in run_004).
+        self._n_desc = 12
+        self.proj = nn.Linear(enc_dim + self._n_desc, self._target_dim)
 
         # LayerNorm
         self.norm = nn.LayerNorm(self._target_dim) if normalize else nn.Identity()
@@ -207,10 +208,47 @@ class EncoderAdapter(nn.Module):
         -------
         ``[B, target_dim]`` normalised MOF embeddings.
         """
-        h = self.encoder(data)     # [B, enc_dim]
-        h = self.proj(h)           # [B, target_dim]
-        h = self.norm(h)           # [B, target_dim]
+        h = self.encoder(data)                      # [B, enc_dim]
+        d = self._descriptors(data, h)              # [B, n_desc]
+        h = self.proj(torch.cat([h, d], dim=-1))    # [B, target_dim]
+        h = self.norm(h)
         return h
+
+    def _descriptors(self, data: Any, h: torch.Tensor) -> torch.Tensor:
+        """Per-graph global descriptors (roughly standardised)."""
+        z = data.z
+        batch = getattr(data, "batch", None)
+        if batch is None:
+            batch = torch.zeros(z.shape[0], dtype=torch.long, device=z.device)
+        B = int(batch.max().item()) + 1
+        desc = torch.zeros(B, self._n_desc, device=h.device, dtype=torch.float32)
+        edge_batch = batch[data.edge_index[0]]
+        cell = getattr(data, "cell", None)
+        cells = cell.reshape(-1, 3, 3) if cell is not None else None
+        NONMETALS = (1, 6, 7, 8, 9, 15, 16, 17, 35, 53)
+        for b in range(B):
+            zb = z[batch == b].float()
+            n = float(zb.numel())
+            ne = float((edge_batch == b).sum())
+            metals = torch.ones_like(zb, dtype=torch.bool)
+            for nm in NONMETALS:
+                metals &= zb != nm
+            desc[b, 0] = torch.log(torch.tensor(n)) - 4.5
+            desc[b, 1] = ne / n / 30.0
+            desc[b, 2] = float((zb == 1).sum()) / n
+            desc[b, 3] = float((zb == 6).sum()) / n
+            desc[b, 4] = float((zb == 7).sum()) / n
+            desc[b, 5] = float((zb == 8).sum()) / n
+            desc[b, 6] = float((zb == 9).sum()) / n
+            desc[b, 7] = float(metals.sum()) / n
+            desc[b, 8] = zb.mean() / 10.0
+            desc[b, 9] = (zb.std() / 10.0) if n > 1 else 0.0
+            zm = zb[metals]
+            desc[b, 10] = (zm.mean() / 30.0) if zm.numel() else 0.0
+            if cells is not None:
+                c = cells[min(b, cells.shape[0] - 1)].float()
+                desc[b, 11] = (torch.log(torch.abs(torch.det(c)) + 1.0) - 9.0) / 2.0
+        return desc.to(h.dtype)
 
     # ── Transfer-learning helpers ────────────────────────────────
 
