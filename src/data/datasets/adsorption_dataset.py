@@ -31,6 +31,13 @@ class AdsorptionDataset(Dataset):
     3. Removed lazy_loading flag — both old branches did identical work at
        init time (pre-computed all row indices), so the flag saved no memory.
        One clean path is simpler and correct.
+
+    run_007
+    -------
+    __getitem__ still returns RAW loadings in mol/kg (unchanged), so eval /
+    process code is unaffected. Only compute_normalization_stats gains a
+    ``target_transform`` argument so the model's q_mean/q_std can be computed
+    on log1p(loading) — matching TPNOConfig.target_transform="log1p".
     """
 
     def __init__(
@@ -138,7 +145,7 @@ class AdsorptionDataset(Dataset):
             "mof_id":     mof_id,
             "graphs":     graph,
             "conditions": conditions,   # [P, D]
-            "loadings":   loadings,     # [P, C]
+            "loadings":   loadings,     # [P, C]  (RAW mol/kg)
             "n_points":   len(conditions),
         }
 
@@ -205,7 +212,9 @@ class AdsorptionDataset(Dataset):
     # ------------------------------------------------------------------
 
     def compute_normalization_stats(
-        self, indices: Optional[List[int]] = None
+        self,
+        indices: Optional[List[int]] = None,
+        target_transform: str = "log1p",
     ) -> Dict[str, torch.Tensor]:
         """
         Compute per-column mean and std for conditions and loadings.
@@ -213,6 +222,14 @@ class AdsorptionDataset(Dataset):
         Pass the result directly to model.set_normalization():
             stats = dataset.compute_normalization_stats(train_indices)
             model.set_normalization(**stats)
+
+        run_007
+        -------
+        ``target_transform`` MUST match TPNOConfig.target_transform:
+          - "log1p"    : q stats are computed on log1p(loading) so they line
+                         up with the model's normalize_q / denormalize_q.
+          - "identity" : q stats on raw loadings (run_005/run_006 behaviour).
+        The default is "log1p" to match the TPNOConfig default.
         """
         all_cond: List[torch.Tensor] = []
         all_load: List[torch.Tensor] = []
@@ -221,10 +238,17 @@ class AdsorptionDataset(Dataset):
         for i in idx_iter:
             item = self[i]
             all_cond.append(item["conditions"])   # [P, D]
-            all_load.append(item["loadings"])     # [P, C]
+            all_load.append(item["loadings"])     # [P, C]  (RAW mol/kg)
 
         cond_cat = torch.cat(all_cond, dim=0)   # [N_total, D]
         load_cat = torch.cat(all_load, dim=0)   # [N_total, C]
+
+        # run_007: transform loadings BEFORE computing q stats so that
+        # (q_mean, q_std) live in the same space the model trains in.
+        if target_transform == "log1p":
+            load_cat = torch.log1p(load_cat.clamp(min=0.0))
+        elif target_transform not in ("identity", None):
+            raise ValueError(f"Unknown target_transform: {target_transform!r}")
 
         return {
             "mu_mean": cond_cat.mean(0),

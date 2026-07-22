@@ -11,6 +11,7 @@ Main goals
 3. Support charges from either:
       - _atom_site_charge
       - separate _atom_type_symbol / _atom_type_partial_charge loop
+      - _atom_type_partial_charge as a column INSIDE the atom_site loop  (run_008; ARC layout)
 4. Fall back to ASE when direct parsing is not enough
 5. Write a minimal P1 CIF for downstream use
 6. Match RASPA's CIF examples more closely:
@@ -191,11 +192,23 @@ def _guess_cell_setting(cell: Dict[str, float]) -> str:
 # 2. ATOM EXTRACTION
 # ═══════════════════════════════════════════════════════════════════════
 
+# run_008: charge columns that may appear INSIDE the atom_site loop.
+# ARC MOF CIFs store per-site charges under _atom_type_partial_charge, which
+# the previous code did not recognise (it only looked for _atom_site_charge),
+# so every charge was silently written as 0.0.
+_ATOM_SITE_CHARGE_COLUMNS = (
+    "_atom_site_charge",
+    "_atom_type_partial_charge",
+    "_atom_site_partial_charge",
+    "_atom_site_charge_partial",
+)
+
+
 def _build_type_charge_map(
     loops: List[Tuple[List[str], List[List[str]]]]
 ) -> Dict[str, float]:
     """
-    Parse:
+    Parse a SEPARATE atom-type charge loop:
       loop_
       _atom_type_symbol
       _atom_type_partial_charge
@@ -206,7 +219,13 @@ def _build_type_charge_map(
 
     for headers, rows in loops:
         hs = set(headers)
-        if "_atom_type_symbol" in hs and "_atom_type_partial_charge" in hs:
+        # Only treat this as a type-charge loop when there is NO coordinate
+        # column (otherwise it is the atom_site loop, handled separately).
+        if (
+            "_atom_type_symbol" in hs
+            and "_atom_type_partial_charge" in hs
+            and "_atom_site_fract_x" not in hs
+        ):
             idx = {h: i for i, h in enumerate(headers)}
             s_idx = idx["_atom_type_symbol"]
             q_idx = idx["_atom_type_partial_charge"]
@@ -248,7 +267,14 @@ def _extract_atom_rows_from_text(text: str) -> List[Dict[str, Any]]:
         idx = {h: i for i, h in enumerate(headers)}
 
         has_symbol = "_atom_site_type_symbol" in idx
-        has_charge = "_atom_site_charge" in idx
+        # run_008: accept per-site charges stored INSIDE the atom_site loop
+        # under a non-standard column name (ARC uses _atom_type_partial_charge).
+        charge_col = None
+        for _cand in _ATOM_SITE_CHARGE_COLUMNS:
+            if _cand in idx:
+                charge_col = _cand
+                break
+        has_charge = charge_col is not None
 
         needed_idx = [
             idx["_atom_site_label"],
@@ -259,7 +285,7 @@ def _extract_atom_rows_from_text(text: str) -> List[Dict[str, Any]]:
         if has_symbol:
             needed_idx.append(idx["_atom_site_type_symbol"])
         if has_charge:
-            needed_idx.append(idx["_atom_site_charge"])
+            needed_idx.append(idx[charge_col])
 
         parsed_rows: List[Dict[str, Any]] = []
 
@@ -282,7 +308,7 @@ def _extract_atom_rows_from_text(text: str) -> List[Dict[str, Any]]:
 
             charge = 0.0
             if has_charge:
-                q = _safe_float(row[idx["_atom_site_charge"]])
+                q = _safe_float(row[idx[charge_col]])
                 if q is not None:
                     charge = q
             else:
@@ -336,10 +362,16 @@ def _extract_atom_rows_with_ase(
     scaled = atoms.get_scaled_positions(wrap=True)
     syms = atoms.get_chemical_symbols()
 
+    # run_008: preserve ASE-read charges if present (0.0 otherwise).
+    try:
+        ase_charges = atoms.get_initial_charges()
+    except Exception:
+        ase_charges = [0.0] * len(syms)
+
     rows: List[Dict[str, Any]] = []
     counters: Dict[str, int] = {}
 
-    for sym, pos in zip(syms, scaled):
+    for k, (sym, pos) in enumerate(zip(syms, scaled)):
         counters[sym] = counters.get(sym, 0) + 1
         rows.append(
             {
@@ -348,7 +380,7 @@ def _extract_atom_rows_with_ase(
                 "fx": float(pos[0]),
                 "fy": float(pos[1]),
                 "fz": float(pos[2]),
-                "charge": 0.0,
+                "charge": float(ase_charges[k]) if k < len(ase_charges) else 0.0,
             }
         )
 

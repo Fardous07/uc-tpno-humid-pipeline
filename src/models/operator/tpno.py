@@ -28,6 +28,14 @@ class TPNOConfig:
     use_layer_norm: bool = True
     activation: str = "swish"
     min_potential: float = 1e-6
+    # --- run_007: target transform ---------------------------------------
+    # "log1p"    : train on log1p(loading); predictions are expm1'd back to
+    #              real mol/kg. Compresses the heavy CO2 loading tail and
+    #              rebalances the per-gas scale (helps CO2 + H2O). The
+    #              normalization stats (q_mean/q_std) MUST be computed on
+    #              log1p(loadings) — see AdsorptionDataset.compute_normalization_stats.
+    # "identity" : original linear standardization (run_005/run_006 behaviour).
+    target_transform: str = "log1p"
 
 
 # ---------------------------------------------------------------------------
@@ -267,6 +275,15 @@ class ThermodynamicPotentialNO(nn.Module):
        ICNN forward pass needed), cutting hessian computation cost in half.
     3. Hessian cache removed — it was unreliable (id() reuse, non-unique
        sum keys) and wrong to cache across training batches.
+
+    run_007
+    -------
+    The normalization now composes an optional target transform
+    (config.target_transform) with standardization:
+        normalize_q(q)   :  real → (T(q) - q_mean) / q_std      (for the loss)
+        denormalize_q(z) :  z → T^{-1}(z * q_std + q_mean)      (→ real mol/kg)
+    with T = log1p (inverse expm1) by default. q_pred therefore always comes
+    back in physical mol/kg, so eval / PVSA / KPI code is unaffected.
     """
 
     def __init__(self, encoder: nn.Module, config: TPNOConfig):
@@ -317,7 +334,9 @@ class ThermodynamicPotentialNO(nn.Module):
             nn.Linear(config.hidden_dim, config.n_components),
         )
 
-        # Normalization buffers (set by set_normalization before training)
+        # Normalization buffers (set by set_normalization before training).
+        # run_007: q_mean / q_std are stats of the TRANSFORMED target
+        # (e.g. log1p(loading)) when config.target_transform == "log1p".
         self.register_buffer("mu_mean", torch.zeros(config.n_conditions))
         self.register_buffer("mu_std",  torch.ones(config.n_conditions))
         self.register_buffer("q_mean",  torch.zeros(config.n_components))
@@ -343,8 +362,36 @@ class ThermodynamicPotentialNO(nn.Module):
     def normalize_mu(self, mu: torch.Tensor) -> torch.Tensor:
         return (mu - self.mu_mean) / (self.mu_std + 1e-8)
 
-    def denormalize_q(self, q: torch.Tensor) -> torch.Tensor:
-        return q * self.q_std + self.q_mean
+    # --- run_007: composable target transform T and its inverse ----------
+
+    def _fwd_transform(self, q: torch.Tensor) -> torch.Tensor:
+        """Real loading → transform space T(q)."""
+        if getattr(self.config, "target_transform", "identity") == "log1p":
+            # clamp keeps log1p in-domain (x > -1) for any stray negatives
+            return torch.log1p(q.clamp(min=-1.0 + 1e-6))
+        return q
+
+    def _inv_transform(self, y: torch.Tensor) -> torch.Tensor:
+        """Transform space → real loading T^{-1}(y)."""
+        if getattr(self.config, "target_transform", "identity") == "log1p":
+            # clamp the exponent to avoid expm1 overflow on pathological
+            # early-training outputs (expm1(10) ≈ 2.2e4, still finite)
+            return torch.expm1(y.clamp(max=10.0))
+        return y
+
+    def normalize_q(self, q: torch.Tensor) -> torch.Tensor:
+        """
+        Real loading (mol/kg) → normalized transform space.
+        Used by the loss so it compares in the (tail-compressed) log space.
+        """
+        return (self._fwd_transform(q) - self.q_mean) / (self.q_std + 1e-8)
+
+    def denormalize_q(self, q_norm: torch.Tensor) -> torch.Tensor:
+        """
+        Normalized transform space → real loading (mol/kg).
+        Applied to every prediction, so q_pred is always physical.
+        """
+        return self._inv_transform(q_norm * self.q_std + self.q_mean)
 
     # ------------------------------------------------------------------
     # Utilities
@@ -424,7 +471,7 @@ class ThermodynamicPotentialNO(nn.Module):
                 # [B*P, n_comp, n_comp]
                 hess_flat = torch.stack(rows, dim=1)
 
-        # --- reshape and denormalise ---
+        # --- reshape and denormalise (→ real mol/kg via inverse transform) ---
         q_pred = self.denormalize_q(q_norm.reshape(B, P, n_comp))
 
         output: Dict[str, torch.Tensor] = {"q_pred": q_pred}
@@ -647,6 +694,13 @@ class TPNOEnsemble(nn.Module):
     ) -> None:
         for model in self.models:
             model.set_normalization(mu_mean, mu_std, q_mean, q_std)
+
+    def normalize_q(self, q: torch.Tensor) -> torch.Tensor:
+        """Delegate to member 0 (all members share the same normalization)."""
+        return self.models[0].normalize_q(q)
+
+    def denormalize_q(self, q_norm: torch.Tensor) -> torch.Tensor:
+        return self.models[0].denormalize_q(q_norm)
 
     def forward(
         self,
