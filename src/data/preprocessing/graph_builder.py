@@ -11,11 +11,13 @@ objects containing the fields that our E(3)-equivariant encoders
     pbc        : ``[3]``    bool  — periodic boundary conditions
     edge_index : ``[2, E]`` long  — neighbour list
     edge_attr  : ``[E, D]`` float — edge features (length, unit vector)
+    q          : ``[N]``    float — per-atom partial charge (run_008)
 
 Supports:
 *  Radius-based neighbour list (with PBC).
 *  k-nearest-neighbours (kNN) graph.
 *  Pre-computed edge features (distance + unit displacement vector).
+*  Per-atom partial charge as a node feature (run_008).
 *  Batch processing of entire directories.
 *  Loading back from saved ``.pt`` files.
 
@@ -69,6 +71,66 @@ class GraphConfig:
 # 2.  CORE CONVERSION
 # ═══════════════════════════════════════════════════════════════════════
 
+# run_008: charge column names we accept when reading a sanitised CIF.
+_CHARGE_COLUMN_NAMES = (
+    "_atom_site_charge",
+    "_atom_type_partial_charge",
+    "_atom_site_partial_charge",
+    "_atom_site_charge_partial",
+)
+
+
+def _read_site_charges_from_cif(
+    cif_path: Union[str, Path], n_atoms: int
+) -> Optional[np.ndarray]:
+    """
+    Fallback per-atom charge reader.
+
+    Parses the charge column of the atom_site loop directly from the CIF
+    text, in FILE ORDER (which matches ASE's atom order for P1 cells).
+    Returns a ``[n_atoms]`` float array, or ``None`` if no charge column
+    is found or the atom count does not match (so the caller can fall
+    back to zeros safely).
+    """
+    try:
+        lines = Path(cif_path).read_text(encoding="utf-8", errors="ignore").splitlines()
+    except Exception:
+        return None
+
+    i = 0
+    while i < len(lines):
+        if lines[i].strip() == "loop_":
+            headers: List[str] = []
+            j = i + 1
+            while j < len(lines) and lines[j].strip().startswith("_"):
+                headers.append(lines[j].strip())
+                j += 1
+
+            has_coords = "_atom_site_fract_x" in headers
+            charge_hdr = next((h for h in headers if h in _CHARGE_COLUMN_NAMES), None)
+
+            if has_coords and charge_hdr is not None:
+                q_idx = headers.index(charge_hdr)
+                vals: List[float] = []
+                while j < len(lines):
+                    s = lines[j].strip()
+                    if not s or s.startswith("_") or s == "loop_" or s.startswith("#"):
+                        break
+                    row = lines[j].split()
+                    if len(row) > q_idx:
+                        try:
+                            vals.append(float(row[q_idx]))
+                        except ValueError:
+                            vals.append(0.0)
+                    j += 1
+                arr = np.asarray(vals, dtype=np.float32)
+                return arr if len(arr) == n_atoms else None
+            i = j
+        else:
+            i += 1
+    return None
+
+
 def cif_to_graph(
     cif_path: Union[str, Path],
     config: Optional[GraphConfig] = None,
@@ -83,7 +145,7 @@ def cif_to_graph(
 
     Returns
     -------
-    ``Data(z, pos, cell, pbc, edge_index, edge_attr, num_nodes)``
+    ``Data(z, pos, cell, pbc, edge_index, edge_attr, q, num_nodes)``
     """
     from ase.io import read as ase_read
     from ase.neighborlist import neighbor_list
@@ -106,6 +168,21 @@ def cif_to_graph(
 
     # Periodic boundary conditions
     pbc = torch.tensor(atoms.get_pbc(), dtype=torch.bool)
+
+    # run_008: per-atom partial charge.
+    # Primary: ASE (aligned to atom order). Fallback: parse the CIF text
+    # directly if ASE reports all-zero (some ASE versions ignore the
+    # _atom_site_charge tag). 0.0 where charges are genuinely absent.
+    n_atoms = len(z)
+    try:
+        charges = np.asarray(atoms.get_initial_charges(), dtype=np.float32)
+    except Exception:
+        charges = np.zeros(n_atoms, dtype=np.float32)
+    if charges.shape[0] != n_atoms or not np.any(charges):
+        fallback = _read_site_charges_from_cif(cif_path, n_atoms)
+        if fallback is not None:
+            charges = fallback
+    q = torch.tensor(charges, dtype=torch.float32)
 
     # Build neighbour list with PBC
     i_idx, j_idx, dist, D_vec = neighbor_list("ijdD", atoms, cutoff=config.cutoff)
@@ -139,6 +216,7 @@ def cif_to_graph(
         cell=cell.unsqueeze(0),    # [1, 3, 3] for batching
         pbc=pbc,
         edge_index=edge_index,
+        q=q,                       # [N] per-atom partial charge (run_008)
         num_nodes=len(z),
     )
 

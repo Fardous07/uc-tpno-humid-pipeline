@@ -24,6 +24,14 @@ class LossConfig:
     lambda_aux:         float = 0.3
     henry_mu_threshold: float = -5.0   # μ < threshold → Henry region
     use_nll:            bool  = True
+    # --- run_006: robust data loss ---------------------------------------
+    # Huber ("smooth L1") on the data term: quadratic for |resid| < delta,
+    # linear beyond it. Since the data loss is computed in NORMALIZED units
+    # (std ≈ 1), delta = 1.0 caps the influence of >1σ outliers — this is
+    # the fix for the heavy CO2 error tail (kurtosis ~140, max_abs_err ~1.9).
+    # Ignored when use_nll is True and a sigma head is available.
+    use_huber:          bool  = True
+    huber_delta:        float = 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -42,6 +50,28 @@ def data_loss_mse(
         m = mask.unsqueeze(-1).expand_as(q_pred)   # [B, P, C]
         return F.mse_loss(q_pred[m], q_true[m])
     return F.mse_loss(q_pred, q_true)
+
+
+def data_loss_huber(
+    q_pred: torch.Tensor,
+    q_true: torch.Tensor,
+    mask:   Optional[torch.Tensor] = None,
+    delta:  float = 1.0,
+) -> torch.Tensor:
+    """
+    Huber (smooth-L1) loss with optional boolean mask [B, P].
+
+    Behaves like MSE for |q_pred - q_true| < delta and like MAE beyond it,
+    so a small number of large-error points (strong CO2 binders) can no
+    longer dominate the gradient the way squared error does.
+
+    Expects inputs in NORMALIZED units so that delta ≈ 1 corresponds to
+    roughly one standard deviation of the target.
+    """
+    if mask is not None:
+        m = mask.unsqueeze(-1).expand_as(q_pred)   # [B, P, C]
+        return F.huber_loss(q_pred[m], q_true[m], delta=delta)
+    return F.huber_loss(q_pred, q_true, delta=delta)
 
 
 def data_loss_nll(
@@ -220,6 +250,10 @@ class ThermodynamicLoss(nn.Module):
     FIX: forward() now accepts a mask [B, P] to exclude padded pressure
     points from all loss computations.  Without this, the collate function's
     zero-padding at μ=0,T=0 was silently included in every loss term.
+
+    run_006: the data term (and the auxiliary-head term) use Huber loss by
+    default (config.use_huber) so a few high-error CO2 points can no longer
+    dominate training. Set config.use_huber = False to fall back to MSE.
     """
 
     def __init__(
@@ -240,6 +274,21 @@ class ThermodynamicLoss(nn.Module):
         if lambda_henry       is not None: self.config.lambda_henry       = lambda_henry
         if lambda_competition is not None: self.config.lambda_competition = lambda_competition
         if lambda_gibbs_duhem is not None: self.config.lambda_gibbs_duhem = lambda_gibbs_duhem
+
+    def _data_term(
+        self,
+        q_pred_n:  torch.Tensor,
+        targets_n: torch.Tensor,
+        mask:      Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Robust (Huber) or plain (MSE) data term, in normalized units."""
+        c = self.config
+        if getattr(c, "use_huber", True):
+            return data_loss_huber(
+                q_pred_n, targets_n, mask=mask,
+                delta=getattr(c, "huber_delta", 1.0),
+            )
+        return data_loss_mse(q_pred_n, targets_n, mask=mask)
 
     def forward(
         self,
@@ -263,18 +312,22 @@ class ThermodynamicLoss(nn.Module):
         if conditions.dim() == 2:
             conditions = conditions.unsqueeze(1)
 
-        # --- Data loss in NORMALIZED units (per-component balance) ---
+        # --- Data loss in NORMALIZED (transformed) units ---
+        # run_007: use the model's normalize_q so the loss automatically
+        # respects config.target_transform (e.g. log1p) and stays consistent
+        # with denormalize_q. For target_transform="identity" this reduces to
+        # the previous linear (q - q_mean) / q_std standardization.
         base = model.models[0] if hasattr(model, "models") else model
-        q_std  = base.q_std.to(q_pred.device)
-        q_mean = base.q_mean.to(q_pred.device)
-        q_pred_n  = (q_pred  - q_mean) / (q_std + 1e-8)
-        targets_n = (targets - q_mean) / (q_std + 1e-8)
+        q_pred_n  = base.normalize_q(q_pred)
+        targets_n = base.normalize_q(targets)
 
         sigma = predictions.get("sigma")
         if c.use_nll and sigma is not None:
+            # Heteroscedastic NLL takes precedence when a sigma head is active.
             d_loss = data_loss_nll(q_pred_n, targets_n, sigma, mask=mask)
         else:
-            d_loss = data_loss_mse(q_pred_n, targets_n, mask=mask)
+            # run_006: robust Huber (or MSE) data term.
+            d_loss = self._data_term(q_pred_n, targets_n, mask=mask)
 
         physics: Dict[str, torch.Tensor] = {}
         total = c.lambda_data * d_loss
@@ -283,8 +336,8 @@ class ThermodynamicLoss(nn.Module):
         # first-order signal; the ICNN remains the physics predictor)
         q_aux = predictions.get("q_aux")
         if q_aux is not None and getattr(c, "lambda_aux", 0.0) > 0:
-            q_aux_n = (q_aux - q_mean) / (q_std + 1e-8)
-            aux_loss = data_loss_mse(q_aux_n, targets_n, mask=mask)
+            q_aux_n = base.normalize_q(q_aux)
+            aux_loss = self._data_term(q_aux_n, targets_n, mask=mask)
             physics["aux"] = aux_loss
             total = total + c.lambda_aux * aux_loss
 
@@ -573,6 +626,7 @@ class ThermodynamicValidator:
 __all__ = [
     "LossConfig",
     "data_loss_mse",
+    "data_loss_huber",
     "data_loss_nll",
     "hessian_symmetry_loss",
     "monotonicity_loss",

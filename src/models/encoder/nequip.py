@@ -8,7 +8,8 @@ adapted for periodic crystalline MOF structures.
 Architecture overview
 ─────────────────────
 1.  **Atom embedding** — learnable embedding table maps atomic numbers
-    to scalar features (``emb_dim × 0e`` irreps).
+    to scalar features (``emb_dim × 0e`` irreps).  (run_008: optionally
+    mixes a per-atom partial charge into this scalar embedding.)
 2.  **Radial basis** — Gaussian RBFs with a smooth polynomial cutoff
     envelope encode interatomic distances.
 3.  **Spherical harmonics** — unit edge vectors are expanded into SO(3)
@@ -30,7 +31,8 @@ Key properties
 ──────────────
 * **E(3)-invariant output** — the final embedding is a scalar (``0e``),
   so rotating, translating, or reflecting the crystal leaves the
-  embedding unchanged.
+  embedding unchanged.  (Partial charge is a scalar, so mixing it in
+  preserves invariance.)
 * **Periodic boundary conditions** — minimum-image convention is applied
   when a unit cell is provided, and ASE-computed edge shifts are
   supported for exact PBC handling.
@@ -122,6 +124,8 @@ class NequIPConfig:
                          for message normalisation (``1/sqrt(N)``).
     envelope_exponent  : Exponent *p* of the polynomial envelope.
     use_sc         : Use self-connection (equivariant skip) in each layer.
+    use_charges    : run_008 — mix a per-atom partial charge into the
+                     scalar node embedding (requires graphs to carry ``q``).
     """
 
     n_species: int = 100
@@ -138,6 +142,7 @@ class NequIPConfig:
     avg_num_neighbours: float = 50.0
     envelope_exponent: int = 5
     use_sc: bool = True
+    use_charges: bool = False   # run_008: mix per-atom charge into node embedding
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -434,6 +439,7 @@ class NequIPEncoder(nn.Module):
     n_rbf          : see :class:`NequIPConfig`
     cutoff         : see :class:`NequIPConfig`
     use_pbc        : see :class:`NequIPConfig`
+    use_charges    : see :class:`NequIPConfig` (run_008)
     config         : Alternatively, pass a :class:`NequIPConfig` directly.
 
     Accepted input formats
@@ -447,6 +453,8 @@ class NequIPEncoder(nn.Module):
     * ``edge_attr`` — ``[E, 1]`` or ``[E]`` edge lengths (optional; if
       absent they are computed from ``pos``).
     * ``cell`` — ``[1, 3, 3]`` or ``[3, 3]`` lattice vectors (optional).
+    * ``q`` — ``[N]`` per-atom partial charges (optional; used only when
+      ``use_charges`` is True, defaults to zeros if absent).
     * ``batch`` — ``[N]`` graph-membership indices (default: single graph).
     """
 
@@ -460,6 +468,7 @@ class NequIPEncoder(nn.Module):
         cutoff: float = 5.0,
         use_pbc: bool = True,
         avg_num_neighbours: float = 15.0,
+        use_charges: bool = False,
         *,
         config: Optional[NequIPConfig] = None,
     ):
@@ -478,6 +487,7 @@ class NequIPEncoder(nn.Module):
                 cutoff=cutoff,
                 use_pbc=use_pbc,
                 avg_num_neighbours=avg_num_neighbours,
+                use_charges=use_charges,
             )
 
         self.config = c
@@ -492,6 +502,15 @@ class NequIPEncoder(nn.Module):
         # ── Node embedding ───────────────────────────────────────
         self.node_embedding = nn.Embedding(c.n_species, c.emb_dim)
         nn.init.uniform_(self.node_embedding.weight, -math.sqrt(3), math.sqrt(3))
+
+        # run_008: optional per-atom charge → embedding contribution.
+        # Zero-init so the encoder starts identical to the no-charge model
+        # and learns to use charge from there (safe, near-identity start).
+        self.use_charges = c.use_charges
+        if c.use_charges:
+            self.charge_proj = nn.Linear(1, c.emb_dim)
+            nn.init.zeros_(self.charge_proj.weight)
+            nn.init.zeros_(self.charge_proj.bias)
 
         # ── Build irreps schedule ────────────────────────────────
         # Input: scalars only
@@ -577,6 +596,25 @@ class NequIPEncoder(nn.Module):
 
         return z, pos, edge_index, cell, batch
 
+    def _get_charges(
+        self,
+        data: Union[Dict[str, Any], Any],
+        n_atoms: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """
+        run_008: return per-atom charge as ``[N, 1]``; zeros if the graph
+        carries none (keeps the encoder well-defined for charge-less MOFs).
+        """
+        q = None
+        if hasattr(data, "q"):
+            q = data.q
+        elif isinstance(data, dict):
+            q = data.get("q")
+        if q is None:
+            return torch.zeros(n_atoms, 1, device=device)
+        return q.to(device).float().view(-1, 1)
+
     def _compute_edge_vectors(
         self,
         pos: torch.Tensor,
@@ -630,6 +668,8 @@ class NequIPEncoder(nn.Module):
         # ── Node features ────────────────────────────────────────
         x = self.node_embedding(z)  # [N, emb_dim]
         x = x * math.sqrt(self.emb_dim)
+        if self.use_charges:
+            x = x + self.charge_proj(self._get_charges(data, x.shape[0], x.device))
 
         # ── Edge attributes ──────────────────────────────────────
         vec, lengths = self._compute_edge_vectors(pos, edge_index, cell)
@@ -678,6 +718,8 @@ class NequIPEncoder(nn.Module):
         z, pos, edge_index, cell, batch = self._unpack_input(data)
 
         x = self.node_embedding(z) * math.sqrt(self.emb_dim)
+        if self.use_charges:
+            x = x + self.charge_proj(self._get_charges(data, x.shape[0], x.device))
         vec, lengths = self._compute_edge_vectors(pos, edge_index, cell)
         unit_vec = vec / (lengths.unsqueeze(-1) + 1e-8)
         edge_sh = o3.spherical_harmonics(
@@ -725,7 +767,7 @@ class NequIPEncoder(nn.Module):
             f"n_species={c.n_species}, emb_dim={c.emb_dim}, "
             f"n_layers={c.n_layers}, lmax={c.lmax}, "
             f"n_rbf={c.n_rbf}, cutoff={c.cutoff}, "
-            f"use_pbc={c.use_pbc}"
+            f"use_pbc={c.use_pbc}, use_charges={c.use_charges}"
         )
 
 
