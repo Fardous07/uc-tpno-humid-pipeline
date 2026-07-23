@@ -69,10 +69,10 @@ model:
     n_species: 100
     use_pbc: true
   ensemble:
-    n_models: 2
+    n_models: 4
     n_samples: 30
     share_encoder: true
-  n_ensemble: 2
+  n_ensemble: 4
   n_layers: 2
   n_rbf: 32
   avg_num_neighbours: 15.0
@@ -86,6 +86,8 @@ model:
     n_conditions: 4
     n_layers: 3
     use_layer_norm: true
+  lmax: 2
+  use_charges: true
 results:
   figures:
     benchmark_comparison: true
