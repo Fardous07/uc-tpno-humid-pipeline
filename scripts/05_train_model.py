@@ -343,6 +343,7 @@ def main() -> None:
         "cutoff":    model_cfg.get("cutoff",           6.0),
         "n_rbf":     model_cfg.get("n_rbf",            32),
         "use_pbc":   model_cfg.get("use_pbc",          True),
+        "use_charges": model_cfg.get("use_charges", False),
         "avg_num_neighbours": model_cfg.get("avg_num_neighbours", 15.0),
     }
     encoder = EncoderAdapter.from_config(
