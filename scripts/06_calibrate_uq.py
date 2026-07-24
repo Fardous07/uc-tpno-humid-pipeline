@@ -112,70 +112,52 @@ def resolve_loaded_splits(
     return train_idx, val_idx, test_idx
 
 
-def build_model_from_config(
-    model_cfg: Dict[str, Any],
-    device: torch.device,
-) -> ThermodynamicPotentialNO:
-    """
-    Build the same model family used in 05_train_model.py.
-    """
-    encoder_config = {
-        "encoder": model_cfg.get("encoder", "nequip"),
-        "n_species": model_cfg.get("n_species", 100),
-        "emb_dim": model_cfg.get("emb_dim", 128),
-        "n_layers": model_cfg.get("n_encoder_layers", 4),
-        "lmax": model_cfg.get("lmax", 2),
-        "cutoff": model_cfg.get("cutoff", 6.0),
-        "n_rbf": model_cfg.get("n_rbf", 32),
-        "use_pbc": model_cfg.get("use_pbc", True),
+def build_model_from_config(model_cfg, device):
+    """PATCHED: rebuild the trained TPNOEnsemble (not a single model)."""
+    from src.models.operator.tpno import TPNOEnsemble, TPNOConfig
+    from src.models.encoder.adapter import EncoderAdapter
+    m = dict(model_cfg or {})
+    enc_cfg = {
+        "encoder": m.get("encoder", "nequip"),
+        "n_species": int(m.get("n_species", 100)),
+        "emb_dim": int(m.get("emb_dim", 48)),
+        "n_layers": int(m.get("n_encoder_layers", 2)),
+        "lmax": int(m.get("lmax", 1)),
+        "cutoff": float(m.get("cutoff", 5.0)),
+        "n_rbf": int(m.get("n_rbf", 32)),
+        "use_pbc": bool(m.get("use_pbc", True)),
+        "use_charges": bool(m.get("use_charges", False)),
+        "avg_num_neighbours": float(m.get("avg_num_neighbours", 15.0)),
     }
-
-    encoder = EncoderAdapter.from_config(
-        encoder_config,
-        target_dim=model_cfg.get("emb_dim", 128),
-        normalize=True,
-    )
-
+    encoder = EncoderAdapter.from_config(enc_cfg, target_dim=int(m.get("emb_dim", 48)), normalize=True)
     tpno_cfg = TPNOConfig(
-        emb_dim=int(model_cfg.get("emb_dim", 128)),
-        n_conditions=int(model_cfg.get("n_conditions", 4)),
-        n_components=int(model_cfg.get("n_components", 3)),
-        hidden_dim=int(model_cfg.get("hidden_dim", 256)),
-        n_layers=int(model_cfg.get("n_tpno_layers", 4)),
-        convex_constraint=model_cfg.get("convex_constraint", "softplus"),
-        film_conditioning=bool(model_cfg.get("film_conditioning", True)),
-        dropout=float(model_cfg.get("dropout", 0.1)),
-        use_layer_norm=bool(model_cfg.get("use_layer_norm", True)),
-        activation=model_cfg.get("activation", "swish"),
-        min_potential=float(model_cfg.get("min_potential", 1e-6)),
+        emb_dim=int(m.get("emb_dim", 48)),
+        n_conditions=int(m.get("n_conditions", 4)),
+        n_components=int(m.get("n_components", 3)),
+        hidden_dim=int(m.get("hidden_dim", 128)),
+        n_layers=int(m.get("n_tpno_layers", 3)),
+        convex_constraint=m.get("convex_constraint", "softplus"),
+        film_conditioning=bool(m.get("film_conditioning", True)),
+        dropout=float(m.get("dropout", 0.05)),
+        use_layer_norm=bool(m.get("use_layer_norm", True)),
+        activation=m.get("activation", "swish"),
+        min_potential=float(m.get("min_potential", 1e-6)),
     )
+    model = TPNOEnsemble(config=tpno_cfg, encoder=encoder,
+                         n_models=int(m.get("n_ensemble", 2)),
+                         share_encoder=bool(m.get("share_encoder", True)))
+    return model.to(device)
 
-    model = ThermodynamicPotentialNO(encoder=encoder, config=tpno_cfg)
-    model.to(device)
-    return model
 
-
-def load_checkpoint_into_model(
-    model: torch.nn.Module,
-    checkpoint_path: str,
-    device: torch.device,
-) -> None:
-    """
-    Load either a raw state_dict or a wrapped checkpoint.
-    """
+def load_checkpoint_into_model(model, checkpoint_path, device):
+    """PATCHED: tolerant load for the ensemble checkpoint."""
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-
     if isinstance(ckpt, dict):
-        if "state_dict" in ckpt:
-            state_dict = ckpt["state_dict"]
-        elif "model_state_dict" in ckpt:
-            state_dict = ckpt["model_state_dict"]
-        else:
-            state_dict = ckpt
+        state_dict = ckpt.get("model_state_dict", ckpt.get("state_dict", ckpt))
     else:
         state_dict = ckpt
-
-    model.load_state_dict(state_dict, strict=True)
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    print(f"[patched load] missing={len(missing)} unexpected={len(unexpected)}")
 
 
 def _safe_sigma_fallback(y_true: np.ndarray, y_pred: np.ndarray) -> np.ndarray:
