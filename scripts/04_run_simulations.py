@@ -345,10 +345,21 @@ def prepare_runtime(output_dir: Path, raspa_share: Path) -> Tuple[Path, Path, Pa
 
 
 def check_ff_assets(runtime_share: Path, ff_name: str) -> None:
+    """
+    FIX: force_field.def used to be required, but it's genuinely optional
+    in RASPA2 -- it only holds explicit pairwise overrides beyond the
+    general mixing rule. Verified directly: a real, official RASPA2 build's
+    bundled ExampleMOFsForceField has no force_field.def at all (only
+    pseudo_atoms.def + force_field_mixing_rules.def); RASPA logs
+    "'force_field.def' file not found and therefore not used" and runs a
+    complete GCMC simulation correctly without it. Requiring it here would
+    have made check_ff_assets() raise FileNotFoundError on the very first
+    real invocation of this script against a standard RASPA2 install.
+    """
     ff_dir = runtime_share / "forcefield" / ff_name
     if not ff_dir.exists():
         raise FileNotFoundError(f"Forcefield dir missing: {ff_dir}")
-    required = ["force_field.def", "pseudo_atoms.def"]
+    required = ["pseudo_atoms.def"]
     missing = [f for f in required if not (ff_dir / f).exists()]
     mixing = any((ff_dir / f).exists() for f in
                  ["force_field_mixing_rules.def", "mixing_rules.def"])
