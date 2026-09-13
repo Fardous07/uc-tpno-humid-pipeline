@@ -209,15 +209,6 @@ def parse_tmmc_output(
     return _parse(job_dir, T=T, pressures=pressures)
 
 
-# Re-export parser utilities so tests can do:
-#   from src.simulation.gctmmc.parser import synthetic_collection_matrix
-from .runner import (           # noqa: E402
-    synthetic_collection_matrix,
-    collection_matrix_to_ln_pi,
-    ln_pi_to_isotherm,
-)
-
-
 # ═══════════════════════════════════════════════════════════════════════
 # 5. GC-TMMC RUNNER
 # ═══════════════════════════════════════════════════════════════════════
@@ -363,6 +354,22 @@ class GCTMMCRunner:
     def _job_id(self, mof_name: str, molecule: str, temperature: float) -> str:
         raw = f"{mof_name}_{molecule}_{float(temperature):.3f}"
         return hashlib.md5(raw.encode("utf-8")).hexdigest()[:12]
+
+
+# FIX: this MUST come after GCTMMCRunner is fully defined above -- runner.py's
+# own module-level `from .parser import (..., GCTMMCRunner)` needs
+# GCTMMCRunner to already exist in this module's namespace by the time it
+# runs. Placing this import earlier (as it was) triggered runner.py mid-way
+# through this file's execution, before GCTMMCRunner existed, causing
+# "ImportError: cannot import name 'GCTMMCRunner' from partially initialized
+# module" on every single caller (verified: this broke every GCTMMC test in
+# tests/test_simulation/test_gcmc.py, and would have made
+# run_stage1_isotherms_gctmmc() in 04_run_simulations.py fail immediately).
+from .runner import (           # noqa: E402
+    synthetic_collection_matrix,
+    collection_matrix_to_ln_pi,
+    ln_pi_to_isotherm,
+)
 
 
 # ═══════════════════════════════════════════════════════════════════════

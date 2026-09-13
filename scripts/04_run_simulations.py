@@ -67,6 +67,11 @@ from src.utils.chemistry import (
     water_saturation_pressure_antoine,
 )
 
+# ADDED: GC-TMMC existed in src/simulation/gctmmc/ but nothing in this
+# pipeline ever drove it -- Stage 1 only ever ran ordinary GCMC pressure
+# sweeps. See run_stage1_isotherms_gctmmc() below and --stage1-method.
+from src.simulation.gctmmc.parser import GCTMMCConfig, GCTMMCRunner
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -661,6 +666,97 @@ def run_stage1_isotherms(
 
 
 # ---------------------------------------------------------------------------
+# Stage 1 (alternative) — real GC-TMMC single-component screening
+# ---------------------------------------------------------------------------
+# ADDED: this project's docstring always called Stage 1 a "low-fidelity TMMC
+# proxy", but nothing ever actually drove src/simulation/gctmmc/ -- Stage 1
+# was ordinary GCMC repeated at each pressure. GC-TMMC gets a MOF's full
+# isotherm from ONE simulation (via the collection matrix), instead of one
+# GCMC run per pressure point, so it is genuinely cheaper for screening the
+# whole library. This is single-component only (GCTMMCRunner has no
+# multicomponent mode in this codebase) -- Stage 3's humid multicomponent
+# GCMC is unaffected either way and remains the source of real training
+# labels.
+def run_stage1_isotherms_gctmmc(
+    cif_paths: Sequence[Path], output_dir: Path,
+    runtime_root: Path, raspa_path: Path,
+    temperatures_k: Sequence[float],
+    n_cycles: int, keep_workspaces: bool,
+    forcefield: str, use_charges: bool, cutoff: float,
+) -> pd.DataFrame:
+    """
+    Run one GC-TMMC simulation per (MOF, component, T) and expand each
+    resulting isotherm into the same row schema run_stage1_isotherms()
+    produces (mof_id, component, temperature_k, pressure_bar, loading_molkg),
+    so select_mofs_for_gcmc() works unchanged regardless of which Stage 1
+    method produced stage1_isotherms.parquet.
+
+    Molecule definitions (CO2/N2 -> TraPPE, H2O -> TIP4P/2005) are fixed by
+    src/simulation/gctmmc/parser.py's _MOLECULE_DEFS, not by this script's
+    --co2-definition/--n2-definition/--h2o-definition flags -- edit that
+    dict if your RASPA install names those folders differently.
+    """
+    components = ("CO2", "N2", "H2O")
+    total = len(cif_paths) * len(components) * len(temperatures_k)
+    job = 0
+
+    ws_root = ensure_dir(output_dir / "stage1_gctmmc_workspace")
+    config = GCTMMCConfig(
+        raspa_path=str(raspa_path),
+        raspa_data_dir=str(runtime_root),
+        work_dir=str(ws_root),
+        forcefield=forcefield,
+        cutoff_vdw=cutoff,
+        n_cycles=n_cycles,
+        use_charges=use_charges,
+        timeout=7200,
+    )
+    runner = GCTMMCRunner(config)
+
+    logger.info(f"\n[Stage 1/GC-TMMC] {total} jobs across {len(cif_paths)} MOFs "
+                f"({len(components)} components x {len(temperatures_k)} temperatures, "
+                f"one simulation per job yields a full isotherm)")
+
+    rows: List[Dict] = []
+    for cif in cif_paths:
+        name = cif.stem
+        # Canonicalize once per MOF (P1, RASPA-parseable) -- GCTMMCRunner
+        # would otherwise copy the raw source CIF as-is, which is exactly
+        # the messy-CIF failure mode canonicalize_cif() was written to fix.
+        canon_cif = ws_root / f"{name}.canonical.cif"
+        try:
+            canonicalize_cif(cif, canon_cif)
+        except Exception as e:
+            logger.warning(f"    Skipping {name}: canonicalisation failed ({e})")
+            job += len(components) * len(temperatures_k)
+            continue
+
+        for mol in components:
+            for t in temperatures_k:
+                job += 1
+                logger.info(f"  [{job}/{total}] {name} | {mol} | T={t:.0f}K (GC-TMMC)")
+                result = runner.run_single(
+                    mof_cif=canon_cif, molecule=mol, temperature=t,
+                    clean_after=not keep_workspaces,
+                )
+                if not result.get("success"):
+                    logger.warning(f"    FAILED: {result.get('error')}")
+                    continue
+                for p_bar, q in zip(result["pressures"], result["loadings"]):
+                    rows.append({
+                        "mof_id": name, "component": mol,
+                        "temperature_k": t, "pressure_bar": float(p_bar),
+                        "loading_molkg": float(q),
+                    })
+
+    df = pd.DataFrame(rows)
+    out = output_dir / "stage1_isotherms.parquet"
+    df.to_parquet(out, index=False)
+    logger.info(f"[Stage 1/GC-TMMC] {job}/{total} jobs run -> {len(df)} isotherm points -> {out}")
+    return df
+
+
+# ---------------------------------------------------------------------------
 # Stage 2 — TMMC→GCMC selection
 # ---------------------------------------------------------------------------
 def _pareto_front(costs: np.ndarray) -> np.ndarray:
@@ -1020,6 +1116,12 @@ def main() -> None:
     # Stage control (useful for resuming)
     p.add_argument("--skip-stage1",  action="store_true", help="Load existing stage1 parquet")
     p.add_argument("--skip-stage2",  action="store_true", help="Run GCMC on all (skip selection)")
+    # ADDED: GC-TMMC existed in src/simulation/gctmmc/ but nothing ever drove
+    # it. 'gctmmc' gets a full isotherm per (MOF, component, T) from one
+    # simulation instead of one GCMC run per (MOF, component, T, P) --
+    # single-component screening only; Stage 3 is unaffected either way.
+    p.add_argument("--stage1-method", choices=["gcmc", "gctmmc"], default="gcmc",
+                   help="Stage 1 single-component screening method (default: gcmc).")
 
     args = p.parse_args()
 
@@ -1107,6 +1209,13 @@ def main() -> None:
     if args.skip_stage1 and stage1_parquet.exists():
         logger.info(f"\n[Stage 1] Skipped — loading {stage1_parquet}")
         stage1_df = pd.read_parquet(stage1_parquet)
+    elif args.stage1_method == "gctmmc":
+        stage1_df = run_stage1_isotherms_gctmmc(
+            all_cifs, output_dir, runtime_root, raspa_path,
+            temps,
+            args.n_cycles, args.keep_workspaces,
+            ff_name, args.use_framework_charges, args.cutoff,
+        )
     else:
         stage1_df = run_stage1_isotherms(
             all_cifs, output_dir, runtime_root, fw_cif_dir, raspa_path,

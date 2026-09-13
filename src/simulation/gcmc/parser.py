@@ -244,10 +244,6 @@ def parse_raspa_output(job_dir: Union[str, Path]) -> Dict[str, Any]:
     return _parse(job_dir)
 
 
-# FIX: re-export results_to_arrays so tests can import it from gcmc.parser
-from .runner import results_to_arrays   # noqa: E402
-
-
 # ═══════════════════════════════════════════════════════════════════════
 # 5. GCMC RUNNER
 # ═══════════════════════════════════════════════════════════════════════
@@ -447,6 +443,18 @@ class GCMCRunner:
         comp_str = "_".join(f"{k}{comp[k]:.6f}" for k in sorted(comp))
         raw = f"{mof_name}_T{T:.3f}_P{P:.6f}_{comp_str}"
         return hashlib.md5(raw.encode("utf-8")).hexdigest()[:12]
+
+
+# FIX: this MUST come after GCMCRunner is fully defined above. runner.py's
+# own module-level `from .parser import (..., GCMCRunner)` needs GCMCRunner
+# to already exist in this module's namespace by the time it runs -- placing
+# this import earlier (as it was) triggered runner.py mid-way through this
+# file's execution, before GCMCRunner existed, causing
+# "ImportError: cannot import name 'GCMCRunner' from partially initialized
+# module" on every single caller (verified: this broke every test in
+# tests/test_simulation/test_gcmc.py and would have broken
+# 08_active_learning_loop.py the moment it actually ran).
+from .runner import results_to_arrays   # noqa: E402
 
 
 # ═══════════════════════════════════════════════════════════════════════
