@@ -216,7 +216,16 @@ else
         --stage1-pressures "${STAGE1_PRESSURES}" \
         --rhs "${RHS}" \
         --dry-co2-frac "${DRY_CO2_FRAC}" \
+        --stage3-n-cycles "${STAGE3_CYCLES}" \
         --stop-after-stage2
+        # FIX: Phase A never actually runs Stage 3 (--stop-after-stage2
+        # exits first), so --stage3-n-cycles is a no-op here functionally.
+        # But 04_run_simulations.py's startup banner prints it regardless,
+        # and without this flag it silently defaulted to args.n_cycles
+        # (Stage 1's cycle count) instead of the real Stage 3 value --
+        # printing "Stage 3 cycles: 1000" during Phase A even though
+        # Phase B's workers correctly use 4000. Passed through here purely
+        # so the banner isn't misleading.
 fi
 
 if [[ ! -f "${SELECTED_MOFS_FILE}" ]]; then
