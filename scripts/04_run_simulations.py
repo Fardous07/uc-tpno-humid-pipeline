@@ -41,6 +41,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 import logging
 from dataclasses import dataclass, field
@@ -55,6 +56,17 @@ try:
 except Exception:
     ase_read = None
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+# FIX: this script used to compute mu via a local, ideal-gas-only
+# mu_ideal_gas() that silently disagreed with src.utils.chemistry's
+# Peng-Robinson mixture EOS (the version 09_benchmark.py already queries the
+# model with). Standardizing on chemistry.py so training labels and
+# inference-time conditions use identical thermodynamics.
+from src.utils.chemistry import (
+    mixture_pressure_to_chemical_potentials,
+    water_saturation_pressure_antoine,
+)
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -64,11 +76,6 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-R_KJ_MOL_K: float = 8.314462618e-3   # kJ / (mol·K)
 
 
 # ---------------------------------------------------------------------------
@@ -126,19 +133,6 @@ def available_subdirs(p: Path) -> List[str]:
 # ---------------------------------------------------------------------------
 # Thermodynamics
 # ---------------------------------------------------------------------------
-def water_saturation_pressure_bar(temperature_k: float) -> float:
-    """Antoine equation → bar (valid 1–100 °C, adequate for 25–60 °C range)."""
-    t_c = temperature_k - 273.15
-    log_p_mmHg = 8.07131 - 1730.63 / (233.426 + t_c)
-    return float(10.0 ** log_p_mmHg * 133.322368e-5)
-
-
-def mu_ideal_gas(partial_pressure_bar: float, temperature_k: float) -> float:
-    """μ = RT ln(P/P_ref)  with P_ref = 1 bar, result in kJ/mol."""
-    p = max(float(partial_pressure_bar), 1e-12)
-    return float(R_KJ_MOL_K * temperature_k * math.log(p))
-
-
 def build_conditions(
     temperatures_k: Sequence[float],
     pressures_bar: Sequence[float],
@@ -148,7 +142,7 @@ def build_conditions(
     """Build all valid (T, P, RH) thermodynamic conditions."""
     out: List[Condition] = []
     for t in temperatures_k:
-        p_sat = water_saturation_pressure_bar(t)
+        p_sat = water_saturation_pressure_antoine(t)
         for p_total in pressures_bar:
             for rh in rhs:
                 p_h2o = rh * p_sat
@@ -160,6 +154,11 @@ def build_conditions(
                 x_n2  = (dry / p_total) * (1.0 - dry_co2_frac)
                 p_co2 = x_co2 * p_total
                 p_n2  = x_n2  * p_total
+                mu = mixture_pressure_to_chemical_potentials(
+                    y={"CO2": x_co2, "N2": x_n2, "H2O": x_h2o},
+                    pressure=p_total,
+                    temperature=t,
+                )
                 out.append(Condition(
                     temperature_k=float(t),
                     pressure_bar=float(p_total),
@@ -172,9 +171,9 @@ def build_conditions(
                     p_h2o_bar=float(p_h2o),
                     p_co2_bar=float(p_co2),
                     p_n2_bar=float(p_n2),
-                    mu_co2=mu_ideal_gas(p_co2, t),
-                    mu_n2=mu_ideal_gas(p_n2,  t),
-                    mu_h2o=mu_ideal_gas(p_h2o, t),
+                    mu_co2=float(mu["CO2"]),
+                    mu_n2=float(mu["N2"]),
+                    mu_h2o=float(mu["H2O"]),
                 ))
     return out
 
@@ -603,7 +602,7 @@ def run_stage1_isotherms(
     temperatures_k: Sequence[float], pressures_bar: Sequence[float],
     n_cycles: int, keep_workspaces: bool,
     forcefield: str, use_charges: bool, cutoff: float,
-    co2_dir: str, n2_dir: str,
+    co2_dir: str, n2_dir: str, h2o_dir: str,
     max_retries: int = 3, retry_delay: int = 60,
 ) -> pd.DataFrame:
     """
@@ -612,10 +611,18 @@ def run_stage1_isotherms(
     FIX: Previous version only ran at max(pressures_bar) — a single point
     per isotherm — which cannot compute working capacity.  We now sweep ALL
     pressures so that Stage 2 can compute ΔN = N(P_high) − N(P_low).
+
+    FIX: previous version only screened CO2 and N2 here, so the Stage 2 MOF
+    selection that determines which MOFs even get the expensive humid
+    multicomponent GCMC in Stage 3 was blind to water. H2O is now included
+    as a third single-component isotherm so Stage 2 can filter on CO2-vs-H2O
+    affinity (see select_mofs_for_gcmc), following the water-aware screening
+    funnel used on this same CoRE-MOF-2019 database in Kancharlapalli &
+    Snurr, ACS Appl. Mater. Interfaces 2023, 15, 28084-28092.
     """
     rows: List[Dict] = []
     ws_root = ensure_dir(output_dir / "stage1_workspace")
-    components = [("CO2", co2_dir), ("N2", n2_dir)]
+    components = [("CO2", co2_dir), ("N2", n2_dir), ("H2O", h2o_dir)]
     total = len(cif_paths) * len(components) * len(temperatures_k) * len(pressures_bar)
     job = 0
 
@@ -680,25 +687,47 @@ def select_mofs_for_gcmc(
     desorption_pressure_bar: float,
     temperature_k: float = 298.15,
     exploration_fraction: float = 0.2,
+    require_co2_over_h2o: bool = True,
 ) -> List[str]:
     """
     Pick the best MOFs for expensive GCMC using Stage 1 single-component data.
 
     Strategy
     --------
-    For each MOF we compute two KPIs from the CO2 and N2 single-component
-    isotherms at the reference temperature:
+    For each MOF we compute three KPIs from the CO2, N2 and H2O
+    single-component isotherms at the reference temperature:
 
-      selectivity_proxy  = KH_CO2 / KH_N2
-                         (Henry constants from low-pressure loading / pressure)
+      selectivity_proxy    = KH_CO2 / KH_N2
+                           (Henry constants from low-pressure loading / pressure)
 
-      working_capacity   = q_CO2(P_ads) − q_CO2(P_des)
-                         (usable CO2 loading over a PSA/VSA swing)
+      working_capacity     = q_CO2(P_ads) − q_CO2(P_des)
+                           (usable CO2 loading over a PSA/VSA swing)
 
-    We then find the Pareto front over (selectivity, working_capacity),
-    fill remaining budget with the highest-selectivity non-Pareto candidates,
-    and finally replace exploration_fraction of slots with diverse candidates
-    (highest selectivity that are NOT already selected) to avoid clustering.
+      co2_h2o_selectivity  = KH_CO2 / KH_H2O
+                           (water-competition indicator)
+
+    ADDED (water-aware screening): before the Pareto step, MOFs whose water
+    Henry constant exceeds their CO2 Henry constant (KH_H2O > KH_CO2, i.e.
+    water outcompetes CO2 for adsorption sites) are filtered out, matching
+    the "stronger CO2 interaction than H2O/N2" filter used to screen this
+    same CoRE-MOF-2019 database in:
+        Kancharlapalli, S.; Snurr, R. Q. "High-Throughput Screening of the
+        CoRE-MOF-2019 Database for CO2 Capture from Wet Flue Gas: A
+        Multi-Scale Modeling Strategy." ACS Appl. Mater. Interfaces 2023,
+        15(23), 28084-28092. DOI: 10.1021/acsami.3c04079
+    and the CO2-over-H2O selectivity ranking in:
+        Li, S.; Chung, Y. G.; Snurr, R. Q. "High-Throughput Screening of
+        Metal-Organic Frameworks for CO2 Capture in the Presence of Water."
+        Langmuir 2016, 32(40), 10368-10376. DOI: 10.1021/acs.langmuir.6b02803
+    Previously this function only ever saw CO2/N2 data, so the MOFs handed
+    to the expensive humid Stage 3 GCMC were selected with zero regard for
+    water competition — the whole point of this "humid" pipeline.
+
+    From the water-filtered survivors we then find the Pareto front over
+    (selectivity, working_capacity), fill remaining budget with the
+    highest-selectivity non-Pareto candidates, and finally replace
+    exploration_fraction of slots with diverse candidates (highest working
+    capacity that are NOT already selected) to avoid clustering.
 
     Parameters
     ----------
@@ -708,6 +737,9 @@ def select_mofs_for_gcmc(
     desorption_pressure_bar : low pressure point for working capacity  (e.g. 0.1)
     temperature_k           : reference temperature for KPI computation
     exploration_fraction    : fraction of budget reserved for diversity
+    require_co2_over_h2o    : apply the CO2-over-H2O Henry-constant filter
+                              before Pareto selection (set False to disable
+                              if H2O Stage 1 data is unavailable/incomplete)
     """
     df = stage1_df.copy()
     df = df[df["temperature_k"].between(temperature_k - 1.0, temperature_k + 1.0)]
@@ -723,16 +755,25 @@ def select_mofs_for_gcmc(
         sub = df[df["mof_id"] == mof]
         co2 = sub[sub["component"] == "CO2"].sort_values("pressure_bar")
         n2  = sub[sub["component"] == "N2" ].sort_values("pressure_bar")
+        h2o = sub[sub["component"] == "H2O"].sort_values("pressure_bar")
         if co2.empty or n2.empty:
             continue
 
         # Henry constants: slope at lowest pressure point (linear regime)
-        kh_co2 = float(co2.iloc[0]["loading_molkg"]) / float(co2.iloc[0]["pressure_bar"]) \
-            if co2.iloc[0]["loading_molkg"] is not None and co2.iloc[0]["pressure_bar"] > 0 else 0.0
-        kh_n2  = float(n2.iloc[0]["loading_molkg"])  / float(n2.iloc[0]["pressure_bar"]) \
-            if n2.iloc[0]["loading_molkg"]  is not None and n2.iloc[0]["pressure_bar"]  > 0 else 0.0
+        def _henry(rows: pd.DataFrame) -> float:
+            if rows.empty:
+                return 0.0
+            first = rows.iloc[0]
+            if first["loading_molkg"] is None or first["pressure_bar"] <= 0:
+                return 0.0
+            return float(first["loading_molkg"]) / float(first["pressure_bar"])
 
-        sel = kh_co2 / max(kh_n2, 1e-9)
+        kh_co2 = _henry(co2)
+        kh_n2  = _henry(n2)
+        kh_h2o = _henry(h2o)   # 0.0 if H2O Stage 1 data is missing for this MOF
+
+        sel        = kh_co2 / max(kh_n2, 1e-9)
+        sel_co2_h2o = kh_co2 / max(kh_h2o, 1e-9) if kh_h2o > 0 else float("inf")
 
         # Working capacity: interpolate at adsorption / desorption pressures
         def interp_loading(rows: pd.DataFrame, p_target: float) -> float:
@@ -749,13 +790,37 @@ def select_mofs_for_gcmc(
         q_des = interp_loading(co2, desorption_pressure_bar)
         wc = max(0.0, q_ads - q_des)
 
-        records.append({"mof_id": mof, "selectivity": sel, "working_capacity": wc})
+        records.append({
+            "mof_id": mof, "selectivity": sel, "working_capacity": wc,
+            "kh_co2": kh_co2, "kh_h2o": kh_h2o,
+            "co2_over_h2o_selectivity": sel_co2_h2o,
+            "has_h2o_data": not h2o.empty,
+        })
 
     if not records:
         logger.warning("Could not compute KPIs for any MOF — returning all")
         return mof_ids
 
     kpi_df = pd.DataFrame(records)
+    n_before_filter = len(kpi_df)
+
+    # ADDED: water-competition filter (Kancharlapalli & Snurr 2023 /
+    # Li, Chung & Snurr 2016 precedent) — drop MOFs where water outcompetes
+    # CO2 at the Henry-constant level, before spending GCMC budget on them.
+    if require_co2_over_h2o and kpi_df["has_h2o_data"].any():
+        survives = (~kpi_df["has_h2o_data"]) | (kpi_df["kh_co2"] > kpi_df["kh_h2o"])
+        filtered_df = kpi_df[survives]
+        if filtered_df.empty:
+            logger.warning(
+                "[Stage 2] CO2-over-H2O filter removed every MOF — "
+                "disabling it for this run and falling back to CO2/N2-only selection."
+            )
+        else:
+            logger.info(
+                f"[Stage 2] Water-competition filter: {len(filtered_df)}/{n_before_filter} "
+                f"MOFs retained (KH_CO2 > KH_H2O)"
+            )
+            kpi_df = filtered_df
 
     # Normalise to [0, 1] for Pareto
     for col in ["selectivity", "working_capacity"]:
@@ -785,6 +850,7 @@ def select_mofs_for_gcmc(
 
     logger.info(
         f"[Stage 2] Selected {len(selected)}/{len(mof_ids)} MOFs for GCMC\n"
+        f"  Water filter passed : {len(kpi_df)}/{n_before_filter}\n"
         f"  Pareto-front size : {pareto_mask.sum()}\n"
         f"  Exploitation slots: {n_exploit}\n"
         f"  Exploration slots : {n_explore}\n"
@@ -927,7 +993,16 @@ def main() -> None:
     p.add_argument("--dry-co2-frac", type=float, default=0.15)
     p.add_argument("--cutoff",       type=float, default=12.0)
     p.add_argument("--forcefield",   default="GenericMOFs")
-    p.add_argument("--use-framework-charges", action="store_true")
+    # FIX: defaulted to False (no framework electrostatics) while the
+    # active-learning GCMCConfig/GCTMMCConfig defaulted use_charges=True and
+    # the model was trained with use_charges=True as an input feature — a
+    # three-way inconsistency. Now defaults on; pass
+    # --no-use-framework-charges to reproduce the old uncharged behaviour.
+    p.add_argument(
+        "--use-framework-charges", action=argparse.BooleanOptionalAction, default=True,
+        help="Use CIF partial charges for host-guest electrostatics in RASPA "
+             "(default: True). Use --no-use-framework-charges to disable.",
+    )
     p.add_argument("--keep-workspaces",       action="store_true")
 
     # Molecule definitions
@@ -958,6 +1033,12 @@ def main() -> None:
             attr = key.replace("-", "_")
             if hasattr(args, attr):
                 setattr(args, attr, val)
+        # FIX: pipeline.yaml stores use_charges under simulation.gcmc, not as
+        # a top-level simulation key, so the generic loop above never applied
+        # it — --config's charge setting was silently ignored. Apply explicitly.
+        gcmc_cfg = sim.get("gcmc", {})
+        if "use_charges" in gcmc_cfg:
+            args.use_framework_charges = bool(gcmc_cfg["use_charges"])
 
     # Resolve paths
     cif_dir     = Path(args.cif_dir).expanduser().resolve()
@@ -1032,7 +1113,7 @@ def main() -> None:
             temps, pressures,
             args.n_cycles, args.keep_workspaces,
             ff_name, args.use_framework_charges, args.cutoff,
-            co2_dir, n2_dir,
+            co2_dir, n2_dir, h2o_dir,
             args.max_retries, args.retry_delay,
         )
 

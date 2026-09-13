@@ -75,7 +75,6 @@ SCREEN_TEMPERATURES = [313.15]         # K
 SCREEN_PRESSURES    = [0.1, 1.0, 10.0] # bar
 SCREEN_RHS          = [0.00, 0.10]     # relative humidity
 DRY_CO2_FRACTION    = 0.15
-R_KJ                = 0.008314462618   # kJ mol⁻¹ K⁻¹
 
 
 # ---------------------------------------------------------------------------
@@ -162,39 +161,19 @@ def load_checkpoint_into_model(model, checkpoint_path, device):
 # ---------------------------------------------------------------------------
 # Chemistry helpers
 # ---------------------------------------------------------------------------
-
-def water_saturation_pressure_antoine(temperature_k: float) -> float:
-    """Antoine equation → saturation pressure of water in bar."""
-    t_c   = temperature_k - 273.15
-    a, b, c = 8.07131, 1730.63, 233.426
-    p_mmHg = 10 ** (a - b / (c + t_c))
-    return float(p_mmHg * 133.322368 / 1e5)
-
-
-def relative_humidity_to_mole_fraction(
-    rh: float,
-    temperature_k: float,
-    total_pressure_bar: float,
-) -> float:
-    p_sat = water_saturation_pressure_antoine(temperature_k)
-    return min(rh * p_sat / total_pressure_bar, 0.9999)
-
-
-def mixture_pressure_to_chemical_potentials(
-    y: Dict[str, float],
-    pressure: float,
-    temperature: float,
-) -> Dict[str, float]:
-    """Mole fractions + pressure → chemical potentials (kJ/mol)."""
-    p_ref = 1.0  # bar
-    mu: Dict[str, float] = {}
-    for species, y_i in y.items():
-        if y_i > 0:
-            p_i = y_i * pressure
-            mu[species] = R_KJ * temperature * float(np.log(p_i / p_ref))
-        else:
-            mu[species] = -100.0
-    return mu
+# FIX: this module used to define its own local water_saturation_pressure_antoine(),
+# relative_humidity_to_mole_fraction(), and mixture_pressure_to_chemical_potentials()
+# — the last one an ideal-gas approximation that happened to share its name with
+# src.utils.chemistry's Peng-Robinson mixture-EOS version, but silently computed
+# different mu values. New GCMC rows appended by this active-learning loop would
+# have used different thermodynamics than the bulk Stage 3 training set generated
+# by scripts/04_run_simulations.py. Now importing the single canonical
+# implementation from chemistry.py so every part of the pipeline agrees.
+from src.utils.chemistry import (
+    water_saturation_pressure_antoine,
+    relative_humidity_to_mole_fraction,
+    mixture_pressure_to_chemical_potentials,
+)
 
 
 def build_flue_gas_composition(

@@ -146,12 +146,18 @@ simulation:
     n_cycles: 5000
     n_init: 2500
     timeout: 7200
-    use_charges: false
+    # FIX: was false, disagreeing with model.use_charges (true, above) and
+    # with GCMCConfig/GCTMMCConfig's own defaults (true) in
+    # src/simulation/{gcmc,gctmmc}/parser.py. Ground-truth labels were being
+    # generated without host-guest electrostatics while the model was told
+    # to condition on framework charges as an input feature. Now consistent.
+    use_charges: true
   gctmmc:
     N_max: 200
     bias_update: 10000
     n_cycles: 50000
     n_init: 10000
+    use_charges: true
   raspa_data_dir: /path/to/raspa/share/raspa
   raspa_path: /path/to/raspa/bin/simulate
 training:
