@@ -17,6 +17,17 @@ Why this version is safer for a flexible pipeline
 9. Avoids filename collisions in the sanitised directory.
 10. Saves a detailed sanitisation report.
 11. Supports resume mode.
+12. ADDED: WS24 water-stability filter. core_mof_2019 CIFs whose refcode
+    has a WS24 Burtch label <= 2 (unstable / low kinetic stability) are
+    excluded before the --max-core limit is applied, since simulating a
+    MOF that decomposes in water is scientifically meaningless for a
+    humid CO2 capture study. Does NOT apply to arc_mof_charges, whose
+    naming scheme has zero overlap with WS24's CCDC refcodes -- there is
+    no water-stability information available for those structures.
+    Unlabeled core MOFs (the vast majority -- WS24 only covers 963 of
+    19,081) are kept by default, since "untested" is not the same as
+    "unstable"; pass --ws24-exclude-unlabeled for a stricter, known-
+    stable-only selection.
 
 Examples
 --------
@@ -43,7 +54,7 @@ import sys
 import time
 import warnings
 from pathlib import Path
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import pandas as pd
 
@@ -87,17 +98,87 @@ def make_unique_sanitized_name(source: str, source_root: Path, cif_path: Path) -
     return f"{source}__{flat_rel}__{digest}.cif"
 
 
+def load_ws24_stability(raw_dir: Path) -> Dict[str, int]:
+    """
+    Load WS24 water-stability labels, keyed by CCDC refcode (upper-case,
+    matching CIF filename stems).
+
+    Burtch label: 1=unstable, 2=low kinetic stability, 3=high kinetic
+    stability, 4=thermodynamic stability. (Burtch et al. water-stability
+    classification, as compiled in the WS24 dataset.)
+
+    Searches recursively under raw_dir/ws24 for labels.csv rather than
+    hardcoding the exact nested extraction path (data_sets/data_sets/WS24s/
+    at the time of writing), so this keeps working if the archive is
+    re-extracted differently.
+
+    FIX: the WS24 archive also contains a sibling WS14s/labels.csv with a
+    completely different schema (columns "filename"/"stability_label", no
+    "refcode" or Burtch label at all). rglob("labels.csv") finds both, and
+    alphabetical sorting picked WS14s/labels.csv first (a real bug caught
+    by testing against the actual data -- it silently returned {} because
+    that file has neither expected column). Now tries every candidate and
+    picks by SCHEMA (has both a "refcode" and a "Burtch label ..." column),
+    not by path/sort order.
+
+    Returns {} (filter becomes a no-op, not a hard failure) if no
+    candidate with the expected schema can be found or parsed.
+    """
+    candidates = sorted((raw_dir / "ws24").rglob("labels.csv"))
+
+    for path in candidates:
+        try:
+            df = pd.read_csv(path, encoding="utf-8-sig")
+        except Exception:
+            continue
+
+        burtch_col = next(
+            (c for c in df.columns if c.strip().lower().startswith("burtch label")),
+            None,
+        )
+        if "refcode" not in df.columns or burtch_col is None:
+            continue
+
+        stability: Dict[str, int] = {}
+        for _, row in df.iterrows():
+            refcode = str(row["refcode"]).strip().upper()
+            if not refcode or refcode == "NAN":
+                continue
+            try:
+                stability[refcode] = int(row[burtch_col])
+            except (ValueError, TypeError):
+                continue
+        return stability
+
+    return {}
+
+
 def collect_limited_cifs(
     source_dir: Path,
     source_name: str,
     limit: int,
     shuffle_selection: bool,
     rng: random.Random,
+    stability_filter: Optional[Dict[str, int]] = None,
+    min_stability_label: int = 3,
+    exclude_unlabeled: bool = False,
 ) -> List[Dict[str, str]]:
     """
     Collect up to `limit` CIFs recursively from one source directory.
 
     limit = 0 means "all".
+
+    ADDED: stability_filter, when given, drops CIFs whose CCDC refcode
+    matches a WS24 refcode with Burtch label < min_stability_label, BEFORE
+    the limit is applied (so --max-core selects from among water-stable
+    candidates, not water-stable survivors of an already-truncated list).
+    Unlabeled CIFs are kept unless exclude_unlabeled.
+
+    FIX: core_mof_2019 CIF filenames aren't bare refcodes -- they append a
+    processing suffix (e.g. "ESOROV_freeONLY.cif", "BUCTUQ_clean.cif").
+    Matching on the full stem against WS24 found ZERO matches out of
+    19,081 CIFs (verified). The refcode is the token before the first
+    underscore; matching on that found 729 real matches instead.
     """
     discovered: List[Dict[str, str]] = []
 
@@ -106,6 +187,30 @@ def collect_limited_cifs(
 
     found = sorted(source_dir.rglob("*.cif"))
     n_available = len(found)
+
+    n_excluded_unstable = 0
+    n_excluded_unlabeled = 0
+    labels_by_cif: Dict[Path, int] = {}
+
+    if stability_filter:
+        kept: List[Path] = []
+        for cif in found:
+            # Refcode is the token before the first underscore
+            # (e.g. "ESOROV_freeONLY" -> "ESOROV"); a bare stem with no
+            # underscore is its own token, so this is safe either way.
+            refcode = cif.stem.split("_")[0].upper()
+            label = stability_filter.get(refcode)
+            if label is None:
+                if exclude_unlabeled:
+                    n_excluded_unlabeled += 1
+                    continue
+                kept.append(cif)
+            elif label >= min_stability_label:
+                labels_by_cif[cif] = label
+                kept.append(cif)
+            else:
+                n_excluded_unstable += 1
+        found = kept
 
     if shuffle_selection:
         rng.shuffle(found)
@@ -117,6 +222,12 @@ def collect_limited_cifs(
         found = found[:limit]
 
     print(f"  {source_dir.name}: available={n_available:,} | selected={len(found):,}")
+    if stability_filter:
+        print(
+            f"    WS24 filter: excluded {n_excluded_unstable:,} unstable/low-stability "
+            f"(Burtch < {min_stability_label}), "
+            f"{n_excluded_unlabeled:,} unlabeled" + (" (excluded)" if exclude_unlabeled else " (kept)")
+        )
 
     for cif in found:
         rel = cif.relative_to(source_dir)
@@ -128,6 +239,7 @@ def collect_limited_cifs(
                 "relative_path": str(rel).replace("\\", "/"),
                 "input_path": str(cif),
                 "mof_id_raw": cif.stem,
+                "ws24_burtch_label": labels_by_cif.get(cif),
             }
         )
 
@@ -140,13 +252,22 @@ def discover_cifs(
     max_arc: int,
     shuffle_selection: bool,
     seed: int,
+    ws24_stability: Optional[Dict[str, int]] = None,
+    ws24_min_label: int = 3,
+    ws24_exclude_unlabeled: bool = False,
 ) -> List[Dict[str, str]]:
     """
     Discover a limited number of CIFs recursively and preserve their source.
+
+    ADDED: ws24_stability, when given, filters "core" (core_mof_2019)
+    candidates by WS24 water-stability label before --max-core is applied.
+    Deliberately NOT applied to "arc" (arc_mof_charges): its naming scheme
+    doesn't correspond to WS24's CCDC refcodes at all, so there is no
+    water-stability information available for those structures.
     """
     source_dirs = [
-        ("core", raw_dir / "core_mof_2019", max_core),
-        ("arc", raw_dir / "arc_mof_charges", max_arc),
+        ("core", raw_dir / "core_mof_2019", max_core, ws24_stability),
+        ("arc", raw_dir / "arc_mof_charges", max_arc, None),
     ]
 
     discovered: List[Dict[str, str]] = []
@@ -156,7 +277,7 @@ def discover_cifs(
     print("STEP 1: Collecting selected CIF files")
     print("=" * 70)
 
-    for source_name, source_dir, limit in source_dirs:
+    for source_name, source_dir, limit, stab_filter in source_dirs:
         if not source_dir.exists():
             print(f"  {source_dir.name}: folder not found")
             continue
@@ -168,6 +289,9 @@ def discover_cifs(
                 limit=limit,
                 shuffle_selection=shuffle_selection,
                 rng=rng,
+                stability_filter=stab_filter,
+                min_stability_label=ws24_min_label,
+                exclude_unlabeled=ws24_exclude_unlabeled,
             )
         )
 
@@ -246,6 +370,7 @@ def save_selection_manifest(
                 "mof_id_raw": item["mof_id_raw"],
                 "sanitized_name": out_name,
                 "sanitized_path": str(output_path),
+                "ws24_burtch_label": item.get("ws24_burtch_label"),
             }
         )
 
@@ -301,6 +426,7 @@ def sanitize_all(
                 "mof_id_raw": item["mof_id_raw"],
                 "mof_id": output_path.stem,
                 "status": "skipped_existing",
+                "ws24_burtch_label": item.get("ws24_burtch_label"),
             }
         else:
             report = sanitizer.sanitize(input_path, output_path)
@@ -309,6 +435,7 @@ def sanitize_all(
             report["mof_id_raw"] = item["mof_id_raw"]
             report["mof_id"] = output_path.stem
             report["status"] = "sanitized"
+            report["ws24_burtch_label"] = item.get("ws24_burtch_label")
 
         reports.append(report)
         n_done += 1
@@ -371,6 +498,7 @@ def build_registry_from_reports(
                 "n_atoms_raw": r.get("n_atoms_raw"),
                 "n_atoms_clean": r.get("n_atoms_clean"),
                 "n_warnings": len(r.get("warnings", [])),
+                "ws24_burtch_label": r.get("ws24_burtch_label"),
             }
         )
 
@@ -404,6 +532,7 @@ def save_sanitization_reports(reports: List[Dict], output_dir: Path) -> None:
                 "n_atoms_raw": r.get("n_atoms_raw"),
                 "n_atoms_clean": r.get("n_atoms_clean"),
                 "warnings_json": json.dumps(r.get("warnings", []), ensure_ascii=False),
+                "ws24_burtch_label": r.get("ws24_burtch_label"),
             }
         )
 
@@ -465,6 +594,27 @@ def main() -> None:
         help="Shuffle each source before taking the top N CIFs.",
     )
 
+    # ADDED: WS24 water-stability filter (core_mof_2019 only -- see
+    # discover_cifs()/collect_limited_cifs() docstrings for why this
+    # can't apply to arc_mof_charges).
+    parser.add_argument(
+        "--ws24-filter", action=argparse.BooleanOptionalAction, default=True,
+        help="Exclude core_mof_2019 MOFs with a WS24 Burtch water-stability "
+             "label below --ws24-min-label (default: on). Pass "
+             "--no-ws24-filter to disable.",
+    )
+    parser.add_argument(
+        "--ws24-min-label", type=int, default=3, choices=[1, 2, 3, 4],
+        help="Minimum Burtch stability label to keep: 1=unstable, "
+             "2=low kinetic stability, 3=high kinetic stability, "
+             "4=thermodynamic stability. Default 3.",
+    )
+    parser.add_argument(
+        "--ws24-exclude-unlabeled", action="store_true",
+        help="Also exclude core_mof_2019 MOFs with no WS24 entry at all "
+             "(default: keep them -- untested is not the same as unstable).",
+    )
+
     parser.add_argument(
         "--resume",
         action="store_true",
@@ -502,12 +652,26 @@ def main() -> None:
     inter_dir = out_dir / "intermediate"
     san_dir = inter_dir / "cifs_sanitized"
 
+    ws24_stability: Dict[str, int] = {}
+    if args.ws24_filter:
+        ws24_stability = load_ws24_stability(raw_dir)
+        if ws24_stability:
+            print(f"  WS24: loaded stability labels for {len(ws24_stability):,} refcodes "
+                  f"(keeping Burtch >= {args.ws24_min_label}; "
+                  f"unlabeled {'excluded' if args.ws24_exclude_unlabeled else 'kept'}).")
+        else:
+            print("  WS24: --ws24-filter is on but no labels.csv could be found/parsed "
+                  "under data/raw/ws24 -- filter will have no effect.")
+
     discovered = discover_cifs(
         raw_dir=raw_dir,
         max_core=args.max_core,
         max_arc=args.max_arc,
         shuffle_selection=args.shuffle_selection,
         seed=args.seed,
+        ws24_stability=(ws24_stability if args.ws24_filter else None),
+        ws24_min_label=args.ws24_min_label,
+        ws24_exclude_unlabeled=args.ws24_exclude_unlabeled,
     )
 
     if not discovered:
