@@ -126,12 +126,25 @@ def monotonicity_loss(
 
     pos_mu = (mu_diff > 0).float()               # where μ increased
 
+    pair_mask: Optional[torch.Tensor] = None
     if mask is not None:
         # Both positions in a pair must be real (not padded)
         pair_mask = (mask[:, 1:] & mask[:, :-1]).float()  # [B, P-1]
         pos_mu = pos_mu * pair_mask.unsqueeze(-1)
 
     violations = F.relu(-q_diff) * pos_mu        # penalise q↓ when μ↑
+    # FIX: violations.mean() used to divide by the FULL padded tensor size
+    # (B*(P-1)*n_components) even when a mask zeroed out padded pairs, so
+    # the same physical violation rate produced a smaller loss/gradient the
+    # more a batch happened to be padded -- making lambda_monotonic
+    # effectively batch-composition-dependent instead of a fixed weight.
+    # (Currently latent: configs/pipeline.yaml trains at batch_size=1, where
+    # there is no padding at all -- but it would have silently under-
+    # weighted this term the moment batch_size was increased.) Divide by
+    # the actual valid-element count when a mask is given.
+    if pair_mask is not None:
+        denom = pair_mask.sum() * n_components
+        return violations.sum() / denom.clamp(min=1.0)
     return violations.mean()
 
 
@@ -206,7 +219,17 @@ def competition_loss(
                 pos_mu_i = pos_mu_i * pair_mask
             # q_j should not increase when μ_i increases
             violations = F.relu(q_diff[..., j]) * pos_mu_i
-            penalty = penalty + violations.mean()
+            # FIX: violations.mean() divided by the full B*(P-1) padded
+            # size even when pair_mask zeroed out padded pairs, diluting
+            # this term's magnitude by the batch's padding ratio (same
+            # class of bug as monotonicity_loss above; also currently
+            # latent at batch_size=1). Divide by the actual valid-pair
+            # count when a mask is given.
+            if pair_mask is not None:
+                denom = pair_mask.sum().clamp(min=1.0)
+                penalty = penalty + violations.sum() / denom
+            else:
+                penalty = penalty + violations.mean()
             count  += 1
 
     return penalty / max(count, 1)

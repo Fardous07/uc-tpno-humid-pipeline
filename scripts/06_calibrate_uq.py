@@ -214,7 +214,19 @@ def collect_predictions(
             )
 
             y_pred = out["q_pred"] if isinstance(out, dict) else out
-            y_std = out.get("sigma", None) if isinstance(out, dict) else None
+            # FIX: build_model_from_config() always builds a TPNOEnsemble,
+            # whose forward() returns "total_uncertainty" (epistemic+aleatoric
+            # combined) -- it has no "sigma" key at all (that's only on the
+            # single-model ThermodynamicPotentialNO). out.get("sigma") was
+            # therefore always None for every ensemble checkpoint, silently
+            # discarding the model's real per-point uncertainty and falling
+            # back to _safe_sigma_fallback()'s single constant scalar for
+            # every calibration run. Check both keys so this works for
+            # either model type.
+            y_std = (
+                out.get("total_uncertainty", out.get("sigma", None))
+                if isinstance(out, dict) else None
+            )
 
             B, P, C = targets.shape
             D = conditions.shape[-1]

@@ -367,9 +367,20 @@ def run_nist_validation(
       1. Parse using parse_nist_isodb_json (already in io_utils)
       2. Fuzzy-match adsorbent name to registry MOF ID
       3. Convert pressure → bar, loading → mol/kg
-      4. Build normalised pure-component condition vector [μ_CO2, μ_N2, μ_H2O, T]
-      5. Query model; extract component loading; denormalize
+      4. Build the RAW pure-component condition vector [μ_CO2, μ_N2, μ_H2O, T]
+      5. Query model; extract component loading (already denormalized to
+         real mol/kg by the model's own denormalize_q())
       6. Accumulate MAE / RMSE
+
+    FIX: this used to pre-normalize the condition vector with mu_mean/mu_std
+    and then re-denormalize the model's output with q_std/q_mean. Both
+    steps were wrong: TPNOEnsemble.forward() already normalizes mu
+    internally (own registered buffers) and already returns q_pred
+    denormalized to real mol/kg (via denormalize_q()) -- so this was
+    double-normalizing the input and double-denormalizing the output for
+    every single NIST comparison point. The `normalization` parameter is
+    unused now (kept for call-site/signature stability); mu_mean/mu_std/
+    q_mean/q_std are no longer needed here.
     """
     nist_dir = Path(nist_dir)
     out_dir  = Path(out_dir)
@@ -383,17 +394,6 @@ def run_nist_validation(
         }
 
     registry_ids: List[str] = dataset.mof_ids
-
-    mu_mean = np.array(normalization.get("mu_mean", [0.0, 0.0, 0.0, 298.15]),
-                       dtype=np.float64)
-    mu_std  = np.array(normalization.get("mu_std",  [1.0, 1.0, 1.0, 1.0]),
-                       dtype=np.float64)
-    q_mean  = np.array(normalization.get("q_mean",  [0.0, 0.0, 0.0]),
-                       dtype=np.float64)
-    q_std   = np.array(normalization.get("q_std",   [1.0, 1.0, 1.0]),
-                       dtype=np.float64)
-    mu_std = np.where(mu_std > 0, mu_std, 1.0)
-    q_std  = np.where(q_std  > 0, q_std,  1.0)
 
     comp_names = ["CO2", "N2", "H2O"]
     eps = 1e-10
@@ -472,9 +472,16 @@ def run_nist_validation(
                 mu_raw[comp_idx] = math.log(p_bar + eps)
                 mu_raw[3]        = float(temperature)
 
-                mu_norm = (mu_raw - mu_mean) / mu_std
-                cond_t  = torch.tensor(
-                    mu_norm[np.newaxis, np.newaxis, :],
+                # FIX: this used to pre-normalize mu_raw with mu_mean/mu_std
+                # before calling the model. But TPNOEnsemble.forward() (and
+                # ThermodynamicPotentialNO.forward()) normalizes mu
+                # INTERNALLY via their own registered mu_mean/mu_std buffers
+                # (tpno.py: normalize_mu()) -- exactly like collect_predictions()
+                # above correctly passes raw batch["conditions"] straight
+                # through. Pre-normalizing here double-normalized every NIST
+                # comparison point, corrupting what the model actually saw.
+                cond_t = torch.tensor(
+                    mu_raw[np.newaxis, np.newaxis, :],
                     dtype=torch.float32, device=device,
                 )  # [1, 1, 4]
 
@@ -488,8 +495,15 @@ def run_nist_validation(
 
                 # FIX: use robust extractor instead of out["q_pred"] directly
                 q_tensor = _extract_q_pred(out)
-                q_norm   = float(q_tensor[0, 0, comp_idx].detach().cpu().numpy())
-                q_pred   = max(float(q_norm * q_std[comp_idx] + q_mean[comp_idx]), 0.0)
+                # FIX: q_tensor is already denormalized to real mol/kg by the
+                # model's own denormalize_q() (tpno.py:475) before forward()
+                # returns it -- exactly like collect_predictions() above uses
+                # model output directly with no further transform. Applying
+                # `* q_std + q_mean` again here re-denormalized an already
+                # denormalized value, compounding with the input-side bug
+                # above to produce doubly-wrong predictions for every NIST
+                # comparison point.
+                q_pred = max(float(q_tensor[0, 0, comp_idx].detach().cpu().numpy()), 0.0)
 
                 all_rows.append({
                     "file":                 jf.name,

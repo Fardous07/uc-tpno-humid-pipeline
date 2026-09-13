@@ -707,12 +707,24 @@ class PhysicsLossMonitor(Callback):
     - Warns if hessian_symmetry loss is not decreasing (Maxwell relation).
     - Records history for plotting.
 
-    Expected metric keys (produced by ThermodynamicLoss):
-        train/physics_hessian_symmetry
-        train/physics_monotonicity
-        train/physics_henry_law
+    Expected metric keys (produced by trainer.py's
+    ``result[f"train/physics_{k}"] = v / n`` from ThermodynamicLoss's
+    ``physics`` dict keys -- "hessian", "monotonic", "henry",
+    "competition", "gibbs_duhem"):
+        train/physics_hessian
+        train/physics_monotonic
+        train/physics_henry
         train/physics_competition
+        train/physics_gibbs_duhem
         convexity_violation_rate       (from ThermodynamicValidator)
+
+    FIX: this used to watch train/physics_hessian_symmetry,
+    train/physics_monotonicity, train/physics_henry_law -- none of which
+    trainer.py ever actually produces (only train/physics_competition
+    happened to match). Those three terms silently never appeared in
+    self.history or the periodic log line, and the "warmup complete"
+    check was the only part of this callback that still worked correctly
+    (it only depends on the epoch number, not these keys).
     """
 
     def __init__(
@@ -728,12 +740,14 @@ class PhysicsLossMonitor(Callback):
         self.history: List[Dict[str, Any]] = []
         self._warmup_logged = False
 
-    # Physics metric keys to watch
+    # Physics metric keys to watch (must match trainer.py's actual
+    # train/physics_{k} keys -- see the FIX note above)
     _PHYSICS_KEYS = (
-        "train/physics_hessian_symmetry",
-        "train/physics_monotonicity",
-        "train/physics_henry_law",
+        "train/physics_hessian",
+        "train/physics_monotonic",
+        "train/physics_henry",
         "train/physics_competition",
+        "train/physics_gibbs_duhem",
         "convexity_violation_rate",
     )
 

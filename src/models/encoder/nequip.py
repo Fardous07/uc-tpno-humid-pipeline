@@ -619,10 +619,28 @@ class NequIPEncoder(nn.Module):
         pos: torch.Tensor,
         edge_index: torch.Tensor,
         cell: Optional[torch.Tensor],
+        batch: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Compute edge vectors and lengths, applying minimum-image
         convention when ``use_pbc`` is True and a cell is provided.
+
+        FIX: cell is ``[n_graphs, 3, 3]`` -- graph_builder.py always emits
+        ``[1, 3, 3]`` per MOF, and PyG's default collation concatenates
+        that along dim 0, giving ``[B, 3, 3]`` for any real batch with
+        B > 1. The previous code did ``cell.squeeze()`` and only applied
+        the minimum-image correction when the result was exactly 2-D --
+        true for a lone graph (``[1,3,3]`` squeezes to ``[3,3]``) but
+        false the moment batch_size > 1 (``[B,3,3]`` has no size-1 dim to
+        squeeze away), which silently skipped PBC correction for the
+        *entire* batch with no warning. configs/pipeline.yaml currently
+        trains at batch_size=1, so this was latent -- but it would have
+        silently corrupted every periodic edge (bogus edge vectors,
+        artificially zeroed out once the resulting bogus lengths exceed
+        the cutoff envelope) the moment batch_size was increased for
+        throughput. Now indexes each edge's own graph's cell via
+        ``batch[src]``, which is correct for both a single graph and any
+        batch size.
 
         Returns ``(vec, lengths)`` each of shape ``[E, 3]`` and ``[E]``.
         """
@@ -630,15 +648,11 @@ class NequIPEncoder(nn.Module):
         vec = pos[dst] - pos[src]  # [E, 3]
 
         if self.use_pbc and cell is not None:
-            # Reshape cell to [3, 3] if batched as [1, 3, 3]
-            c = cell.squeeze()
-            if c.dim() == 2:
-                c = c.float()
-                # Fractional coords
-                c_inv = torch.linalg.inv(c)
-                frac = vec @ c_inv.T
-                frac = frac - torch.round(frac)
-                vec = frac @ c
+            edge_cell = cell[batch[src]].float()            # [E, 3, 3]
+            edge_cell_inv = torch.linalg.inv(edge_cell)      # [E, 3, 3]
+            frac = torch.einsum("ei,eji->ej", vec, edge_cell_inv)
+            frac = frac - torch.round(frac)
+            vec = torch.einsum("ej,ejk->ek", frac, edge_cell)
 
         lengths = torch.linalg.norm(vec, dim=-1)
         return vec, lengths
@@ -671,7 +685,7 @@ class NequIPEncoder(nn.Module):
             x = x + self.charge_proj(self._get_charges(data, x.shape[0], x.device))
 
         # ── Edge attributes ──────────────────────────────────────
-        vec, lengths = self._compute_edge_vectors(pos, edge_index, cell)
+        vec, lengths = self._compute_edge_vectors(pos, edge_index, cell, batch)
 
         # Spherical harmonics of unit edge vectors
         unit_vec = vec / (lengths.unsqueeze(-1) + 1e-8)
@@ -719,7 +733,7 @@ class NequIPEncoder(nn.Module):
         x = self.node_embedding(z) * math.sqrt(self.emb_dim)
         if self.use_charges:
             x = x + self.charge_proj(self._get_charges(data, x.shape[0], x.device))
-        vec, lengths = self._compute_edge_vectors(pos, edge_index, cell)
+        vec, lengths = self._compute_edge_vectors(pos, edge_index, cell, batch)
         unit_vec = vec / (lengths.unsqueeze(-1) + 1e-8)
         edge_sh = o3.spherical_harmonics(
             list(range(self.config.lmax + 1)),

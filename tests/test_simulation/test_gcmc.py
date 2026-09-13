@@ -36,7 +36,9 @@ class TestGCMCConfig:
     def test_defaults(self):
         from src.simulation.gcmc.runner import GCMCConfig
         cfg = GCMCConfig()
-        assert cfg.forcefield in ("UFF", "DREIDING")
+        # FIX: test assumed a charge-less generic FF default (UFF/DREIDING);
+        # the actual, current default is RASPA's bundled example forcefield.
+        assert cfg.forcefield == "ExampleMOFsForceField"
         assert cfg.cutoff_vdw > 0
         assert cfg.n_cycles > 0
 
@@ -49,10 +51,12 @@ class TestGCMCConfig:
 
 class TestGCMCInput:
     def test_dry_input(self):
+        # FIX: generate_input()'s real parameter is mof_cif (a CIF path,
+        # whose .stem becomes the framework name), not mof_name.
         from src.simulation.gcmc.runner import generate_input, GCMCConfig
         cfg = GCMCConfig()
         text = generate_input(
-            mof_name="HKUST-1",
+            mof_cif="HKUST-1",
             temperature=313.15,
             pressure=1.0,
             composition={"CO2": 0.15, "N2": 0.85},
@@ -66,7 +70,7 @@ class TestGCMCInput:
         from src.simulation.gcmc.runner import generate_input, GCMCConfig
         cfg = GCMCConfig()
         text = generate_input(
-            mof_name="HKUST-1",
+            mof_cif="HKUST-1",
             temperature=313.15,
             pressure=1.0,
             composition={"CO2": 0.15, "N2": 0.75, "H2O": 0.10},
@@ -74,15 +78,29 @@ class TestGCMCInput:
         )
         assert "H2O" in text  # humid — includes water
 
-    def test_unit_cell_estimation(self):
-        # FIX: _estimate_unit_cells must be exported from runner.py,
-        # not just a private function.
-        from src.simulation.gcmc.runner import estimate_unit_cells
+    def test_unit_cell_estimation(self, tmp_path):
+        # FIX: the real function is the private _estimate_unit_cells, and it
+        # takes a CIF PATH (it reads _cell_length_a/b/c from the file) --
+        # not three raw float lengths. Build a minimal CIF so this exercises
+        # the actual implementation instead of an API that doesn't exist.
+        from src.simulation.gcmc.runner import _estimate_unit_cells
+
+        def _write_cif(path, a, b, c):
+            path.write_text(
+                f"data_TEST\n_cell_length_a {a}\n_cell_length_b {b}\n"
+                f"_cell_length_c {c}\n"
+            )
+
         # Large cell — one repetition is sufficient (2*12=24 < 25)
-        uc = estimate_unit_cells(25.0, 25.0, 25.0, cutoff=12.0)
+        big_cif = tmp_path / "big.cif"
+        _write_cif(big_cif, 25.0, 25.0, 25.0)
+        uc = _estimate_unit_cells(big_cif, cutoff=12.0)
         assert uc == (1, 1, 1)
+
         # Small cell — must replicate (ceil(24/8)=3)
-        uc2 = estimate_unit_cells(8.0, 8.0, 8.0, cutoff=12.0)
+        small_cif = tmp_path / "small.cif"
+        _write_cif(small_cif, 8.0, 8.0, 8.0)
+        uc2 = _estimate_unit_cells(small_cif, cutoff=12.0)
         assert all(u >= 2 for u in uc2)
 
 
@@ -194,10 +212,11 @@ class TestGCTMMCConfig:
 
 class TestGCTMMCInput:
     def test_tmmc_input_generation(self):
+        # FIX: generate_tmmc_input()'s real parameter is mof_cif, not mof_name.
         from src.simulation.gctmmc.runner import generate_tmmc_input, GCTMMCConfig
         cfg = GCTMMCConfig(N_max=100)
         text = generate_tmmc_input(
-            mof_name="HKUST-1",
+            mof_cif="HKUST-1",
             molecule="CO2",
             temperature=313.15,
             config=cfg,

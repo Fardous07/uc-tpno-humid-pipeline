@@ -468,20 +468,31 @@ def _write_clean_p1_cif(
 def _remove_overlaps_with_ase(
     cif_path: Path,
     overlap_tol: float,
-) -> Tuple[Optional[Dict[str, float]], List[Dict[str, Any]]]:
+) -> Tuple[Optional[Dict[str, float]], List[Dict[str, Any]], List[bool]]:
     """
     Optional cleanup pass:
       - read CIF with ASE
       - remove very close duplicate/overlapping atoms
       - return cleaned scaled positions
+
+    FIX: now also returns the per-input-atom ``keep`` mask (all-True when
+    no overlap removal happens at all, e.g. the len(atoms) < 2 branch).
+    Every returned row's "charge" is a placeholder 0.0 -- real charges
+    live only in the caller's original atom_rows -- and previously the
+    caller could only restore them when the atom COUNT was unchanged
+    (``len(ase_rows2) == len(atom_rows)``), so as soon as this function
+    actually dropped even one overlapping atom, EVERY remaining atom in
+    that MOF silently kept charge=0.0 with no warning. The keep mask lets
+    the caller align surviving atoms to their real original charges even
+    when atoms were removed.
     """
     if not _ASE_AVAILABLE:
-        return None, []
+        return None, [], []
 
     try:
         atoms = ase_read(str(cif_path))
     except Exception:
-        return None, []
+        return None, [], []
 
     if len(atoms) < 2:
         try:
@@ -514,12 +525,12 @@ def _remove_overlaps_with_ase(
                     "charge": 0.0,
                 }
             )
-        return cell, rows
+        return cell, rows, [True] * len(atoms)
 
     try:
         from ase.geometry import get_distances
     except Exception:
-        return None, []
+        return None, [], []
 
     try:
         D, _ = get_distances(
@@ -528,7 +539,7 @@ def _remove_overlaps_with_ase(
             pbc=True,
         )
     except Exception:
-        return None, []
+        return None, [], []
 
     keep = [True] * len(atoms)
     for i in range(len(atoms)):
@@ -572,7 +583,7 @@ def _remove_overlaps_with_ase(
             }
         )
 
-    return cell, rows
+    return cell, rows, keep
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -666,15 +677,39 @@ class CIFSanitizer:
                     tmp_cif = Path(tmp.name)
 
                 _write_clean_p1_cif(tmp_cif, data_name, cell, atom_rows)
-                ase_cell2, ase_rows2 = _remove_overlaps_with_ase(
+                ase_cell2, ase_rows2, keep_mask = _remove_overlaps_with_ase(
                     tmp_cif,
                     overlap_tol=self.overlap_tol,
                 )
 
                 if ase_cell2 is not None and len(ase_rows2) >= self.min_atoms:
-                    if len(ase_rows2) == len(atom_rows):
-                        for i in range(len(ase_rows2)):
-                            ase_rows2[i]["charge"] = atom_rows[i].get("charge", 0.0)
+                    # FIX: previously only restored real charges when the
+                    # atom count was unchanged (no overlaps removed) --
+                    # any MOF where even one overlapping atom got dropped
+                    # silently kept charge=0.0 for every remaining atom,
+                    # with no warning. Use the keep mask to align
+                    # surviving atoms to their real original charges even
+                    # when atoms were removed.
+                    if len(keep_mask) == len(atom_rows):
+                        surviving_charges = [
+                            atom_rows[i].get("charge", 0.0)
+                            for i, k in enumerate(keep_mask) if k
+                        ]
+                        if len(surviving_charges) == len(ase_rows2):
+                            for i in range(len(ase_rows2)):
+                                ase_rows2[i]["charge"] = surviving_charges[i]
+                        else:
+                            report["warnings"].append(
+                                "Overlap removal changed atom count in an "
+                                "unexpected way; charges could not be "
+                                "re-aligned and are set to 0.0."
+                            )
+                    else:
+                        report["warnings"].append(
+                            "Overlap-removal keep-mask length did not match "
+                            "the original atom count; charges could not be "
+                            "re-aligned and are set to 0.0."
+                        )
 
                     cleaned_cell = ase_cell2
                     cleaned_rows = ase_rows2

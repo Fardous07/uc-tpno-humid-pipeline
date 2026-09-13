@@ -112,7 +112,24 @@ def parse_raspa_output(
         logger.warning("No RASPA output files in %s — returning empty result.", out_dir)
         return {"loadings": {}, "converged": False}
 
-    accumulated: Dict[str, List[float]] = {}
+    # BUG FIX: mol/kg and molecules/unit-cell readings used to share one
+    # accumulator list per species. Real RASPA output always prints the
+    # "[molecules/unit cell]" line BEFORE "[mol/kg framework]" for each
+    # component, so the old `current_species not in accumulated` guard was
+    # always true on that first line and silently seeded the accumulator
+    # with a raw molecules/unit-cell count -- then the correct mol/kg value
+    # for the same component was appended to the SAME list, and
+    # np.mean() averaged two numbers in different units together
+    # (verified: this produced 7.898 instead of the correct 3.456 mol/kg on
+    # authentic RASPA-format output -- a genuine, silent unit-mixing bug
+    # that would have corrupted every loading value parsed through this
+    # function, e.g. every GCMC job run via
+    # scripts/08_active_learning_loop.py's active-learning loop). Track the
+    # two units in separate accumulators and only fall back to the
+    # molecules/unit-cell proxy for a species that never got a real mol/kg
+    # reading.
+    mol_kg_accum: Dict[str, List[float]] = {}
+    moluc_accum: Dict[str, List[float]] = {}
 
     for fp in data_files:
         current_species: Optional[str] = None
@@ -124,20 +141,24 @@ def parse_raspa_output(
             if current_species is not None:
                 m = _RE_MOL_KG.search(line)
                 if m:
-                    accumulated.setdefault(current_species, []).append(float(m.group(1)))
+                    mol_kg_accum.setdefault(current_species, []).append(float(m.group(1)))
                     continue
-                # Fallback: molecules/unit cell (stored as proxy if mol/kg absent)
                 m2 = _RE_MOLEC_UC.search(line)
-                if m2 and current_species not in accumulated:
-                    logger.warning(
-                        "Species %s: mol/kg not found; using molecules/uc as proxy.",
-                        current_species,
-                    )
-                    accumulated.setdefault(current_species, []).append(float(m2.group(1)))
+                if m2:
+                    moluc_accum.setdefault(current_species, []).append(float(m2.group(1)))
 
-    averaged: Dict[str, float] = {
-        sp: float(np.mean(vals)) for sp, vals in accumulated.items()
-    }
+    averaged: Dict[str, float] = {}
+    for sp in set(mol_kg_accum) | set(moluc_accum):
+        if sp in mol_kg_accum:
+            averaged[sp] = float(np.mean(mol_kg_accum[sp]))
+        else:
+            logger.warning(
+                "Species %s: mol/kg not found; using molecules/uc as proxy "
+                "(different units -- not a real mol/kg loading).",
+                sp,
+            )
+            averaged[sp] = float(np.mean(moluc_accum[sp]))
+
     return {"loadings": averaged, "converged": True}
 
 
