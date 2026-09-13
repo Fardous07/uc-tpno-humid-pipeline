@@ -144,12 +144,20 @@ TMC_BiasUpdate                {bias_update}
 TMC_CollectionMatrix          yes
 """
 
+# FIX: these used to name folders that don't exist in a real RASPA2
+# install ("TraPPE", and "TIP4P/2005" -- which additionally contains a
+# literal "/", so it was read as two nested directories "TIP4P/2005/",
+# not a label). Verified against an actual RASPA2 build: CO2.def, N2.def,
+# and H2O.def (added for this project's humid GCMC) all live directly
+# under molecules/ExampleDefinitions/. Confirmed this was silently
+# failing 100% of GC-TMMC jobs (54/54 in a real test run) with
+# "Cannot open .../molecules/TraPPE/CO2.def" before this fix.
 _MOLECULE_DEFS: Dict[str, str] = {
-    "CO2": "TraPPE",
-    "N2":  "TraPPE",
-    "H2O": "TIP4P/2005",
-    "CH4": "TraPPE",
-    "H2":  "Buch",
+    "CO2": "ExampleDefinitions",
+    "N2":  "ExampleDefinitions",
+    "H2O": "ExampleDefinitions",
+    "CH4": "ExampleDefinitions",
+    "H2":  "ExampleDefinitions",
 }
 
 

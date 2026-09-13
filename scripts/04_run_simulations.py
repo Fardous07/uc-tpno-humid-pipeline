@@ -712,6 +712,16 @@ def run_stage1_isotherms_gctmmc(
     job = 0
 
     ws_root = ensure_dir(output_dir / "stage1_gctmmc_workspace")
+    # FIX: GCTMMCConfig.n_init defaults to 50,000 (src/simulation/gctmmc/
+    # parser.py) and was never overridden here, so EVERY GC-TMMC job ran
+    # 50,000+ initialization cycles regardless of --n-cycles -- confirmed
+    # in a real test: a "--n-cycles 200" run generated
+    # "NumberOfInitializationCycles 50000" in the actual RASPA input file,
+    # making a single test job (meant to be near-instant) take 30+ minutes.
+    # At production scale (998 MOFs x 9 jobs) this would have made Stage 1
+    # "screening" many times more expensive than Stage 3. Scale n_init with
+    # n_cycles, matching the convention _common_header() already uses for
+    # regular GCMC elsewhere in this file.
     config = GCTMMCConfig(
         raspa_path=str(raspa_path),
         raspa_data_dir=str(runtime_root),
@@ -719,6 +729,7 @@ def run_stage1_isotherms_gctmmc(
         forcefield=forcefield,
         cutoff_vdw=cutoff,
         n_cycles=n_cycles,
+        n_init=max(200, n_cycles // 2),
         use_charges=use_charges,
         timeout=7200,
     )
@@ -848,6 +859,24 @@ def select_mofs_for_gcmc(
                               before Pareto selection (set False to disable
                               if H2O Stage 1 data is unavailable/incomplete)
     """
+    # FIX: if every single Stage 1 job failed, stage1_df is a completely
+    # empty, columnless DataFrame (pd.DataFrame([]) with no successful
+    # rows to infer columns from), and the .between() filter below used
+    # to raise an opaque "KeyError: 'temperature_k'" instead of pointing
+    # at the real problem. Caught in testing: this happened when
+    # GC-TMMC's molecule definitions pointed at a folder that doesn't
+    # exist, silently failing 100% of jobs -- the crash three lines later
+    # gave no hint why. Fail immediately with a clear, actionable message.
+    if stage1_df.empty or "temperature_k" not in stage1_df.columns:
+        raise RuntimeError(
+            "Stage 1 produced ZERO successful simulation results (every "
+            "job failed). This is not a 'no MOFs near this temperature' "
+            "situation -- something is broken before any physics ran. "
+            "Check the Stage 1 log output above for the actual RASPA "
+            "error (e.g. a missing molecule/forcefield file), fix that, "
+            "and rerun Stage 1 before selection can proceed."
+        )
+
     df = stage1_df.copy()
     df = df[df["temperature_k"].between(temperature_k - 1.0, temperature_k + 1.0)]
 
@@ -1104,8 +1133,28 @@ def main() -> None:
                    help="Cycles for Stage 3 (humid multicomponent GCMC, "
                         "the real training-label generator). Defaults to "
                         "--n-cycles if not given.")
-    p.add_argument("--temperatures", default="298.15,313.15,333.15")
-    p.add_argument("--pressures",    default="0.1,0.5,1.0,5.0,10.0")
+    p.add_argument("--temperatures", default="298.15,313.15,333.15",
+                   help="Stage 3 (real training data) temperature grid.")
+    p.add_argument("--pressures",    default="0.1,0.5,1.0,5.0,10.0",
+                   help="Stage 3 (real training data) pressure grid.")
+    # ADDED: select_mofs_for_gcmc() only ever reads ONE temperature
+    # (temps[0]) and only the lowest pressure point (Henry constant) plus
+    # min/max pressure (working-capacity interpolation) -- the rest of a
+    # full --temperatures x --pressures sweep is computed by Stage 1 and
+    # then silently never used. A separate, smaller Stage 1 grid gets the
+    # cheap-screening benefit GC-TMMC would have given (9 jobs/MOF at the
+    # defaults below: 1 temp x 3 pressures x 3 components) using the plain
+    # GCMC method that's actually proven to work, instead of GC-TMMC (which
+    # doesn't -- see --stage1-method's help).
+    p.add_argument("--stage1-temperatures", default=None,
+                   help="Stage 1 (screening) temperature grid. Defaults to "
+                        "just the first value in --temperatures if not given.")
+    p.add_argument("--stage1-pressures", default="0.1,1.0,10.0",
+                   help="Stage 1 (screening) pressure grid -- only the "
+                        "lowest point (Henry constant) and min/max "
+                        "(working-capacity interpolation) are actually "
+                        "used by MOF selection, so this can be much "
+                        "smaller than --pressures.")
     p.add_argument("--rhs",          default="0.0,0.05,0.15")
     p.add_argument("--dry-co2-frac", type=float, default=0.15)
     p.add_argument("--cutoff",       type=float, default=12.0)
@@ -1137,6 +1186,15 @@ def main() -> None:
     # Stage control (useful for resuming)
     p.add_argument("--skip-stage1",  action="store_true", help="Load existing stage1 parquet")
     p.add_argument("--skip-stage2",  action="store_true", help="Run GCMC on all (skip selection)")
+    # ADDED: for a two-phase parallel setup -- run this once, globally, to
+    # do Stage 1 (screening) + Stage 2 (selection) only, producing
+    # gcmc_selected_mofs.txt, then exit before the expensive Stage 3. Then
+    # parallel workers each run with --skip-stage1 --skip-stage2 on their
+    # own pre-assigned subset of the selected MOFs for Stage 3 only.
+    p.add_argument("--stop-after-stage2", action="store_true",
+                   help="Exit after Stage 2 selection, before Stage 3 (GCMC). "
+                        "For running Stage 1+2 once globally before "
+                        "parallelizing Stage 3 across workers.")
     # ADDED: GC-TMMC existed in src/simulation/gctmmc/ but nothing ever drove
     # it. 'gctmmc' gets a full isotherm per (MOF, component, T) from one
     # simulation instead of one GCMC run per (MOF, component, T, P) --
@@ -1188,6 +1246,15 @@ def main() -> None:
     pressures = parse_float_list(args.pressures)
     rhs      = parse_float_list(args.rhs)
 
+    # Stage 1's own (smaller) condition grid -- see --stage1-temperatures/
+    # --stage1-pressures help text for why this is deliberately separate
+    # from Stage 3's temps/pressures above.
+    stage1_temps = (
+        parse_float_list(args.stage1_temperatures)
+        if args.stage1_temperatures else [temps[0]]
+    )
+    stage1_pressures = parse_float_list(args.stage1_pressures)
+
     # RASPA setup
     raspa_share  = detect_raspa_share(raspa_dd)
     ff_name      = resolve_forcefield(raspa_share, args.forcefield)
@@ -1213,8 +1280,10 @@ def main() -> None:
     logger.info("=" * 65)
     logger.info(f"UC-TPNO SIMULATION PIPELINE")
     logger.info(f"  CIFs            : {len(all_cifs)}")
-    logger.info(f"  Temperatures (K): {temps}")
-    logger.info(f"  Pressures (bar) : {pressures}")
+    logger.info(f"  Stage 3 temps(K): {temps}")
+    logger.info(f"  Stage 3 press.  : {pressures}")
+    logger.info(f"  Stage 1 temps(K): {stage1_temps}")
+    logger.info(f"  Stage 1 press.  : {stage1_pressures}")
     logger.info(f"  RH values       : {rhs}")
     logger.info(f"  Dry CO2 frac    : {args.dry_co2_frac}")
     logger.info(f"  Valid cond/MOF  : {len(conditions)}")
@@ -1230,21 +1299,30 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Stage 1 — single-component pressure sweep (ALL MOFs)
     # ------------------------------------------------------------------
+    # ADDED: when both stages are skipped (the "Stage 3 only" mode used by
+    # parallel workers that already received a pre-selected MOF list from a
+    # prior global Stage 1+2 run), Stage 1 output is never used for
+    # anything -- Stage 2 is also skipped, so nothing reads stage1_df
+    # except a row-count log line. Don't waste time recomputing it.
     stage1_parquet = output_dir / "stage1_isotherms.parquet"
-    if args.skip_stage1 and stage1_parquet.exists():
+    if args.skip_stage1 and args.skip_stage2:
+        logger.info("\n[Stage 1] Skipped entirely (Stage 3-only mode: Stage 2 is also skipped, "
+                     "so Stage 1 output would be unused).")
+        stage1_df = pd.DataFrame()
+    elif args.skip_stage1 and stage1_parquet.exists():
         logger.info(f"\n[Stage 1] Skipped — loading {stage1_parquet}")
         stage1_df = pd.read_parquet(stage1_parquet)
     elif args.stage1_method == "gctmmc":
         stage1_df = run_stage1_isotherms_gctmmc(
             all_cifs, output_dir, runtime_root, raspa_path,
-            temps,
+            stage1_temps,
             args.n_cycles, args.keep_workspaces,
             ff_name, args.use_framework_charges, args.cutoff,
         )
     else:
         stage1_df = run_stage1_isotherms(
             all_cifs, output_dir, runtime_root, fw_cif_dir, raspa_path,
-            temps, pressures,
+            stage1_temps, stage1_pressures,
             args.n_cycles, args.keep_workspaces,
             ff_name, args.use_framework_charges, args.cutoff,
             co2_dir, n2_dir, h2o_dir,
@@ -1258,12 +1336,19 @@ def main() -> None:
         gcmc_cifs = all_cifs
         logger.info(f"\n[Stage 2] Skipped — using all {len(gcmc_cifs)} MOFs for GCMC")
     else:
+        # FIX: this used to reference Stage 3's temps/pressures (temps[0],
+        # max/min(pressures)) even though Stage 1 now runs its own,
+        # separate, smaller condition grid. If the two grids don't share
+        # a reference temperature, the "between(temperature_k +/- 1.0)"
+        # filter inside select_mofs_for_gcmc would match zero rows and
+        # (per the earlier fix) raise immediately instead of silently
+        # selecting nothing. Must reference Stage 1's own grid here.
         selected_ids = select_mofs_for_gcmc(
             stage1_df,
             gcmc_budget=args.gcmc_budget,
-            adsorption_pressure_bar=max(pressures),
-            desorption_pressure_bar=min(pressures),
-            temperature_k=temps[0],
+            adsorption_pressure_bar=max(stage1_pressures),
+            desorption_pressure_bar=min(stage1_pressures),
+            temperature_k=stage1_temps[0],
             exploration_fraction=args.exploration_fraction,
         )
         # Save selection list
@@ -1273,6 +1358,17 @@ def main() -> None:
 
         id_set   = set(selected_ids)
         gcmc_cifs = [c for c in all_cifs if c.stem in id_set]
+
+    if args.stop_after_stage2:
+        logger.info("\n" + "=" * 65)
+        logger.info("STOPPING AFTER STAGE 2 (--stop-after-stage2)")
+        logger.info(f"  Stage 1 rows       : {len(stage1_df)}")
+        logger.info(f"  MOFs selected      : {len(gcmc_cifs)}")
+        logger.info(f"  Selection file     : {output_dir / 'gcmc_selected_mofs.txt'}")
+        logger.info("Next: split the selected MOFs across parallel workers "
+                     "for Stage 3 (--skip-stage1 --skip-stage2 per worker).")
+        logger.info("=" * 65)
+        return
 
     # ------------------------------------------------------------------
     # Stage 3 — multicomponent GCMC on selected MOFs

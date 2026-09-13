@@ -28,19 +28,27 @@ logger = logging.getLogger(__name__)
 
 
 def find_worker_parquets(worker_dir: Path) -> list[Path]:
-    """Find all parquet files produced by worker subdirectories."""
+    """
+    Find each worker's own final adsorption_training.parquet.
+
+    FIX: this used to glob("*.parquet") inside each worker_* subdirectory,
+    which also picks up gcmc_adsorption.parquet (pre-dedup, same rows as
+    adsorption_training.parquet but not cleaned) and gcmc_failures.parquet
+    (a completely different schema: mof_id/temperature_k/pressure_bar/rh/
+    returncode/error_tail, no loading columns at all). Concatenating all
+    three together per worker silently produced a merged file mixing rows
+    from three different, incompatible tables. Now only collects each
+    worker's adsorption_training.parquet -- the one clean, deduplicated
+    file 04_run_simulations.py's build_training_dataset() actually writes.
+    """
     files: list[Path] = []
 
     # Worker subdirectories: worker_0/, worker_1/, ...
     for sub in sorted(worker_dir.glob("worker_*")):
         if not sub.is_dir():
             continue
-        for pq in sorted(sub.glob("*.parquet")):
-            files.append(pq)
-
-    # Also pick up any parquet directly in worker_dir (single-worker run)
-    for pq in sorted(worker_dir.glob("*.parquet")):
-        if pq.name != "adsorption_training.parquet":
+        pq = sub / "adsorption_training.parquet"
+        if pq.exists():
             files.append(pq)
 
     return sorted(set(files))
@@ -54,7 +62,7 @@ def validate_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     n_before = len(df)
 
     # Required columns
-    required = {"mof_id", "temperature", "pressure"}
+    required = {"mof_id", "temperature_k", "pressure_bar"}
     missing = required - set(df.columns)
     if missing:
         logger.warning("Missing expected columns: %s", missing)
@@ -65,8 +73,8 @@ def validate_dataframe(df: pd.DataFrame) -> pd.DataFrame:
         df = df.dropna(subset=loading_cols, how="all")
 
     # Drop non-positive pressure
-    if "pressure" in df.columns:
-        df = df[df["pressure"] > 0]
+    if "pressure_bar" in df.columns:
+        df = df[df["pressure_bar"] > 0]
 
     # Drop infinite values
     numeric_cols = df.select_dtypes(include=[np.number]).columns
@@ -113,7 +121,13 @@ def merge(worker_dir: Path, output_path: Path) -> None:
     logger.info("Merged: %d rows total", len(merged))
 
     # Deduplication — same MOF + conditions should not appear twice
-    id_cols = [c for c in ["mof_id", "temperature", "pressure", "relative_humidity"]
+    # FIX: was ["mof_id", "temperature", "pressure", "relative_humidity"],
+    # but the actual columns 04_run_simulations.py writes are
+    # temperature_k/pressure_bar/rh -- none of those three matched, so
+    # id_cols silently fell back to just ["mof_id"] and drop_duplicates
+    # collapsed all 45 conditions per MOF down to 1 row per MOF (verified:
+    # a 4-MOF/45-condition test run merged to 4 rows total instead of 180).
+    id_cols = [c for c in ["mof_id", "temperature_k", "pressure_bar", "rh"]
                if c in merged.columns]
     if id_cols:
         n_before = len(merged)
@@ -126,7 +140,8 @@ def merge(worker_dir: Path, output_path: Path) -> None:
     merged = validate_dataframe(merged)
 
     # Sort
-    sort_cols = [c for c in ["mof_id", "temperature", "pressure"] if c in merged.columns]
+    sort_cols = [c for c in ["mof_id", "temperature_k", "pressure_bar", "rh"]
+                 if c in merged.columns]
     if sort_cols:
         merged = merged.sort_values(sort_cols).reset_index(drop=True)
 
@@ -152,13 +167,24 @@ def merge(worker_dir: Path, output_path: Path) -> None:
         print("\nRows per MOF (first 10):")
         counts = merged.groupby("mof_id").size().sort_values(ascending=False)
         print(counts.head(10).to_string())
-        n_complete = (counts >= 36).sum()  # 3T × 4P × 3RH
-        print(f"\nMOFs with all 36 conditions complete: {n_complete}/{counts.shape[0]}")
+        # FIX: was hardcoded to 36 (3T x 4P x 3RH), stale for the actual
+        # condition grid this pipeline uses (3T x 5P x 3RH = 45, and this
+        # script has no way to know the exact grid a given run used
+        # anyway). Detect the expected per-MOF count dynamically instead
+        # of hardcoding a number that silently drifts out of sync with
+        # whatever --temperatures/--pressures/--rhs were actually passed.
+        full_count = int(counts.max()) if not counts.empty else 0
+        n_complete = (counts >= full_count).sum()
+        print(f"\nMOFs with all {full_count} conditions complete (detected from data): "
+              f"{n_complete}/{counts.shape[0]}")
 
+    # FIX: this used to hardcode the OLD data/processed/adsorption path
+    # regardless of --output, silently pointing users at stale/wrong data
+    # whenever --output was actually used (as the parallel launcher does).
     print("\nNext step:")
     print("  python scripts/05_train_model.py \\")
     print("    --registry data/mof_registry.parquet \\")
-    print("    --adsorption-data data/processed/adsorption/adsorption_training.parquet \\")
+    print(f"    --adsorption-data {output_path} \\")
     print("    --graph-dir data/processed/graphs \\")
     print("    --output-dir experiments/run_001 \\")
     print("    --config configs/pipeline.yaml --amp")
