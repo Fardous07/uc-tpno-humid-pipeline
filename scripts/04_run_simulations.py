@@ -1093,7 +1093,17 @@ def main() -> None:
                    help="Fraction of GCMC budget for diversity exploration")
 
     # Simulation parameters
-    p.add_argument("--n-cycles",    type=int,   default=5000)
+    p.add_argument("--n-cycles",    type=int,   default=5000,
+                   help="Cycles for Stage 1 (GCMC or GC-TMMC screening).")
+    # ADDED: separate cycle count for Stage 3 -- screening (Stage 1) only
+    # needs to rank MOFs relatively, so it can run cheap; Stage 3 produces
+    # the actual training labels, where noisier/under-converged loadings
+    # directly become noisier training data. None (default) reuses
+    # --n-cycles, so existing invocations are unaffected.
+    p.add_argument("--stage3-n-cycles", type=int, default=None,
+                   help="Cycles for Stage 3 (humid multicomponent GCMC, "
+                        "the real training-label generator). Defaults to "
+                        "--n-cycles if not given.")
     p.add_argument("--temperatures", default="298.15,313.15,333.15")
     p.add_argument("--pressures",    default="0.1,0.5,1.0,5.0,10.0")
     p.add_argument("--rhs",          default="0.0,0.05,0.15")
@@ -1135,6 +1145,8 @@ def main() -> None:
                    help="Stage 1 single-component screening method (default: gcmc).")
 
     args = p.parse_args()
+    if args.stage3_n_cycles is None:
+        args.stage3_n_cycles = args.n_cycles
 
     # Optional YAML override
     if args.config:
@@ -1207,6 +1219,8 @@ def main() -> None:
     logger.info(f"  Dry CO2 frac    : {args.dry_co2_frac}")
     logger.info(f"  Valid cond/MOF  : {len(conditions)}")
     logger.info(f"  GCMC budget     : {args.gcmc_budget} MOFs")
+    logger.info(f"  Stage 1 cycles  : {args.n_cycles}")
+    logger.info(f"  Stage 3 cycles  : {args.stage3_n_cycles}")
     logger.info(f"  Forcefield      : {ff_name}")
     logger.info(f"  CO2 mol dir     : {co2_dir}")
     logger.info(f"  N2  mol dir     : {n2_dir}")
@@ -1266,7 +1280,7 @@ def main() -> None:
     gcmc_df, _ = run_stage3_gcmc(
         gcmc_cifs, output_dir, runtime_root, fw_cif_dir, raspa_path,
         conditions,
-        args.n_cycles, args.keep_workspaces,
+        args.stage3_n_cycles, args.keep_workspaces,
         ff_name, args.use_framework_charges, args.cutoff,
         co2_dir, n2_dir, h2o_dir,
         args.max_retries, args.retry_delay,
