@@ -1009,11 +1009,35 @@ def run_stage3_gcmc(
     co2_dir: str, n2_dir: str, h2o_dir: str,
     max_retries: int = 3, retry_delay: int = 60,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    rows: List[Dict] = []
-    failures: List[Dict] = []
     ws_root = ensure_dir(output_dir / "stage3_workspace")
     total = len(cif_paths) * len(conditions)
     job = 0
+
+    # FIX: results used to live only in memory (`rows`) and hit disk once,
+    # in a single gcmc_adsorption.parquet write, after the *entire* loop
+    # finished. A crash/reboot partway through a worker's run (happened for
+    # real: a hard reboot mid-run lost 100% of a 15-worker Stage 3 run,
+    # hours of compute, not just the in-flight job) lost everything because
+    # nothing was ever written incrementally. Now each successful job is
+    # appended to a checkpoint CSV immediately, and a restart reloads it
+    # and skips already-completed (mof, condition) pairs instead of
+    # redoing them.
+    checkpoint_path = output_dir / "gcmc_adsorption.checkpoint.csv"
+    rows: List[Dict] = []
+    done_keys: set = set()
+    if checkpoint_path.exists() and checkpoint_path.stat().st_size > 0:
+        prior = pd.read_csv(checkpoint_path)
+        rows = prior.to_dict("records")
+        done_keys = {
+            (r["mof_id"], round(float(r["temperature_k"]), 3),
+             round(float(r["pressure_bar"]), 6), round(float(r["rh"]), 6))
+            for r in rows
+        }
+        logger.info(f"[Stage 3] Resuming: {len(done_keys)} jobs already "
+                    f"completed in a previous run (from {checkpoint_path.name})")
+    checkpoint_header_written = bool(done_keys)
+
+    failures: List[Dict] = []
 
     logger.info(f"\n[Stage 3] Multicomponent GCMC: {total} jobs across {len(cif_paths)} MOFs")
 
@@ -1022,6 +1046,10 @@ def run_stage3_gcmc(
         uc = determine_unit_cells(cif, cutoff)
         for cond in conditions:
             job += 1
+            key = (name, round(cond.temperature_k, 3),
+                   round(cond.pressure_bar, 6), round(cond.rh, 6))
+            if key in done_keys:
+                continue
             logger.info(
                 f"  [{job}/{total}] {name} | "
                 f"T={cond.temperature_k:.0f}K P={cond.pressure_bar:g}bar RH={cond.rh*100:.0f}%"
@@ -1038,7 +1066,7 @@ def run_stage3_gcmc(
                                 cif, ws, inp, max_retries, retry_delay)
             if res.ok:
                 parsed = parse_multi(res.combined_text)
-                rows.append({
+                row = {
                     "mof_id":        name,
                     "temperature_k": cond.temperature_k,
                     "pressure_bar":  cond.pressure_bar,
@@ -1058,7 +1086,14 @@ def run_stage3_gcmc(
                     "T":             cond.temperature_k,
                     "log":           str(res.log_path),
                     **parsed,
-                })
+                }
+                rows.append(row)
+                pd.DataFrame([row]).to_csv(
+                    checkpoint_path, mode="a",
+                    header=not checkpoint_header_written,
+                    index=False,
+                )
+                checkpoint_header_written = True
             else:
                 failures.append({
                     "mof_id": name, "temperature_k": cond.temperature_k,
