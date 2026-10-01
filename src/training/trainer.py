@@ -346,37 +346,33 @@ class TPNOTrainer:
         graphs: Any,
         conditions: torch.Tensor,
         mask: Optional[torch.Tensor],
+        target_err: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
         """
-        Call the loss module robustly across slightly different signatures.
+        Call the loss module with the arguments its signature accepts.
+
+        run_009: dispatch on the signature instead of retrying on
+        TypeError, which also swallowed genuine TypeErrors raised INSIDE
+        the loss and silently re-called it without mask / error bars.
         """
+        import inspect
         try:
+            params = inspect.signature(self.criterion.forward).parameters
+        except (TypeError, ValueError):
+            params = {}
+        if "model" in params and "conditions" in params:
+            kwargs: Dict[str, Any] = {}
+            if "mask" in params:
+                kwargs["mask"] = mask
+            if "target_err" in params:
+                kwargs["target_err"] = target_err
             loss_out = self.criterion(
-                predictions,
-                targets,
-                self.model,
-                graphs,
-                conditions,
-                mask=mask,
+                predictions, targets, self.model, graphs, conditions, **kwargs
             )
-        except TypeError:
-            try:
-                loss_out = self.criterion(
-                    predictions,
-                    targets,
-                    self.model,
-                    graphs,
-                    conditions,
-                )
-            except TypeError:
-                try:
-                    loss_out = self.criterion(
-                        predictions,
-                        targets,
-                        mask=mask,
-                    )
-                except TypeError:
-                    loss_out = self.criterion(predictions, targets)
+        elif "mask" in params:
+            loss_out = self.criterion(predictions, targets, mask=mask)
+        else:
+            loss_out = self.criterion(predictions, targets)
 
         if isinstance(loss_out, torch.Tensor):
             return {
@@ -437,6 +433,9 @@ class TPNOTrainer:
 
         for i, batch in enumerate(self.train_loader):
             graphs, conditions, targets, mask = self._to_device(batch, self.device)
+            target_err = batch.get("loading_errs")
+            if target_err is not None:
+                target_err = target_err.to(self.device)
 
             with torch.amp.autocast("cuda", enabled=self._scaler is not None):
                 predictions = self.model(
@@ -452,6 +451,7 @@ class TPNOTrainer:
                     graphs=graphs,
                     conditions=conditions,
                     mask=mask,
+                    target_err=target_err,
                 )
                 loss = losses["total"]
 

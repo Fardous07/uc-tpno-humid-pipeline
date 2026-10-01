@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
+import math
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -22,7 +24,8 @@ class LossConfig:
     lambda_competition: float = 0.05
     lambda_gibbs_duhem: float = 0.0
     lambda_aux:         float = 0.3
-    henry_mu_threshold: float = -5.0   # μ < threshold → Henry region
+    # run_009: threshold on ln(f / 1 bar) = μ/RT (was on raw μ in kJ/mol).
+    henry_mu_threshold: float = -2.3   # ln(0.1 bar): dilute region
     use_nll:            bool  = True
     # --- run_006: robust data loss ---------------------------------------
     # Huber ("smooth L1") on the data term: quadratic for |resid| < delta,
@@ -32,6 +35,18 @@ class LossConfig:
     # Ignored when use_nll is True and a sigma head is available.
     use_huber:          bool  = True
     huber_delta:        float = 1.0
+    # --- run_009 ----------------------------------------------------------
+    # Variance head: trained with a Gaussian NLL on a STOP-GRADIENT copy of
+    # the prediction, so σ learns the residual scale without pulling the
+    # mean away from the robust (Huber) fit. 0 disables.
+    lambda_nll:         float = 1.0
+    # Penalty on negative predicted loadings (n = c·∂Φ/∂μ can be < 0;
+    # physically n ≥ 0). mean(relu(−n)²) in mol/kg.
+    lambda_negative:    float = 1.0
+    # Weight data points by the GCMC block-average error bars:
+    # w ∝ 1 / (σ_z² + floor²), σ_z = error in normalised log space.
+    use_error_weights:  bool  = True
+    error_weight_floor: float = 0.05
 
 
 # ---------------------------------------------------------------------------
@@ -72,6 +87,48 @@ def data_loss_huber(
         m = mask.unsqueeze(-1).expand_as(q_pred)   # [B, P, C]
         return F.huber_loss(q_pred[m], q_true[m], delta=delta)
     return F.huber_loss(q_pred, q_true, delta=delta)
+
+
+def data_loss_huber_weighted(
+    q_pred:  torch.Tensor,
+    q_true:  torch.Tensor,
+    weights: torch.Tensor,
+    mask:    Optional[torch.Tensor] = None,
+    delta:   float = 1.0,
+) -> torch.Tensor:
+    """Point-weighted Huber loss: Σ w·huber / Σ w over valid points."""
+    per = F.huber_loss(q_pred, q_true, delta=delta, reduction="none")
+    if mask is not None:
+        m = mask.unsqueeze(-1).expand_as(q_pred)
+        per, weights = per[m], weights[m]
+    return (weights * per).sum() / weights.sum().clamp(min=1e-12)
+
+
+def error_bar_weights(
+    targets:    torch.Tensor,            # [B, P, C] mol/kg
+    target_err: torch.Tensor,            # [B, P, C] mol/kg, NaN where unknown
+    q_std:      torch.Tensor,            # [C] std of the transformed target
+    log1p:      bool,
+    floor:      float,
+    mask:       Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    Inverse-variance weights from the GCMC error bars, expressed in the
+    loss's normalised space: z = (T(n) − m)/s, so σ_z = σ_n · T'(n) / s with
+    T'(n) = 1/(1+n) for log1p. w = 1/(σ_z² + floor²); the floor stops points
+    with a (near-)zero error bar (e.g. water at 0 % RH) from dominating.
+    Unknown errors get the median weight. Weights are scaled to mean 1.
+    """
+    deriv = 1.0 / (1.0 + targets.clamp(min=0.0)) if log1p else torch.ones_like(targets)
+    sigma_z = target_err * deriv / q_std
+    w = 1.0 / (sigma_z.pow(2) + floor ** 2)
+    valid = torch.isfinite(w)
+    if mask is not None:
+        valid = valid & mask.unsqueeze(-1).expand_as(w)
+    fill = w[valid].median() if valid.any() else torch.tensor(1.0, device=w.device)
+    w = torch.where(torch.isfinite(w), w, fill)
+    sel = mask.unsqueeze(-1).expand_as(w) if mask is not None else torch.ones_like(w, dtype=torch.bool)
+    return w / w[sel].mean().clamp(min=1e-12)
 
 
 def data_loss_nll(
@@ -152,38 +209,47 @@ def henry_law_loss(
     q_pred:        torch.Tensor,
     conditions:    torch.Tensor,
     n_components:  int   = 3,
-    mu_threshold:  float = -5.0,
+    mu_threshold:  float = -2.3,
+    mask:          Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
-    Enforce Henry's law in the dilute limit.
+    Henry's law in the dilute limit: n_i = K_H,i(T) · f_i, with the
+    fugacity f_i = exp(μ_i / RT) (μ in kJ/mol, f in bar; see
+    src.utils.chemistry). K_H,i = n_i / f_i should therefore be constant
+    across dilute points of the SAME MOF at the SAME temperature.
 
-    Henry's law: q_i = K_H,i · P_i  with P_i = exp(μ_i / RT).
-    Setting RT = 1 in our μ units:  q_i = K_H,i · exp(μ_i).
-    → K_H,i = q_i / exp(μ_i) should be CONSTANT across the Henry region.
+    run_009 FIX: the previous version used exp(μ) (i.e. RT = 1 with μ in
+    kJ/mol -- wrong units) and pooled points at different temperatures,
+    although K_H depends on T. Now: f = exp(μ/RT), dilute = ln f < mu_threshold
+    (default ln 0.1 bar) for that component, trace species (f < 1e-8 bar,
+    e.g. water at 0 % RH) excluded, and the coefficient of variation of K_H
+    is penalised within each (MOF, T) group.
 
-    FIX vs. original: original compared q vs. μ linearly (wrong physics).
-    Correct formulation: penalise the coefficient of variation of K_H.
-
-    conditions : [B, P, D]
+    conditions : [B, P, D] with T in the last column.
     """
-    mu = conditions[..., :n_components]           # [B, P, n_comp]
-    henry_mask = (mu < mu_threshold).all(dim=-1)  # [B, P] bool
-
-    if not henry_mask.any():
-        return torch.tensor(0.0, device=q_pred.device)
-
-    q_henry  = q_pred[henry_mask]                 # [N, n_comp]
-    mu_henry = mu[henry_mask]                     # [N, n_comp]
-
-    # P_eff = exp(μ) — clamp to avoid overflow for very negative μ
-    P_eff = torch.exp(mu_henry.clamp(min=-50.0, max=0.0))   # [N, n_comp]
-    K_H   = q_henry / (P_eff + 1e-8)                        # [N, n_comp]
-
-    # Penalise variance of K_H relative to its mean
-    # (coefficient of variation → dimensionless, scale-invariant)
-    K_H_mean = K_H.mean(dim=0, keepdim=True)                # [1, n_comp]
-    cv       = (K_H - K_H_mean) / (K_H_mean.abs() + 1e-8)  # [N, n_comp]
-    return cv.pow(2).mean()
+    R_KJ = 8.314462618e-3
+    mu = conditions[..., :n_components]                     # [B, P, C]
+    T  = conditions[..., -1:].clamp(min=1.0)                # [B, P, 1]
+    ln_f = mu / (R_KJ * T)                                  # [B, P, C]
+    dilute = (ln_f < mu_threshold) & (ln_f > math.log(1e-8))
+    if mask is not None:
+        dilute = dilute & mask.unsqueeze(-1)
+    K = q_pred / torch.exp(ln_f.clamp(min=-40.0, max=5.0))
+    terms = []
+    Tr = T.squeeze(-1).round()
+    for b in range(q_pred.shape[0]):
+        for t in torch.unique(Tr[b]):
+            sel_t = Tr[b] == t
+            for c in range(n_components):
+                m = dilute[b, :, c] & sel_t
+                if m.sum() < 2:
+                    continue
+                k = K[b, m, c]
+                cv = (k - k.mean()) / (k.mean().abs() + 1e-8)
+                terms.append(cv.pow(2).mean())
+    if not terms:
+        return torch.zeros((), device=q_pred.device)
+    return torch.stack(terms).mean()
 
 
 def competition_loss(
@@ -321,66 +387,116 @@ class ThermodynamicLoss(nn.Module):
         graphs:      Any,
         conditions:  torch.Tensor,
         mask:        Optional[torch.Tensor] = None,   # [B, P] bool
+        target_err:  Optional[torch.Tensor] = None,   # [B, P, C] mol/kg, NaN = unknown
     ) -> Dict[str, torch.Tensor]:
         """
-        predictions : dict with keys q_pred [B,P,C], optionally sigma [B,P,C]
-        targets     : [B, P, C]  (may contain zeros at padded positions)
-        mask        : [B, P] bool — True where data is real, False where padded
+        predictions : model output. For an ensemble it contains the
+                      per-member stacks all_predictions [M,B,P,C],
+                      all_log_var, all_q_aux; each member is trained on its
+                      OWN prediction (deep ensemble). A single model's
+                      q_pred / log_var / q_aux are treated as M = 1.
+        targets     : [B, P, C] simulated loadings (mol/kg)
+        mask        : [B, P] bool -- True where data is real, False where padded
+        target_err  : GCMC block-average error bars; used for weighting when
+                      config.use_error_weights is True.
         """
         c = self.config
-
-        q_pred = predictions["q_pred"]
-        n_comp = q_pred.shape[-1]
-
+        q_mean_pred = predictions["q_pred"]
+        n_comp = q_mean_pred.shape[-1]
         if conditions.dim() == 2:
             conditions = conditions.unsqueeze(1)
 
-        # --- Data loss in NORMALIZED (transformed) units ---
-        # run_007: use the model's normalize_q so the loss automatically
-        # respects config.target_transform (e.g. log1p) and stays consistent
-        # with denormalize_q. For target_transform="identity" this reduces to
-        # the previous linear (q - q_mean) / q_std standardization.
         base = model.models[0] if hasattr(model, "models") else model
-        q_pred_n  = base.normalize_q(q_pred)
+        log1p = getattr(base.config, "target_transform", "identity") == "log1p"
+
+        # Per-member stacks (M = 1 for a single model)
+        preds = predictions.get("all_predictions", q_mean_pred.unsqueeze(0))
+        logvs = predictions.get("all_log_var")
+        if logvs is None and "log_var" in predictions:
+            logvs = predictions["log_var"].unsqueeze(0)
+        auxs = predictions.get("all_q_aux")
+        if auxs is None and "q_aux" in predictions:
+            auxs = predictions["q_aux"].unsqueeze(0)
+
         targets_n = base.normalize_q(targets)
 
-        sigma = predictions.get("sigma")
-        if c.use_nll and sigma is not None:
-            # Heteroscedastic NLL takes precedence when a sigma head is active.
-            d_loss = data_loss_nll(q_pred_n, targets_n, sigma, mask=mask)
-        else:
-            # run_006: robust Huber (or MSE) data term.
-            d_loss = self._data_term(q_pred_n, targets_n, mask=mask)
+        weights = None
+        if c.use_error_weights and target_err is not None:
+            weights = error_bar_weights(
+                targets, target_err, base.q_std, log1p,
+                c.error_weight_floor, mask=mask,
+            )
+
+        def fit_term(pred_n: torch.Tensor) -> torch.Tensor:
+            if weights is not None:
+                return data_loss_huber_weighted(
+                    pred_n, targets_n, weights, mask=mask,
+                    delta=getattr(c, "huber_delta", 1.0),
+                )
+            return self._data_term(pred_n, targets_n, mask=mask)
 
         physics: Dict[str, torch.Tensor] = {}
+
+        # --- Data term, averaged over ensemble members ---
+        d_terms = []
+        nll_terms = []
+        for m in range(preds.shape[0]):
+            pred_n = base.normalize_q(preds[m])
+            if c.use_nll and logvs is not None:
+                # legacy: NLL drives the mean as well
+                sig = torch.exp(0.5 * logvs[m])
+                d_terms.append(data_loss_nll(pred_n, targets_n, sig, mask=mask))
+            else:
+                d_terms.append(fit_term(pred_n))
+                if c.lambda_nll > 0 and logvs is not None:
+                    # σ head: NLL against a stop-gradient copy of the mean
+                    sig = torch.exp(0.5 * logvs[m])
+                    nll_terms.append(data_loss_nll(pred_n.detach(), targets_n, sig, mask=mask))
+        d_loss = torch.stack(d_terms).mean()
         total = c.lambda_data * d_loss
 
-        # Auxiliary direct-head loss (trains the encoder with a
-        # first-order signal; the ICNN remains the physics predictor)
-        q_aux = predictions.get("q_aux")
-        if q_aux is not None and getattr(c, "lambda_aux", 0.0) > 0:
-            q_aux_n = base.normalize_q(q_aux)
-            aux_loss = self._data_term(q_aux_n, targets_n, mask=mask)
+        if nll_terms:
+            nll = torch.stack(nll_terms).mean()
+            physics["nll_sigma"] = nll
+            total = total + c.lambda_nll * nll
+
+        # --- Auxiliary direct-head term (first-order signal to the encoder) ---
+        if auxs is not None and getattr(c, "lambda_aux", 0.0) > 0:
+            aux_loss = torch.stack(
+                [fit_term(base.normalize_q(auxs[m])) for m in range(auxs.shape[0])]
+            ).mean()
             physics["aux"] = aux_loss
             total = total + c.lambda_aux * aux_loss
 
-        # --- Hessian symmetry (Maxwell relations) ---
+        # --- Negative loadings (n = c·∂Φ/∂μ is not sign-constrained) ---
+        if c.lambda_negative > 0:
+            neg = F.relu(-preds)
+            if mask is not None:
+                mm = mask.unsqueeze(0).unsqueeze(-1).expand_as(neg)
+                neg_loss = neg[mm].pow(2).mean() if mm.any() else neg.sum() * 0
+            else:
+                neg_loss = neg.pow(2).mean()
+            physics["negative"] = neg_loss
+            total = total + c.lambda_negative * neg_loss
+
+        q_pred = q_mean_pred
+
+        # --- Hessian symmetry (exact by construction since run_009; kept for ablations) ---
         if c.lambda_hessian > 0:
             hess  = model.get_hessian(graphs, conditions)
             h_loss = hessian_symmetry_loss(hess)
             physics["hessian"] = h_loss
             total = total + c.lambda_hessian * h_loss
 
-        # The remaining physics losses need at least 2 pressure points
+        # The remaining physics losses need at least 2 points per MOF
         if conditions.shape[1] > 1:
-
             if c.lambda_monotonic > 0:
                 m_loss = monotonicity_loss(q_pred, conditions, n_comp, mask=mask)
                 physics["monotonic"] = m_loss
                 total = total + c.lambda_monotonic * m_loss
 
             if c.lambda_henry > 0:
-                hl = henry_law_loss(q_pred, conditions, n_comp, c.henry_mu_threshold)
+                hl = henry_law_loss(q_pred, conditions, n_comp, c.henry_mu_threshold, mask=mask)
                 physics["henry"] = hl
                 total = total + c.lambda_henry * hl
 

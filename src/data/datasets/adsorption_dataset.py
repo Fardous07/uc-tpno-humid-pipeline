@@ -61,6 +61,9 @@ class AdsorptionDataset(Dataset):
 
         self.condition_columns = condition_columns
         self.target_columns = target_columns
+        # run_009: GCMC error bars, e.g. co2_loading_molkg_err (NaN where a
+        # result predates error recording or the column is absent).
+        self.error_columns = [f"{c}_err" for c in target_columns]
 
         # --- registry (MOF metadata) ---
         rp = Path(registry_path)
@@ -140,12 +143,17 @@ class AdsorptionDataset(Dataset):
         loadings = torch.tensor(
             df[self.target_columns].values, dtype=torch.float32
         )
+        errs = torch.tensor(
+            df.reindex(columns=self.error_columns).values.astype("float64"),
+            dtype=torch.float32,
+        )                                   # [P, C], NaN where unknown
 
         return {
             "mof_id":     mof_id,
             "graphs":     graph,
             "conditions": conditions,   # [P, D]
             "loadings":   loadings,     # [P, C]  (RAW mol/kg)
+            "loading_errs": errs,       # [P, C]  GCMC error bars (mol/kg), NaN = unknown
             "n_points":   len(conditions),
         }
 
@@ -190,12 +198,15 @@ class AdsorptionDataset(Dataset):
 
         conditions = torch.zeros(B, P_max, D)
         loadings   = torch.zeros(B, P_max, C)
+        errs       = torch.full((B, P_max, C), float("nan"))
         mask       = torch.zeros(B, P_max, dtype=torch.bool)
 
         for i, item in enumerate(batch):
             p = item["n_points"]
             conditions[i, :p] = item["conditions"]
             loadings[i,   :p] = item["loadings"]
+            if "loading_errs" in item:
+                errs[i, :p] = item["loading_errs"]
             mask[i,       :p] = True
 
         return {
@@ -203,6 +214,7 @@ class AdsorptionDataset(Dataset):
             "graphs":     graphs,
             "conditions": conditions,   # [B, P_max, D]
             "loadings":   loadings,     # [B, P_max, C]
+            "loading_errs": errs,       # [B, P_max, C]  NaN where unknown/padded
             "mask":       mask,         # [B, P_max]  True where real data
             "n_points":   n_pts,
         }

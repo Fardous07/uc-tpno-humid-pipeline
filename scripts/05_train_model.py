@@ -361,8 +361,8 @@ def main() -> None:
         convex_constraint=model_cfg.get("convex_constraint", "softplus"),
         film_conditioning=bool(model_cfg.get("film_conditioning", True)),
         dropout=float(model_cfg.get("dropout",          0.15)),
-        use_layer_norm=bool(model_cfg.get("use_layer_norm", True)),
-        activation=model_cfg.get("activation",          "swish"),
+        use_layer_norm=bool(model_cfg.get("use_layer_norm", False)),
+        activation=model_cfg.get("activation", "softplus"),
         min_potential=float(model_cfg.get("min_potential", 1e-6)),
     )
 
@@ -422,8 +422,14 @@ def main() -> None:
         lambda_competition=lambda_competition,
         lambda_gibbs_duhem=lambda_gibbs_duhem,
         henry_mu_threshold=float(physics_cfg.get("henry_mu_threshold",
-                                 train_cfg.get("henry_mu_threshold", -5.0))),
+                                 train_cfg.get("henry_mu_threshold", -2.3))),
         use_nll=bool(train_cfg.get("use_nll", True)),
+        # run_009: σ-head NLL (stop-gradient), negative-loading penalty and
+        # GCMC error-bar weighting -- see LossConfig.
+        lambda_nll=float(physics_cfg.get("lambda_nll", 1.0)),
+        lambda_negative=float(physics_cfg.get("lambda_negative", 1.0)),
+        use_error_weights=bool(train_cfg.get("use_error_weights", True)),
+        error_weight_floor=float(train_cfg.get("error_weight_floor", 0.05)),
     )
     criterion = ThermodynamicLoss(config=loss_cfg)
 

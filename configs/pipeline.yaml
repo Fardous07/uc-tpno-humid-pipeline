@@ -19,8 +19,8 @@ active_learning:
   n_iterations: 50
   rho_threshold: 0.85
 data:
-  adsorption_dir: data/processed/adsorption
-  adsorption_parquet: data/processed/adsorption/adsorption_training.parquet
+  adsorption_dir: data/processed/adsorption_v3
+  adsorption_parquet: data/processed/adsorption_v3/adsorption_training.parquet
   arc_mof_dir: data/raw/arc_mof_charges
   core_mof_dir: data/raw/core_mof_2019
   dataset:
@@ -76,8 +76,12 @@ model:
   n_layers: 2
   n_rbf: 32
   avg_num_neighbours: 15.0
+  # run_009: the potential network must be provably convex in mu:
+  # softplus activation, no LayerNorm (Amos et al., ICML 2017).
+  activation: softplus
+  use_layer_norm: false
   tpno_config:
-    activation: swish
+    activation: softplus
     convex_constraint: softplus
     dropout: 0.15
     film_conditioning: true
@@ -85,7 +89,7 @@ model:
     n_components: 3
     n_conditions: 4
     n_layers: 3
-    use_layer_norm: true
+    use_layer_norm: false
   lmax: 2
   use_charges: true
 results:
@@ -139,7 +143,7 @@ simulation:
     - 298.15
     - 313.15
     - 333.15
-  forcefield: GenericMOFs
+  forcefield: UFF_TIP4P2005   # was GenericMOFs (not installed -> silently used ExampleMOFsForceField)
   gcmc:
     cutoff: 12.0
     keep_workspaces: false
@@ -177,7 +181,12 @@ training:
     lambda_gibbs_duhem: 0.0
     lambda_henry: 0.02
     lambda_hessian: 0.0
-    lambda_monotonic: 0.1
+    # run_009: monotonicity and Maxwell symmetry are exact by construction,
+    # so their penalties are off. Henry now uses ln f = mu/RT per (MOF, T).
+    lambda_monotonic: 0.0
+    lambda_nll: 1.0          # trains the variance head (stop-gradient NLL)
+    lambda_negative: 1.0     # penalises negative predicted loadings
+    henry_mu_threshold: -2.3 # ln(0.1 bar)
     validate_physics: true
     validation_freq: 50
     weight_smoothing: 0.9
@@ -187,6 +196,8 @@ training:
   scheduler_T_mult: 2
   use_amp: true
   use_nll: false
+  use_error_weights: true   # weight data by GCMC error bars (inverse variance)
+  error_weight_floor: 0.05
   warmup_epochs: 30
   weight_decay: 0.0001
 uq:

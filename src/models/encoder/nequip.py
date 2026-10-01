@@ -614,6 +614,36 @@ class NequIPEncoder(nn.Module):
             return torch.zeros(n_atoms, 1, device=device)
         return q.to(device).float().view(-1, 1)
 
+    def _edge_geometry(
+        self,
+        data: Union[Dict[str, Any], Any],
+        pos: torch.Tensor,
+        edge_index: torch.Tensor,
+        cell: Optional[torch.Tensor],
+        batch: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Edge vectors + lengths, preferring the exact periodic displacement
+        vectors stored by graph_builder.py (edge_attr = [dist, unit_vec]).
+
+        FIX: the minimum-image reconstruction in _compute_edge_vectors() is
+        only exact when every perpendicular cell width is >= 2x the cutoff.
+        For smaller cells, several periodic images of the same (i, j) pair
+        are separate edges in the ASE neighbour list, and minimum-image maps
+        them all onto ONE (usually different) vector. Verified on the 500
+        selected MOFs: 185 have at least one wrong edge within 5 A (1.8 % of
+        all edges). ASE's neighbour list already stores the exact vectors,
+        so use them whenever they are present.
+        """
+        edge_attr = getattr(data, "edge_attr", None) if not isinstance(data, dict) else data.get("edge_attr")
+        if edge_attr is not None and edge_attr.dim() == 2 and edge_attr.shape[1] == 4 \
+                and edge_attr.shape[0] == edge_index.shape[1]:
+            ea = edge_attr.to(pos.device).float()
+            lengths = ea[:, 0]
+            vec = ea[:, 1:4] * lengths.unsqueeze(-1)
+            return vec, lengths
+        return self._compute_edge_vectors(pos, edge_index, cell, batch)
+
     def _compute_edge_vectors(
         self,
         pos: torch.Tensor,
@@ -685,7 +715,7 @@ class NequIPEncoder(nn.Module):
             x = x + self.charge_proj(self._get_charges(data, x.shape[0], x.device))
 
         # ── Edge attributes ──────────────────────────────────────
-        vec, lengths = self._compute_edge_vectors(pos, edge_index, cell, batch)
+        vec, lengths = self._edge_geometry(data, pos, edge_index, cell, batch)
 
         # Spherical harmonics of unit edge vectors
         unit_vec = vec / (lengths.unsqueeze(-1) + 1e-8)
@@ -733,7 +763,7 @@ class NequIPEncoder(nn.Module):
         x = self.node_embedding(z) * math.sqrt(self.emb_dim)
         if self.use_charges:
             x = x + self.charge_proj(self._get_charges(data, x.shape[0], x.device))
-        vec, lengths = self._compute_edge_vectors(pos, edge_index, cell, batch)
+        vec, lengths = self._edge_geometry(data, pos, edge_index, cell, batch)
         unit_vec = vec / (lengths.unsqueeze(-1) + 1e-8)
         edge_sh = o3.spherical_harmonics(
             list(range(self.config.lmax + 1)),

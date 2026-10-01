@@ -137,8 +137,8 @@ def build_model_from_config(model_cfg, device):
         convex_constraint=m.get("convex_constraint", "softplus"),
         film_conditioning=bool(m.get("film_conditioning", True)),
         dropout=float(m.get("dropout", 0.05)),
-        use_layer_norm=bool(m.get("use_layer_norm", True)),
-        activation=m.get("activation", "swish"),
+        use_layer_norm=bool(m.get("use_layer_norm", False)),
+        activation=m.get("activation", "softplus"),
         min_potential=float(m.get("min_potential", 1e-6)),
     )
     model = TPNOEnsemble(config=tpno_cfg, encoder=encoder,
@@ -571,9 +571,15 @@ def train_model_once(
         lambda_gibbs_duhem=float(physics_cfg.get("lambda_gibbs_duhem", 0.0)),
         henry_mu_threshold=float(
             physics_cfg.get("henry_mu_threshold",
-            train_cfg.get("henry_mu_threshold", -5.0))
+            train_cfg.get("henry_mu_threshold", -2.3))
         ),
         use_nll=bool(train_cfg.get("use_nll", True)),
+        # run_009: σ-head NLL (stop-gradient), negative-loading penalty and
+        # GCMC error-bar weighting -- see LossConfig.
+        lambda_nll=float(physics_cfg.get("lambda_nll", 1.0)),
+        lambda_negative=float(physics_cfg.get("lambda_negative", 1.0)),
+        use_error_weights=bool(train_cfg.get("use_error_weights", True)),
+        error_weight_floor=float(train_cfg.get("error_weight_floor", 0.05)),
     )
     criterion = ThermodynamicLoss(config=loss_cfg)
 

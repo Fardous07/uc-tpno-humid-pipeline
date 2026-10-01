@@ -125,8 +125,8 @@ def build_model_from_config(model_cfg, device):
         convex_constraint=m.get("convex_constraint", "softplus"),
         film_conditioning=bool(m.get("film_conditioning", True)),
         dropout=float(m.get("dropout", 0.05)),
-        use_layer_norm=bool(m.get("use_layer_norm", True)),
-        activation=m.get("activation", "swish"),
+        use_layer_norm=bool(m.get("use_layer_norm", False)),
+        activation=m.get("activation", "softplus"),
         min_potential=float(m.get("min_potential", 1e-6)),
     )
     model = TPNOEnsemble(config=tpno_cfg, encoder=encoder,
