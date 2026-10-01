@@ -66,6 +66,18 @@ from src.utils.chemistry import (
     mixture_pressure_to_chemical_potentials,
     water_saturation_pressure_antoine,
 )
+from src.utils.cif_charges import read_site_charges
+
+# Force fields shipped with this repo (see scripts/build_raspa_forcefield.py),
+# installed into every RASPA runtime tree by prepare_runtime().
+REPO_FORCEFIELD_DIR = Path(__file__).resolve().parent.parent / "forcefields"
+DEFAULT_FORCEFIELD = "UFF_TIP4P2005"
+
+# Wall-clock limit per RASPA job (set from --job-timeout-hours in main()).
+# FIX: was a hard-coded 7200 s. With framework charges, high-pressure humid
+# jobs on large MOFs take 2-6 h, so they were killed at 2 h and retried from
+# scratch up to 3x (~6 h wasted per job) before being recorded as failures.
+RASPA_TIMEOUT_S = 48 * 3600
 
 # ADDED: GC-TMMC existed in src/simulation/gctmmc/ but nothing in this
 # pipeline ever drove it -- Stage 1 only ever ran ordinary GCMC pressure
@@ -122,6 +134,28 @@ def parse_float_list(s: str) -> List[float]:
 def ensure_dir(p: Path) -> Path:
     p.mkdir(parents=True, exist_ok=True)
     return p
+
+
+def append_checkpoint(path: Path, row: Dict) -> None:
+    """
+    Append one result row to a checkpoint CSV, keeping columns aligned.
+
+    ADDED: a plain to_csv(mode="a", header=False) silently shifts values
+    into the wrong columns if the row's columns differ from the file's
+    header -- e.g. a unit started before the *_err columns existed and
+    resumed after. Rows are written in the header's order; if the row
+    brings new columns, the file is rewritten once with the union.
+    """
+    if not path.exists() or path.stat().st_size == 0:
+        pd.DataFrame([row]).to_csv(path, index=False)
+        return
+    with open(path, encoding="utf-8") as fh:
+        header = fh.readline().rstrip("\n").split(",")
+    if set(row) <= set(header):
+        pd.DataFrame([row]).reindex(columns=header).to_csv(path, mode="a", header=False, index=False)
+    else:
+        old = pd.read_csv(path)
+        pd.concat([old, pd.DataFrame([row])], ignore_index=True).to_csv(path, index=False)
 
 
 def tail_text(text: str, n: int = 80) -> str:
@@ -224,8 +258,7 @@ def determine_unit_cells(cif_path: Path, cutoff_angstrom: float) -> Tuple[int, i
     return (reps[0], reps[1], reps[2])
 
 
-def canonicalize_cif(input_cif: Path, output_cif: Path) -> None:
-    """Write a minimal P1 CIF that RASPA can always parse."""
+def _read_atoms(input_cif: Path):
     if ase_read is None:
         raise RuntimeError("ASE required: pip install ase")
     atoms = ase_read(str(input_cif))
@@ -233,10 +266,32 @@ def canonicalize_cif(input_cif: Path, output_cif: Path) -> None:
         if not atoms:
             raise ValueError(f"Empty CIF: {input_cif}")
         atoms = atoms[0]
+    return atoms
+
+
+def canonicalize_cif(input_cif: Path, output_cif: Path, with_charges: bool = True) -> None:
+    """
+    Write a minimal P1 CIF that RASPA can always parse.
+
+    FIX: this used to write positions only. ASE never returns the CIF's
+    _atom_site_charge values (get_initial_charges() is all zeros for every
+    sanitised CIF), and the charge column was not written at all, so RASPA
+    ran with UseChargesFromCIFFile yes against a CIF with no charges and set
+    every framework charge to 0 -- no host-guest electrostatics in any
+    simulation, which is why water uptake was ~0 in all 476 MOFs. Charges
+    are now read with the same reader the graph builder uses (file order ==
+    ASE atom order for the P1 sanitised CIFs) and written back out.
+    """
+    atoms = _read_atoms(input_cif)
     cl  = atoms.cell.lengths()
     ca  = atoms.cell.angles()
     sp  = atoms.get_scaled_positions(wrap=True)
     sym = atoms.get_chemical_symbols()
+    charges = None
+    if with_charges:
+        charges = read_site_charges(input_cif, len(atoms))
+        if charges is None:
+            raise ValueError(f"No per-atom charge column matching {len(atoms)} atoms in {input_cif.name}")
     counts: Dict[str, int] = {}
     lines = [
         f"data_{input_cif.stem}",
@@ -255,12 +310,79 @@ def canonicalize_cif(input_cif: Path, output_cif: Path) -> None:
         "_atom_site_fract_x", "_atom_site_fract_y", "_atom_site_fract_z",
         "_atom_site_occupancy",
     ]
-    for s, pos in zip(sym, sp):
+    if charges is not None:
+        lines.append("_atom_site_charge")
+    for k, (s, pos) in enumerate(zip(sym, sp)):
         counts[s] = counts.get(s, 0) + 1
-        lines.append(f"{s}{counts[s]} {s} {pos[0]:.6f} {pos[1]:.6f} {pos[2]:.6f} 1.0")
+        row = f"{s}{counts[s]} {s} {pos[0]:.6f} {pos[1]:.6f} {pos[2]:.6f} 1.0"
+        if charges is not None:
+            row += f" {float(charges[k]):.6f}"
+        lines.append(row)
     lines.append("")
     ensure_dir(output_cif.parent)
     output_cif.write_text("\n".join(lines), encoding="utf-8")
+
+
+# ADDED: pre-flight checks, run once per MOF before any RASPA job. Every
+# failure here used to be silent -- RASPA happily simulates an uncharged
+# framework, an element with no LJ parameters, or a disordered CIF with
+# atoms 0.1 A apart, and returns plausible-looking but meaningless numbers.
+MIN_ATOM_DISTANCE_A = 0.7   # below any real bond (O-H 0.96, C-H 1.08 A): overlapping/disordered sites
+MAX_NET_CHARGE_E    = 0.05  # per unit cell; ARC REPEAT and PACMAN charges are neutral to ~1e-5
+
+
+def forcefield_pseudo_atoms(runtime_share: Path, ff_name: str) -> set:
+    lines = (runtime_share / "forcefield" / ff_name / "pseudo_atoms.def").read_text().splitlines()
+    return {ln.split()[0] for ln in lines[3:] if ln.strip() and not ln.startswith("#")}
+
+
+def validate_framework(cif: Path, ff_atoms: set, use_charges: bool) -> List[str]:
+    """Return a list of problems that make this MOF unsafe to simulate (empty = OK)."""
+    from ase.neighborlist import neighbor_list
+    problems: List[str] = []
+    try:
+        atoms = _read_atoms(cif)
+    except Exception as e:
+        return [f"unreadable CIF ({e})"]
+
+    missing = sorted(set(atoms.get_chemical_symbols()) - ff_atoms)
+    if missing:
+        problems.append(f"elements without force-field parameters: {missing}")
+
+    d = neighbor_list("d", atoms, MIN_ATOM_DISTANCE_A)
+    if len(d):
+        problems.append(f"{len(d) // 2} atom pairs closer than {MIN_ATOM_DISTANCE_A} A "
+                        f"(min {d.min():.2f} A) -- overlapping/disordered sites")
+
+    if use_charges:
+        q = read_site_charges(cif, len(atoms))
+        if q is None:
+            problems.append("no per-atom charge column")
+        elif not np.any(np.abs(q) > 1e-4):
+            problems.append("all framework charges are zero -- run scripts/assign_charges.py first")
+        elif abs(float(q.sum())) > MAX_NET_CHARGE_E:
+            problems.append(f"framework net charge {q.sum():+.3f} e (limit {MAX_NET_CHARGE_E})")
+    return problems
+
+
+def validate_frameworks(cif_paths: Sequence[Path], ff_atoms: set, use_charges: bool,
+                        output_dir: Path) -> List[Path]:
+    """Validate every MOF once; log and record rejects, return the usable ones."""
+    ok: List[Path] = []
+    rejects: List[Dict] = []
+    for cif in cif_paths:
+        problems = validate_framework(cif, ff_atoms, use_charges)
+        if problems:
+            logger.warning(f"  REJECTED {cif.stem}: {'; '.join(problems)}")
+            rejects.append({"mof_id": cif.stem, "problems": "; ".join(problems)})
+        else:
+            ok.append(cif)
+    if rejects:
+        out = output_dir / "rejected_frameworks.csv"
+        pd.DataFrame(rejects).to_csv(out, index=False)
+        logger.warning(f"[Pre-flight] {len(rejects)}/{len(cif_paths)} MOFs rejected -> {out}")
+    logger.info(f"[Pre-flight] {len(ok)}/{len(cif_paths)} MOFs passed framework checks")
+    return ok
 
 
 # ---------------------------------------------------------------------------
@@ -289,10 +411,10 @@ def resolve_forcefield(raspa_share: Path, requested: str) -> str:
     lower = {n.lower(): n for n in available}
     if requested.lower() in lower:
         return lower[requested.lower()]
-    # Common alias
-    if requested == "GenericMOFs" and "ExampleMOFsForceField" in available:
-        logger.info("GenericMOFs not found → using ExampleMOFsForceField")
-        return "ExampleMOFsForceField"
+    # FIX: a missing "GenericMOFs" used to fall back silently to RASPA's
+    # ExampleMOFsForceField, whose "C" (TraPPE alkane) entry and "_" prefix
+    # wildcards mis-typed framework carbon and ~30 other elements (see
+    # scripts/build_raspa_forcefield.py). A missing force field is now an error.
     raise FileNotFoundError(
         f"Forcefield '{requested}' not found. Available: {available}"
     )
@@ -340,6 +462,10 @@ def prepare_runtime(output_dir: Path, raspa_share: Path) -> Tuple[Path, Path, Pa
     if runtime_share.exists():
         shutil.rmtree(runtime_share)
     shutil.copytree(raspa_share, runtime_share, dirs_exist_ok=True)
+    if REPO_FORCEFIELD_DIR.is_dir():
+        for ff in REPO_FORCEFIELD_DIR.iterdir():
+            if ff.is_dir():
+                shutil.copytree(ff, runtime_share / "forcefield" / ff.name, dirs_exist_ok=True)
     cif_dir = ensure_dir(runtime_share / "structures" / "cif")
     return runtime_root, runtime_share, cif_dir
 
@@ -477,14 +603,21 @@ def _collect_output_files(workdir: Path) -> str:
 def _run_once(
     raspa_path: Path, runtime_root: Path, framework_cif_dir: Path,
     source_cif: Path, workspace: Path, input_text: str,
+    use_charges: bool = True,
 ) -> RASPAResult:
     """Single RASPA execution — no retry logic here."""
     name = source_cif.stem
     runtime_cif = framework_cif_dir / f"{name}.cif"
-    canonicalize_cif(source_cif.resolve(), runtime_cif)
+    canonicalize_cif(source_cif.resolve(), runtime_cif, with_charges=use_charges)
 
     workspace.mkdir(parents=True, exist_ok=True)
     (workspace / f"{name}.canonical.cif").write_bytes(runtime_cif.read_bytes())
+    # FIX: RASPA2 builds the framework path in a fixed 256-char buffer. The
+    # runtime-share path + a long MOF id reached 251 chars in production and
+    # crashed ("*** buffer overflow detected ***", rc=-6) at 259 in a test
+    # dir. RASPA checks the working directory first, so a copy here keeps the
+    # path short regardless of where the output dir lives.
+    (workspace / f"{name}.cif").write_bytes(runtime_cif.read_bytes())
     (workspace / "simulation.input").write_text(input_text, encoding="utf-8")
 
     env = os.environ.copy()
@@ -497,11 +630,11 @@ def _run_once(
             capture_output=True,
             text=True,
             env=env,
-            timeout=7200,
+            timeout=RASPA_TIMEOUT_S,
         )
     except subprocess.TimeoutExpired:
         log = workspace / "raspa_full_output.log"
-        log.write_text("TIMEOUT after 7200 s", encoding="utf-8")
+        log.write_text(f"TIMEOUT after {RASPA_TIMEOUT_S} s", encoding="utf-8")
         return RASPAResult(ok=False, combined_text="TIMEOUT", log_path=log, returncode=-9)
 
     stdout = proc.stdout or ""
@@ -520,6 +653,7 @@ def run_raspa_job(
     raspa_path: Path, runtime_root: Path, framework_cif_dir: Path,
     source_cif: Path, workspace: Path, input_text: str,
     max_retries: int = 3, retry_delay: int = 60,
+    use_charges: bool = True,
 ) -> RASPAResult:
     """
     Run a RASPA job with retry on failure.
@@ -531,10 +665,15 @@ def run_raspa_job(
     last: Optional[RASPAResult] = None
     for attempt in range(max_retries):
         result = _run_once(raspa_path, runtime_root, framework_cif_dir,
-                           source_cif, workspace, input_text)
+                           source_cif, workspace, input_text, use_charges)
         if result.ok:
             return result
         last = result
+        # A timeout is deterministic -- rerunning the same job from scratch
+        # just burns the same wall time again. Only retry real crashes.
+        if result.combined_text == "TIMEOUT":
+            logger.warning(f"  Job exceeded {RASPA_TIMEOUT_S / 3600:.0f} h limit -- not retrying")
+            break
         if attempt < max_retries - 1:
             wait = retry_delay * (2 ** attempt)   # 60s, 120s, 240s …
             logger.warning(
@@ -570,6 +709,11 @@ def _parse_component(text: str, molecule: str) -> Dict[str, Optional[float]]:
         "loading_molkg": _extract_float(
             r"Average loading absolute \[mol/kg framework\]\s+"
             r"([+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)", block),
+        # ADDED: RASPA's block-average error bar ("value +/- err") -- was
+        # parsed away. Lets training weight labels by statistical reliability.
+        "loading_molkg_err": _extract_float(
+            r"Average loading absolute \[mol/kg framework\]\s+\S+\s+\+/-\s+"
+            r"([+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)", block),
         "loading_moluc": _extract_float(
             r"Average loading absolute \[molecules/unit cell\]\s+"
             r"([+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)", block),
@@ -583,6 +727,7 @@ def parse_single(text: str, molecule: str) -> Dict[str, Optional[float]]:
     d = _parse_component(text, molecule)
     return {
         "loading_molkg":  d["loading_molkg"],
+        "loading_molkg_err": d["loading_molkg_err"],
         "loading_moluc":  d["loading_moluc"],
         "enthalpy_kjmol": d["enthalpy_kjmol"],
     }
@@ -599,6 +744,9 @@ def parse_multi(text: str) -> Dict[str, Optional[float]]:
         "co2_loading_molkg":    co2["loading_molkg"],
         "n2_loading_molkg":     n2["loading_molkg"],
         "h2o_loading_molkg":    h2o["loading_molkg"],
+        "co2_loading_molkg_err": co2["loading_molkg_err"],
+        "n2_loading_molkg_err":  n2["loading_molkg_err"],
+        "h2o_loading_molkg_err": h2o["loading_molkg_err"],
         "co2_loading_moluc":    co2["loading_moluc"],
         "n2_loading_moluc":     n2["loading_moluc"],
         "h2o_loading_moluc":    h2o["loading_moluc"],
@@ -620,9 +768,17 @@ def run_stage1_isotherms(
     forcefield: str, use_charges: bool, cutoff: float,
     co2_dir: str, n2_dir: str, h2o_dir: str,
     max_retries: int = 3, retry_delay: int = 60,
+    h2o_rhs: Sequence[float] = (0.05, 0.15),
 ) -> pd.DataFrame:
     """
     Run single-component RASPA at every (MOF, component, T, P) point.
+
+    FIX: H2O used to be swept over the same total pressures as CO2/N2
+    (0.1/1/10 bar), all ABOVE water's saturation pressure (0.074 bar at
+    313 K) -- pure supersaturated water that condenses in the pores once
+    framework charges are on, giving a meaningless "Henry constant" for the
+    Stage 2 water filter and extremely slow jobs. H2O now runs at the
+    Stage 3 relative humidities instead: p = RH * p_sat(T).
 
     FIX: Previous version only ran at max(pressures_bar) — a single point
     per isotherm — which cannot compute working capacity.  We now sweep ALL
@@ -639,8 +795,24 @@ def run_stage1_isotherms(
     rows: List[Dict] = []
     ws_root = ensure_dir(output_dir / "stage1_workspace")
     components = [("CO2", co2_dir), ("N2", n2_dir), ("H2O", h2o_dir)]
-    total = len(cif_paths) * len(components) * len(temperatures_k) * len(pressures_bar)
+    def _pressures(mol: str, t: float) -> List[float]:
+        if mol == "H2O":
+            return [rh * water_saturation_pressure_antoine(t) for rh in h2o_rhs if rh > 0]
+        return list(pressures_bar)
+
+    total = len(cif_paths) * sum(len(_pressures(m, t)) for m, _ in components for t in temperatures_k)
     job = 0
+
+    # ADDED: per-job checkpoint, same scheme as Stage 3 -- Stage 1 used to
+    # keep everything in memory until the very end (~47 h single-process for
+    # 998 MOFs), so any crash or shutdown lost all of it.
+    checkpoint_path = output_dir / "stage1_isotherms.checkpoint.csv"
+    done_keys: set = set()
+    if checkpoint_path.exists() and checkpoint_path.stat().st_size > 0:
+        rows = pd.read_csv(checkpoint_path).to_dict("records")
+        done_keys = {(r["mof_id"], r["component"], round(float(r["temperature_k"]), 3),
+                      round(float(r["pressure_bar"]), 6)) for r in rows}
+        logger.info(f"[Stage 1] Resuming: {len(done_keys)} jobs already completed")
 
     logger.info(f"\n[Stage 1] Single-component isotherms: {total} jobs across {len(cif_paths)} MOFs")
 
@@ -649,8 +821,10 @@ def run_stage1_isotherms(
         uc = determine_unit_cells(cif, cutoff)
         for mol, mol_dir in components:
             for t in temperatures_k:
-                for p in pressures_bar:
+                for p in _pressures(mol, t):
                     job += 1
+                    if (name, mol, round(t, 3), round(p, 6)) in done_keys:
+                        continue
                     ws = ws_root / f"{name}__{mol}__T{t:.0f}__P{p:g}"
                     inp = build_single_component_input(
                         name, uc, t, p, mol, mol_dir,
@@ -658,12 +832,15 @@ def run_stage1_isotherms(
                     )
                     logger.info(f"  [{job}/{total}] {name} | {mol} | T={t:.0f}K P={p:g}bar")
                     res = run_raspa_job(raspa_path, runtime_root, framework_cif_dir,
-                                       cif, ws, inp, max_retries, retry_delay)
+                                       cif, ws, inp, max_retries, retry_delay,
+                                       use_charges)
                     if res.ok:
                         parsed = parse_single(res.combined_text, mol)
-                        rows.append({"mof_id": name, "component": mol,
-                                     "temperature_k": t, "pressure_bar": p,
-                                     "log": str(res.log_path), **parsed})
+                        row = {"mof_id": name, "component": mol,
+                               "temperature_k": t, "pressure_bar": p,
+                               "log": str(res.log_path), **parsed}
+                        rows.append(row)
+                        append_checkpoint(checkpoint_path, row)
                     else:
                         logger.warning(f"    FAILED rc={res.returncode}: {tail_text(res.combined_text, 5)}")
                     if not keep_workspaces and ws.exists():
@@ -731,7 +908,7 @@ def run_stage1_isotherms_gctmmc(
         n_cycles=n_cycles,
         n_init=max(200, n_cycles // 2),
         use_charges=use_charges,
-        timeout=7200,
+        timeout=RASPA_TIMEOUT_S,
     )
     runner = GCTMMCRunner(config)
 
@@ -747,7 +924,7 @@ def run_stage1_isotherms_gctmmc(
         # the messy-CIF failure mode canonicalize_cif() was written to fix.
         canon_cif = ws_root / f"{name}.canonical.cif"
         try:
-            canonicalize_cif(cif, canon_cif)
+            canonicalize_cif(cif, canon_cif, with_charges=use_charges)
         except Exception as e:
             logger.warning(f"    Skipping {name}: canonicalisation failed ({e})")
             job += len(components) * len(temperatures_k)
@@ -956,6 +1133,21 @@ def select_mofs_for_gcmc(
                 f"[Stage 2] Water-competition filter: {len(filtered_df)}/{n_before_filter} "
                 f"MOFs retained (KH_CO2 > KH_H2O)"
             )
+            # FIX: with real framework charges most MOFs have KH_H2O > KH_CO2,
+            # so a hard filter can leave far fewer MOFs than the budget (it
+            # removed every MOF in a 2-MOF test). Survivors now get priority;
+            # the budget is topped up with the removed MOFs that bind water
+            # least strongly relative to CO2.
+            if len(filtered_df) < gcmc_budget:
+                n_top_up = min(gcmc_budget - len(filtered_df), len(kpi_df) - len(filtered_df))
+                top_up = (kpi_df[~survives]
+                          .sort_values("co2_over_h2o_selectivity", ascending=False)
+                          .head(n_top_up))
+                logger.warning(
+                    f"[Stage 2] Only {len(filtered_df)} MOFs pass the water filter (< budget "
+                    f"{gcmc_budget}); topping up with {len(top_up)} MOFs ranked by KH_CO2/KH_H2O."
+                )
+                filtered_df = pd.concat([filtered_df, top_up])
             kpi_df = filtered_df
 
     # Normalise to [0, 1] for Pareto
@@ -1035,7 +1227,6 @@ def run_stage3_gcmc(
         }
         logger.info(f"[Stage 3] Resuming: {len(done_keys)} jobs already "
                     f"completed in a previous run (from {checkpoint_path.name})")
-    checkpoint_header_written = bool(done_keys)
 
     failures: List[Dict] = []
 
@@ -1063,7 +1254,8 @@ def run_stage3_gcmc(
                 co2_dir, n2_dir, h2o_dir,
             )
             res = run_raspa_job(raspa_path, runtime_root, framework_cif_dir,
-                                cif, ws, inp, max_retries, retry_delay)
+                                cif, ws, inp, max_retries, retry_delay,
+                                use_charges)
             if res.ok:
                 parsed = parse_multi(res.combined_text)
                 row = {
@@ -1088,12 +1280,7 @@ def run_stage3_gcmc(
                     **parsed,
                 }
                 rows.append(row)
-                pd.DataFrame([row]).to_csv(
-                    checkpoint_path, mode="a",
-                    header=not checkpoint_header_written,
-                    index=False,
-                )
-                checkpoint_header_written = True
+                append_checkpoint(checkpoint_path, row)
             else:
                 failures.append({
                     "mof_id": name, "temperature_k": cond.temperature_k,
@@ -1155,6 +1342,13 @@ def main() -> None:
     p.add_argument("--gcmc-budget", type=int, default=500, help="MOFs to label with GCMC")
     p.add_argument("--exploration-fraction", type=float, default=0.2,
                    help="Fraction of GCMC budget for diversity exploration")
+    # ADDED: the KH_CO2 > KH_H2O filter was a no-op while frameworks were
+    # uncharged (water barely adsorbed). With real charges it can remove
+    # most hydrophilic MOFs -- and with them most of the humidity effect a
+    # model is supposed to learn -- and leave fewer than --gcmc-budget MOFs.
+    p.add_argument("--water-filter", action=argparse.BooleanOptionalAction, default=True,
+                   help="Stage 2: drop MOFs whose H2O Henry constant exceeds CO2's "
+                        "(default on; --no-water-filter keeps them for a more diverse dataset).")
 
     # Simulation parameters
     p.add_argument("--n-cycles",    type=int,   default=5000,
@@ -1193,7 +1387,10 @@ def main() -> None:
     p.add_argument("--rhs",          default="0.0,0.05,0.15")
     p.add_argument("--dry-co2-frac", type=float, default=0.15)
     p.add_argument("--cutoff",       type=float, default=12.0)
-    p.add_argument("--forcefield",   default="GenericMOFs")
+    # FIX: was "GenericMOFs", which isn't in a standard RASPA2 install and
+    # silently fell back to ExampleMOFsForceField (mis-typed framework atoms).
+    p.add_argument("--forcefield",   default=DEFAULT_FORCEFIELD,
+                   help=f"RASPA force field (default: {DEFAULT_FORCEFIELD}, shipped in forcefields/)")
     # FIX: defaulted to False (no framework electrostatics) while the
     # active-learning GCMCConfig/GCTMMCConfig defaulted use_charges=True and
     # the model was trained with use_charges=True as an input feature — a
@@ -1207,15 +1404,20 @@ def main() -> None:
     p.add_argument("--keep-workspaces",       action="store_true")
 
     # Molecule definitions
-    p.add_argument("--co2-definition", default="TraPPE")
-    p.add_argument("--n2-definition",  default="TraPPE")
-    p.add_argument("--h2o-definition", default="TraPPE")
+    # The guest pseudo atoms in forcefields/UFF_TIP4P2005 match the
+    # ExampleDefinitions CO2/N2/H2O .def files (there is no TraPPE dir in a
+    # standard RASPA2 install; "TraPPE" only ever fell through to these).
+    p.add_argument("--co2-definition", default="ExampleDefinitions")
+    p.add_argument("--n2-definition",  default="ExampleDefinitions")
+    p.add_argument("--h2o-definition", default="ExampleDefinitions")
     p.add_argument("--co2-def-file",   default=None)
     p.add_argument("--n2-def-file",    default=None)
     p.add_argument("--h2o-def-file",   default=None)
 
     # Retry
     p.add_argument("--max-retries",  type=int, default=3)
+    p.add_argument("--job-timeout-hours", type=float, default=48.0,
+                   help="Wall-clock limit per RASPA job (default 48 h; was a hard-coded 2 h).")
     p.add_argument("--retry-delay",  type=int, default=60, help="Initial delay seconds")
 
     # Stage control (useful for resuming)
@@ -1226,6 +1428,10 @@ def main() -> None:
     # gcmc_selected_mofs.txt, then exit before the expensive Stage 3. Then
     # parallel workers each run with --skip-stage1 --skip-stage2 on their
     # own pre-assigned subset of the selected MOFs for Stage 3 only.
+    # ADDED: lets run_parallel_gcmc.sh run Stage 1 on N CIF chunks in
+    # parallel, then merge them and run Stage 2 once globally.
+    p.add_argument("--stop-after-stage1", action="store_true",
+                   help="Exit right after Stage 1 (parallel screening chunks).")
     p.add_argument("--stop-after-stage2", action="store_true",
                    help="Exit after Stage 2 selection, before Stage 3 (GCMC). "
                         "For running Stage 1+2 once globally before "
@@ -1238,6 +1444,8 @@ def main() -> None:
                    help="Stage 1 single-component screening method (default: gcmc).")
 
     args = p.parse_args()
+    global RASPA_TIMEOUT_S
+    RASPA_TIMEOUT_S = int(args.job_timeout_hours * 3600)
     if args.stage3_n_cycles is None:
         args.stage3_n_cycles = args.n_cycles
 
@@ -1292,8 +1500,10 @@ def main() -> None:
 
     # RASPA setup
     raspa_share  = detect_raspa_share(raspa_dd)
-    ff_name      = resolve_forcefield(raspa_share, args.forcefield)
     runtime_root, runtime_share, fw_cif_dir = prepare_runtime(output_dir, raspa_share)
+    # Resolved against the runtime tree, which also holds this repo's
+    # forcefields/ (installed by prepare_runtime).
+    ff_name      = resolve_forcefield(runtime_share, args.forcefield)
 
     # Molecule directories
     def _resolve_mol(def_file_arg, mol_name, preferred):
@@ -1312,6 +1522,15 @@ def main() -> None:
 
     conditions = build_conditions(temps, pressures, rhs, args.dry_co2_frac)
 
+    # Pre-flight: never simulate a MOF with missing force-field parameters,
+    # overlapping atoms, or (when charges are on) no framework charges.
+    all_cifs = validate_frameworks(
+        all_cifs, forcefield_pseudo_atoms(runtime_share, ff_name),
+        args.use_framework_charges, output_dir,
+    )
+    if not all_cifs:
+        raise RuntimeError(f"No MOF passed the pre-flight checks -- see {output_dir / 'rejected_frameworks.csv'}")
+
     logger.info("=" * 65)
     logger.info(f"UC-TPNO SIMULATION PIPELINE")
     logger.info(f"  CIFs            : {len(all_cifs)}")
@@ -1326,6 +1545,7 @@ def main() -> None:
     logger.info(f"  Stage 1 cycles  : {args.n_cycles}")
     logger.info(f"  Stage 3 cycles  : {args.stage3_n_cycles}")
     logger.info(f"  Forcefield      : {ff_name}")
+    logger.info(f"  Framework charges: {'from CIF' if args.use_framework_charges else 'OFF'}")
     logger.info(f"  CO2 mol dir     : {co2_dir}")
     logger.info(f"  N2  mol dir     : {n2_dir}")
     logger.info(f"  H2O mol dir     : {h2o_dir}")
@@ -1362,7 +1582,12 @@ def main() -> None:
             ff_name, args.use_framework_charges, args.cutoff,
             co2_dir, n2_dir, h2o_dir,
             args.max_retries, args.retry_delay,
+            h2o_rhs=rhs,
         )
+
+    if args.stop_after_stage1:
+        logger.info(f"\nSTOPPING AFTER STAGE 1 (--stop-after-stage1): {len(stage1_df)} rows")
+        return
 
     # ------------------------------------------------------------------
     # Stage 2 — select best MOFs for GCMC
@@ -1385,6 +1610,7 @@ def main() -> None:
             desorption_pressure_bar=min(stage1_pressures),
             temperature_k=stage1_temps[0],
             exploration_fraction=args.exploration_fraction,
+            require_co2_over_h2o=args.water_filter,
         )
         # Save selection list
         sel_file = output_dir / "gcmc_selected_mofs.txt"

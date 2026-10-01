@@ -42,12 +42,16 @@ set -euo pipefail
 #   bash scripts/run_parallel_gcmc.sh --status
 #   bash scripts/run_parallel_gcmc.sh --kill
 #   bash scripts/run_parallel_gcmc.sh --merge
+#   bash scripts/run_parallel_gcmc.sh --selection-only   # Phase A only, then
+#        run Stage 3 on the job queue: scripts/stage3_queue.py prepare-fresh
 # ═══════════════════════════════════════════════════════════════════════
 
 PROJECT_ROOT="/home/fardo/uc_tpno_humid_pipeline/uc_tpno_humid_pipeline"
 VENV="${PROJECT_ROOT}/thesis_env/bin/activate"
 CIF_DIR="${PROJECT_ROOT}/data/intermediate/cifs_sanitized"
-OUT_DIR="${PROJECT_ROOT}/data/processed/adsorption_v2"
+# adsorption_v3: first run with framework charges + the UFF_TIP4P2005 force
+# field. adsorption_v2 (ExampleMOFsForceField, no framework charges) is invalid.
+OUT_DIR="${PROJECT_ROOT}/data/processed/adsorption_v3"
 CHUNK_DIR="${PROJECT_ROOT}/data/intermediate/cif_chunks_stage3"
 LOG_DIR="${OUT_DIR}/logs"
 RASPA_BIN="/home/fardo/RASPA2-install/bin/simulate"
@@ -60,7 +64,7 @@ SELECTED_MOFS_FILE="${OUT_DIR}/gcmc_selected_mofs.txt"
 # Stage 1 (screening) and Stage 3 (real training labels) settings --
 # matches what we've been using: cheap screening, more careful final labels.
 STAGE1_CYCLES=1000
-STAGE3_CYCLES=4000
+STAGE3_CYCLES=2000  # was 4000; halved 2026-09-27 (charged high-P jobs took 2-6 h each)
 GCMC_BUDGET=500
 MAX_MOFS=0
 # FIX: "gctmmc" doesn't actually work with real RASPA2 -- verified by
@@ -85,13 +89,60 @@ STAGE1_TEMPERATURES="313.15"
 STAGE1_PRESSURES="0.1,1.0,10.0"
 RHS="0.0,0.05,0.15"
 DRY_CO2_FRAC=0.15
+# Stage 2 water-competition filter (keep only MOFs with KH_CO2 > KH_H2O).
+# Set WATER_FILTER=no in the environment to keep water-affine MOFs too.
+if [[ "${WATER_FILTER:-yes}" == "no" ]]; then
+    WATER_FILTER_FLAG="--no-water-filter"
+else
+    WATER_FILTER_FLAG="--water-filter"
+fi
 
 ACTION="${1:-launch}"
 
 # ─────────────────────────────────────────────────────────────────────
 # --status
 # ─────────────────────────────────────────────────────────────────────
+S1_SESSION="gcmc_stage1"
+S1_CIF_ROOT="${PROJECT_ROOT}/data/intermediate/cif_chunks_stage1_v3"
+S1_OUT_ROOT="${OUT_DIR}/stage1_chunks"
+PHASE_A_LOG="${LOG_DIR}/phase_a.log"
+
 if [[ "$ACTION" == "--status" ]]; then
+    # ADDED: Stage 1 (Phase A) progress -- the chunks run inside tmux
+    # session gcmc_stage1, started by --selection-only.
+    if [[ -d "${S1_CIF_ROOT}" ]]; then
+        n_p=$(echo "${STAGE1_PRESSURES}" | tr ',' '\n' | grep -c .)
+        n_rh=$(echo "${RHS}" | tr ',' '\n' | awk '$1+0>0' | grep -c .)
+        per_mof=$(( 2 * n_p + n_rh ))   # CO2 + N2 at each pressure, H2O at each RH>0
+        if tmux has-session -t "${S1_SESSION}" 2>/dev/null; then s1_state="RUNNING (tmux: ${S1_SESSION})"; else s1_state="NOT RUNNING"; fi
+        echo "========================================"
+        echo "STAGE 1 SCREENING -- ${s1_state}"
+        echo "========================================"
+        tot_done=0; tot_all=0; n_fin=0; n_chunks=0
+        for chunk in "${S1_CIF_ROOT}"/chunk_*; do
+            c="${chunk##*/}"
+            n_cif=$(ls "${chunk}" | wc -l)
+            all=$(( n_cif * per_mof ))
+            ck="${S1_OUT_ROOT}/${c}/stage1_isotherms.checkpoint.csv"
+            done_jobs=0
+            [[ -f "${ck}" ]] && done_jobs=$(( $(wc -l < "${ck}") - 1 ))
+            (( done_jobs < 0 )) && done_jobs=0
+            if [[ -f "${S1_OUT_ROOT}/${c}/stage1_isotherms.parquet" ]]; then
+                tag="DONE"; n_fin=$((n_fin+1))
+            else
+                tag="$(( 100 * done_jobs / (all > 0 ? all : 1) ))%"
+            fi
+            printf "  %-9s %5d/%-5d jobs  %s\n" "${c}" "${done_jobs}" "${all}" "${tag}"
+            tot_done=$((tot_done+done_jobs)); tot_all=$((tot_all+all)); n_chunks=$((n_chunks+1))
+        done
+        echo "----------------------------------------"
+        echo "  Total: ${tot_done}/${tot_all} jobs ($(( 100 * tot_done / (tot_all > 0 ? tot_all : 1) ))%), ${n_fin}/${n_chunks} chunks finished"
+        echo "  (rejected MOFs count in the total but never run, so the last few % may not fill)"
+        if [[ -f "${PHASE_A_LOG}" ]]; then
+            echo "  Last log line: $(grep -v '^\s*$' "${PHASE_A_LOG}" | tail -1 | cut -c1-110)"
+        fi
+        echo
+    fi
     echo "========================================"
     echo "STAGE 3 WORKER STATUS"
     echo "========================================"
@@ -134,7 +185,7 @@ if [[ "$ACTION" == "--status" ]]; then
             finished=$((finished+1))
         fi
     done
-    n_done=$(find "${OUT_DIR}" -maxdepth 2 -name "adsorption_training.parquet" -path "*/worker_*" 2>/dev/null | wc -l)
+    n_done=$( (find "${OUT_DIR}" -maxdepth 2 -name "adsorption_training.parquet" -path "*/worker_*" 2>/dev/null || true) | wc -l)
     echo "----------------------------------------"
     echo "  Running: ${running} | Stopped: ${finished}"
     echo "  Workers with completed output: ${n_done}"
@@ -146,6 +197,11 @@ fi
 # --kill
 # ─────────────────────────────────────────────────────────────────────
 if [[ "$ACTION" == "--kill" ]]; then
+    if tmux has-session -t "${S1_SESSION}" 2>/dev/null; then
+        echo "Stopping Stage 1 (tmux session ${S1_SESSION})..."
+        tmux kill-session -t "${S1_SESSION}"
+    fi
+    pkill -f -- "--cif-dir ${S1_CIF_ROOT}" 2>/dev/null || true
     echo "Killing all Stage 3 workers..."
     for pid_file in "${PID_DIR}"/worker_*.pid; do
         [[ -f "$pid_file" ]] || continue
@@ -175,6 +231,32 @@ if [[ "$ACTION" == "--merge" ]]; then
     exit 0
 fi
 
+SELECTION_ONLY=false
+if [[ "$ACTION" == "--selection-only" ]]; then
+    SELECTION_ONLY=true
+    shift
+    ACTION="${1:-launch}"
+    # ADDED: run Phase A inside a detached tmux session, so closing the
+    # terminal doesn't kill it. Re-invokes this script inside tmux.
+    if [[ -z "${GCMC_IN_TMUX:-}" ]]; then
+        if tmux has-session -t "${S1_SESSION}" 2>/dev/null; then
+            echo "Stage 1 is already running (tmux session ${S1_SESSION})."
+            echo "  Progress : bash scripts/run_parallel_gcmc.sh --status"
+            echo "  Watch    : tmux attach -t ${S1_SESSION}   (detach: Ctrl+B then D)"
+            exit 1
+        fi
+        mkdir -p "${LOG_DIR}"
+        tmux new-session -d -s "${S1_SESSION}" \
+            "GCMC_IN_TMUX=1 STAGE1_WORKERS=${STAGE1_WORKERS:-} WATER_FILTER=${WATER_FILTER:-yes} bash '$(realpath "${BASH_SOURCE[0]}")' --selection-only $* 2>&1 | tee -a '${PHASE_A_LOG}'; echo; echo 'Phase A finished -- press Enter to close'; read"
+        echo "Stage 1 + 2 started in tmux session '${S1_SESSION}'."
+        echo "  Progress : bash scripts/run_parallel_gcmc.sh --status"
+        echo "  Watch    : tmux attach -t ${S1_SESSION}   (detach: Ctrl+B then D)"
+        echo "  Stop     : bash scripts/run_parallel_gcmc.sh --kill"
+        echo "  Safe to close this terminal."
+        exit 0
+    fi
+fi
+
 REDO_SELECTION=false
 if [[ "$ACTION" == "--redo-selection" ]]; then
     REDO_SELECTION=true
@@ -183,7 +265,7 @@ if [[ "$ACTION" == "--redo-selection" ]]; then
 fi
 
 # ─────────────────────────────────────────────────────────────────────
-# Phase A: Stage 1 + Stage 2, ONCE, globally, sequentially.
+# Phase A: Stage 1 (parallel chunks) + Stage 2 (once, globally).
 # Skipped automatically on resume if the selection already exists.
 # ─────────────────────────────────────────────────────────────────────
 cd "${PROJECT_ROOT}"
@@ -196,11 +278,76 @@ if [[ -f "${SELECTED_MOFS_FILE}" ]] && [[ "${REDO_SELECTION}" == "false" ]]; the
     echo "  Pass --redo-selection to force a fresh Stage 1+2 run."
     echo "========================================"
 else
+    # FIX: Stage 1 used to run as ONE process over all ~1000 CIFs (~47 h on
+    # one core while the rest idled, and nothing saved until the end). Now:
+    # split the CIFs round-robin into N_S1 chunks, run Stage 1 on each chunk
+    # in parallel (each checkpoints per job and resumes), merge, then run
+    # Stage 2 once globally on the merged isotherms.
+    N_S1="${STAGE1_WORKERS:-$(( $(nproc --all) > 1 ? $(nproc --all) - 1 : 1 ))}"
+    S1_CIF_ROOT="${PROJECT_ROOT}/data/intermediate/cif_chunks_stage1_v3"
+    S1_OUT_ROOT="${OUT_DIR}/stage1_chunks"
+    if [[ "${REDO_SELECTION}" == "true" ]]; then
+        rm -rf "${S1_CIF_ROOT}" "${S1_OUT_ROOT}" "${OUT_DIR}/stage1_isotherms.parquet"
+    fi
     echo "========================================"
-    echo "PHASE A: Stage 1 (${STAGE1_METHOD}, ${STAGE1_CYCLES} cycles) + Stage 2"
+    echo "PHASE A: Stage 1 (${STAGE1_METHOD}, ${STAGE1_CYCLES} cycles) on ${N_S1} parallel chunks, then Stage 2"
     echo "  Screening all CIFs in ${CIF_DIR}"
+    echo "  Logs: ${LOG_DIR}/stage1_chunk_*.log  (run this inside tmux -- closing the terminal stops it)"
     echo "========================================"
     source "${VENV}"
+    trap 'echo "Stopping Stage 1 chunks..."; kill 0' INT TERM
+
+    # Keep the first split on resume so each chunk's checkpoint stays valid.
+    if [[ ! -d "${S1_CIF_ROOT}" ]]; then
+        mapfile -t ALL_CIFS < <(ls "${CIF_DIR}"/*.cif | sort)
+        for (( c=0; c<N_S1; c++ )); do mkdir -p "${S1_CIF_ROOT}/chunk_${c}"; done
+        for (( i=0; i<${#ALL_CIFS[@]}; i++ )); do
+            ln -sf "${ALL_CIFS[$i]}" "${S1_CIF_ROOT}/chunk_$(( i % N_S1 ))/"
+        done
+    fi
+
+    for chunk in "${S1_CIF_ROOT}"/chunk_*; do
+        c="${chunk##*/}"
+        if [[ -f "${S1_OUT_ROOT}/${c}/stage1_isotherms.parquet" ]]; then
+            echo "  ${c}: already complete"
+            continue
+        fi
+        python "${SCRIPT_PY}" \
+            --cif-dir "${chunk}" \
+            --output-dir "${S1_OUT_ROOT}/${c}" \
+            --raspa-path "${RASPA_BIN}" \
+            --raspa-data-dir "${RASPA_DATA}" \
+            --stage1-method "${STAGE1_METHOD}" \
+            --n-cycles "${STAGE1_CYCLES}" \
+            --temperatures "${TEMPERATURES}" \
+            --pressures "${PRESSURES}" \
+            --stage1-temperatures "${STAGE1_TEMPERATURES}" \
+            --stage1-pressures "${STAGE1_PRESSURES}" \
+            --rhs "${RHS}" \
+            --dry-co2-frac "${DRY_CO2_FRAC}" \
+            --stage3-n-cycles "${STAGE3_CYCLES}" \
+            --stop-after-stage1 >> "${LOG_DIR}/stage1_${c}.log" 2>&1 &
+        echo "  ${c}: started ($(ls "${chunk}" | wc -l) CIFs, PID $!)"
+    done
+    wait
+    trap - INT TERM
+
+    n_chunks=$(ls -d "${S1_CIF_ROOT}"/chunk_* | wc -l)
+    n_done=$( (ls "${S1_OUT_ROOT}"/chunk_*/stage1_isotherms.parquet 2>/dev/null || true) | wc -l)
+    if [[ "${n_done}" -ne "${n_chunks}" ]]; then
+        echo "ERROR: only ${n_done}/${n_chunks} Stage 1 chunks finished -- see ${LOG_DIR}/stage1_chunk_*.log."
+        echo "Rerun the same command to resume the unfinished chunks."
+        exit 1
+    fi
+    python - "${S1_OUT_ROOT}" "${OUT_DIR}/stage1_isotherms.parquet" <<'PYEOF'
+import sys, glob, pandas as pd
+parts = sorted(glob.glob(f"{sys.argv[1]}/chunk_*/stage1_isotherms.parquet"))
+df = pd.concat([pd.read_parquet(p) for p in parts], ignore_index=True)
+df.to_parquet(sys.argv[2], index=False)
+print(f"  Merged {len(parts)} Stage 1 chunks: {len(df)} rows, {df.mof_id.nunique()} MOFs -> {sys.argv[2]}")
+PYEOF
+
+    # Stage 2 once, globally, on the merged Stage 1 results.
     python "${SCRIPT_PY}" \
         --cif-dir "${CIF_DIR}" \
         --output-dir "${OUT_DIR}" \
@@ -217,20 +364,21 @@ else
         --rhs "${RHS}" \
         --dry-co2-frac "${DRY_CO2_FRAC}" \
         --stage3-n-cycles "${STAGE3_CYCLES}" \
+        --skip-stage1 \
+        ${WATER_FILTER_FLAG} \
         --stop-after-stage2
-        # FIX: Phase A never actually runs Stage 3 (--stop-after-stage2
-        # exits first), so --stage3-n-cycles is a no-op here functionally.
-        # But 04_run_simulations.py's startup banner prints it regardless,
-        # and without this flag it silently defaulted to args.n_cycles
-        # (Stage 1's cycle count) instead of the real Stage 3 value --
-        # printing "Stage 3 cycles: 1000" during Phase A even though
-        # Phase B's workers correctly use 4000. Passed through here purely
-        # so the banner isn't misleading.
 fi
 
 if [[ ! -f "${SELECTED_MOFS_FILE}" ]]; then
     echo "ERROR: ${SELECTED_MOFS_FILE} still missing after Phase A. Check the log above."
     exit 1
+fi
+
+if [[ "${SELECTION_ONLY}" == "true" ]]; then
+    echo "Selection ready: ${SELECTED_MOFS_FILE} ($(grep -c . "${SELECTED_MOFS_FILE}") MOFs)"
+    echo "Next: ${PROJECT_ROOT}/thesis_env/bin/python scripts/stage3_queue.py prepare-fresh"
+    echo "      bash scripts/stage3_queue.sh start"
+    exit 0
 fi
 
 # ─────────────────────────────────────────────────────────────────────

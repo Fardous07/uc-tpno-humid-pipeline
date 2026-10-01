@@ -1,0 +1,119 @@
+# general rule for shifted vs truncated
+shifted
+# general rule tailcorrections
+no
+# number of defined interactions
+110
+# type interaction, parameters (eps/k_B [K], sigma [A]). All names are exact matches -- no '_' wildcards.
+He         lennard-jones    10.9000   2.6400   // Hirschfelder et al. 1954
+C_co2      lennard-jones    29.9330   2.7450   // Garcia-Sanchez et al. 2009
+O_co2      lennard-jones    85.6710   3.0170   // Garcia-Sanchez et al. 2009
+N_n2       lennard-jones    38.2980   3.3060   // Martin-Calvo et al. 2011
+N_com      none                                // massless charge site
+O_h2o      lennard-jones    93.2000   3.1589   // TIP4P/2005
+H_h2o      none                                // TIP4P/2005, no LJ site
+M_h2o      none                                // TIP4P/2005, massless charge site
+H          lennard-jones    22.1417   2.5711   // UFF
+Li         lennard-jones    12.5805   2.1836   // UFF
+Be         lennard-jones    42.7737   2.4455   // UFF
+B          lennard-jones    90.5795   3.6375   // UFF
+C          lennard-jones    52.8380   3.4309   // UFF
+N          lennard-jones    34.7221   3.2607   // UFF
+O          lennard-jones    30.1932   3.1181   // UFF
+F          lennard-jones    25.1610   2.9970   // UFF
+Ne         lennard-jones    21.1352   2.8892   // UFF
+Na         lennard-jones    15.0966   2.6576   // UFF
+Mg         lennard-jones    55.8574   2.6914   // UFF
+Al         lennard-jones   254.1258   4.0082   // UFF
+Si         lennard-jones   202.2942   3.8264   // UFF
+P          lennard-jones   153.4819   3.6946   // UFF
+S          lennard-jones   137.8821   3.5948   // UFF
+Cl         lennard-jones   114.2308   3.5164   // UFF
+Ar         lennard-jones    93.0956   3.4460   // UFF
+K          lennard-jones    17.6127   3.3961   // UFF
+Ca         lennard-jones   119.7662   3.0282   // UFF
+Sc         lennard-jones     9.5612   2.9355   // UFF
+Ti         lennard-jones     8.5547   2.8286   // UFF
+V          lennard-jones     8.0515   2.8010   // UFF
+Cr         lennard-jones     7.5483   2.6932   // UFF
+Mn         lennard-jones     6.5419   2.6380   // UFF
+Fe         lennard-jones     6.5419   2.5943   // UFF
+Co         lennard-jones     7.0451   2.5587   // UFF
+Ni         lennard-jones     7.5483   2.5248   // UFF
+Cu         lennard-jones     2.5161   3.1137   // UFF
+Zn         lennard-jones    62.3992   2.4616   // UFF
+Ga         lennard-jones   208.8361   3.9048   // UFF
+Ge         lennard-jones   190.7202   3.8130   // UFF
+As         lennard-jones   155.4948   3.7685   // UFF
+Se         lennard-jones   146.4369   3.7462   // UFF
+Br         lennard-jones   126.3081   3.7320   // UFF
+Kr         lennard-jones   110.7083   3.6892   // UFF
+Rb         lennard-jones    20.1288   3.6652   // UFF
+Sr         lennard-jones   118.2566   3.2438   // UFF
+Y          lennard-jones    36.2318   2.9801   // UFF
+Zr         lennard-jones    34.7221   2.7832   // UFF
+Nb         lennard-jones    29.6900   2.8197   // UFF
+Mo         lennard-jones    28.1803   2.7190   // UFF
+Tc         lennard-jones    24.1545   2.6709   // UFF
+Ru         lennard-jones    28.1803   2.6397   // UFF
+Rh         lennard-jones    26.6706   2.6094   // UFF
+Pd         lennard-jones    24.1545   2.5827   // UFF
+Ag         lennard-jones    18.1159   2.8045   // UFF
+Cd         lennard-jones   114.7340   2.5373   // UFF
+In         lennard-jones   301.4285   3.9761   // UFF
+Sn         lennard-jones   285.3255   3.9128   // UFF
+Sb         lennard-jones   225.9456   3.9378   // UFF
+Te         lennard-jones   200.2814   3.9823   // UFF
+I          lennard-jones   170.5914   4.0090   // UFF
+Xe         lennard-jones   167.0689   3.9235   // UFF
+Cs         lennard-jones    22.6449   4.0242   // UFF
+Ba         lennard-jones   183.1719   3.2990   // UFF
+La         lennard-jones     8.5547   3.1377   // UFF
+Ce         lennard-jones     6.5419   3.1680   // UFF
+Pr         lennard-jones     5.0322   3.2126   // UFF
+Nd         lennard-jones     5.0322   3.1850   // UFF
+Pm         lennard-jones     4.5290   3.1600   // UFF
+Sm         lennard-jones     4.0258   3.1360   // UFF
+Eu         lennard-jones     4.0258   3.1119   // UFF
+Gd         lennard-jones     4.5290   3.0005   // UFF
+Tb         lennard-jones     3.5225   3.0745   // UFF
+Dy         lennard-jones     3.5225   3.0540   // UFF
+Ho         lennard-jones     3.5225   3.0371   // UFF
+Er         lennard-jones     3.5225   3.0210   // UFF
+Tm         lennard-jones     3.0193   3.0059   // UFF
+Yb         lennard-jones   114.7340   2.9890   // UFF
+Lu         lennard-jones    20.6320   3.2429   // UFF
+Hf         lennard-jones    36.2318   2.7983   // UFF
+Ta         lennard-jones    40.7608   2.8241   // UFF
+W          lennard-jones    33.7157   2.7342   // UFF
+Re         lennard-jones    33.2125   2.6317   // UFF
+Os         lennard-jones    18.6191   2.7796   // UFF
+Ir         lennard-jones    36.7350   2.5302   // UFF
+Pt         lennard-jones    40.2576   2.4535   // UFF
+Au         lennard-jones    19.6256   2.9337   // UFF
+Hg         lennard-jones   193.7395   2.4099   // UFF
+Tl         lennard-jones   342.1893   3.8727   // UFF
+Pb         lennard-jones   333.6345   3.8282   // UFF
+Bi         lennard-jones   260.6677   3.8932   // UFF
+Po         lennard-jones   163.5463   4.1952   // UFF
+At         lennard-jones   142.9143   4.2318   // UFF
+Rn         lennard-jones   124.7984   4.2451   // UFF
+Fr         lennard-jones    25.1610   4.3654   // UFF
+Ra         lennard-jones   203.3007   3.2758   // UFF
+Ac         lennard-jones    16.6062   3.0985   // UFF
+Th         lennard-jones    13.0837   3.0255   // UFF
+Pa         lennard-jones    11.0708   3.0504   // UFF
+U          lennard-jones    11.0708   3.0246   // UFF
+Np         lennard-jones     9.5612   3.0504   // UFF
+Pu         lennard-jones     8.0515   3.0504   // UFF
+Am         lennard-jones     7.0451   3.0121   // UFF
+Cm         lennard-jones     6.5419   2.9631   // UFF
+Bk         lennard-jones     6.5419   2.9747   // UFF
+Cf         lennard-jones     6.5419   2.9515   // UFF
+Es         lennard-jones     6.0386   2.9391   // UFF
+Fm         lennard-jones     6.0386   2.9275   // UFF
+Md         lennard-jones     5.5354   2.9168   // UFF
+No         lennard-jones     5.5354   2.8936   // UFF
+Lr         lennard-jones     5.5354   2.8829   // UFF
+# general mixing rule for Lennard-Jones
+Lorentz-Berthelot

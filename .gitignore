@@ -29,3 +29,9 @@ build/
 # OS
 .DS_Store
 Thumbs.db
+
+# Separate env for PACMAN charge assignment (scripts/assign_charges.py)
+charges_env/
+
+# Archived invalid simulation outputs (kept locally, not in git)
+data/archive/
