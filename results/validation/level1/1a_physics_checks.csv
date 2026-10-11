@@ -1,0 +1,15 @@
+check,value
+Simulations,21735.0
+Frameworks,483.0
+Frameworks with all 45 conditions,483.0
+Missing loadings,0.0
+Negative loadings,0.0
+"CO2 rises with pressure, 0.1 -> 10 bar (%)",100.0
+"CO2 falls with temperature, 298 -> 333 K (%)",100.0
+"N2 rises with pressure, 0.1 -> 10 bar (%)",99.8
+"N2 falls with temperature, 298 -> 333 K (%)",93.2
+"H2O rises with RH, 5 -> 15 % (%)",98.0
+CO2 median relative error (%),7.8
+N2 median relative error (%),6.9
+H2O median relative error (%),40.3
+Simulations with error bars (%),96.2

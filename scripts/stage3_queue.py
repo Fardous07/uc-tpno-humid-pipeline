@@ -52,13 +52,16 @@ import pandas as pd
 PROJECT_ROOT = Path("/home/fardo/uc_tpno_humid_pipeline/uc_tpno_humid_pipeline")
 # adsorption_v3: first run with framework charges + the UFF_TIP4P2005 force
 # field (adsorption_v2 used neither and is invalid).
-OUT_DIR = PROJECT_ROOT / "data/processed/adsorption_v3"
+# The QUEUE_* environment variables point the same queue at another MOF set
+# (e.g. the Level 3/4 validation runs, scripts/validation/validation_gcmc.sh)
+# with identical simulation settings.
+OUT_DIR = Path(os.environ.get("QUEUE_OUT_DIR", PROJECT_ROOT / "data/processed/adsorption_v3"))
 LOG_DIR = OUT_DIR / "logs"
 CHUNK_DIR = PROJECT_ROOT / "data/intermediate/cif_chunks_stage3"
-QUEUE_CIF_DIR = PROJECT_ROOT / "data/intermediate/cif_chunks_queue_v3"
-SELECTED_FILE = OUT_DIR / "gcmc_selected_mofs.txt"
+QUEUE_CIF_DIR = Path(os.environ.get("QUEUE_CIF_DIR", PROJECT_ROOT / "data/intermediate/cif_chunks_queue_v3"))
+SELECTED_FILE = Path(os.environ.get("QUEUE_SELECTED", OUT_DIR / "gcmc_selected_mofs.txt"))
 CUTOFF_A = 12.0
-CIF_DIR = PROJECT_ROOT / "data/intermediate/cifs_sanitized"
+CIF_DIR = Path(os.environ.get("QUEUE_SRC_CIF_DIR", PROJECT_ROOT / "data/intermediate/cifs_sanitized"))
 PLAN_FILE = OUT_DIR / "stage3_queue_plan.json"
 PID_FILE = OUT_DIR / "stage3_queue.pid"
 PYTHON = PROJECT_ROOT / "thesis_env/bin/python"

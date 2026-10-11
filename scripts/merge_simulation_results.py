@@ -76,9 +76,13 @@ def validate_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     if "pressure_bar" in df.columns:
         df = df[df["pressure_bar"] > 0]
 
-    # Drop infinite values
+    # Drop infinite values; NaN is allowed in error-bar columns (runs before
+    # error bars were recorded) since training treats them as unknown.
     numeric_cols = df.select_dtypes(include=[np.number]).columns
-    df = df[np.isfinite(df[numeric_cols]).all(axis=1)]
+    err_cols = [c for c in numeric_cols if c.endswith("_err")]
+    value_cols = [c for c in numeric_cols if c not in err_cols]
+    ok = np.isfinite(df[value_cols]).all(axis=1) & ~np.isinf(df[err_cols]).any(axis=1)
+    df = df[ok]
 
     n_after = len(df)
     if n_before > n_after:
@@ -119,6 +123,19 @@ def merge(worker_dir: Path, output_path: Path) -> None:
 
     merged = pd.concat(dfs, ignore_index=True)
     logger.info("Merged: %d rows total", len(merged))
+
+    # ADDED: drop structural duplicates. duplicate_resolution.csv (written
+    # after a pymatgen StructureMatcher check of the selected MOFs) lists,
+    # for each group of identical frameworks, the one copy to keep; the
+    # other copies are removed so the same structure cannot end up in both
+    # the training and the test set (data leakage).
+    dup_file = worker_dir / "duplicate_resolution.csv"
+    if dup_file.exists():
+        removed = set(pd.read_csv(dup_file).query("action == 'remove'").mof_id)
+        n_before = len(merged)
+        merged = merged[~merged["mof_id"].isin(removed)]
+        logger.info("Removed %d rows of %d duplicate frameworks (%s).",
+                    n_before - len(merged), len(removed), dup_file.name)
 
     # Deduplication — same MOF + conditions should not appear twice
     # FIX: was ["mof_id", "temperature", "pressure", "relative_humidity"],
