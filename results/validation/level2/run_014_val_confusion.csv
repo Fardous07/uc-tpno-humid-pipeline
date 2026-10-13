@@ -1,0 +1,2 @@
+label,n,TP,FP,FN,TN,accuracy,precision,recall,F1,MCC
+validation (48 MOFs),48,4,0,2,42,0.9583333333333334,1.0,0.6666666666666666,0.8,0.7977240352174656

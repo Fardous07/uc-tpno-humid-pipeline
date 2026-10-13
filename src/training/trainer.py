@@ -580,8 +580,11 @@ class TPNOTrainer:
             cfg.use_amp,
         )
 
+        # n_epochs is the TOTAL number of epochs: a run resumed from a
+        # checkpoint continues to the same end point instead of adding
+        # n_epochs on top of the resumed epoch.
         start_epoch = self.epoch
-        end_epoch = start_epoch + n_epochs
+        end_epoch = max(n_epochs, start_epoch)
 
         for ep in range(start_epoch, end_epoch):
             self.epoch = ep

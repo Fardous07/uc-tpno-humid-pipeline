@@ -166,6 +166,7 @@ class EncoderAdapter(nn.Module):
         encoder: nn.Module,
         target_dim: Optional[int] = None,
         normalize: bool = True,
+        n_extra_features: int = 0,
     ):
         super().__init__()
         self.encoder = encoder
@@ -187,7 +188,10 @@ class EncoderAdapter(nn.Module):
         # scale and bypass the pooling/normalisation washout that
         # collapsed the pure-GNN embeddings (diagnosed in run_004).
         self._n_desc = 12
-        self.proj = nn.Linear(enc_dim + self._n_desc, self._target_dim)
+        # Optional per-framework features supplied with the graph as
+        # ``data.mof_feat`` [B, F] (Stage 1 GCMC + charge statistics).
+        self._n_extra = int(n_extra_features)
+        self.proj = nn.Linear(enc_dim + self._n_desc + self._n_extra, self._target_dim)
 
         # LayerNorm
         self.norm = nn.LayerNorm(self._target_dim) if normalize else nn.Identity()
@@ -209,6 +213,13 @@ class EncoderAdapter(nn.Module):
         """
         h = self.encoder(data)                      # [B, enc_dim]
         d = self._descriptors(data, h)              # [B, n_desc]
+        if self._n_extra:
+            f = getattr(data, "mof_feat", None)
+            if f is None or f.shape[-1] != self._n_extra:
+                raise ValueError(
+                    f"Encoder expects {self._n_extra} per-framework features in "
+                    f"data.mof_feat; got {None if f is None else tuple(f.shape)}")
+            d = torch.cat([d, f.to(d.dtype).reshape(d.shape[0], -1)], dim=-1)
         h = self.proj(torch.cat([h, d], dim=-1))    # [B, target_dim]
         h = self.norm(h)
         return h
@@ -301,8 +312,10 @@ class EncoderAdapter(nn.Module):
         """
         config = dict(config)  # shallow copy
         name = config.pop("encoder", "nequip")
+        n_extra = int(config.pop("n_extra_features", 0) or 0)
         encoder = build_encoder(name, **config)
-        return cls(encoder, target_dim=target_dim, normalize=normalize)
+        return cls(encoder, target_dim=target_dim, normalize=normalize,
+                   n_extra_features=n_extra)
 
 
 # ═══════════════════════════════════════════════════════════════════════

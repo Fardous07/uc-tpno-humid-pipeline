@@ -29,6 +29,10 @@ data:
     max_core_mofs: 500
     shuffle_selection: true
   graph_dir: data/processed/graphs
+  # run_014: per-framework input features (scripts/build_mof_features.py):
+  # Stage 1 single-component GCMC (CO2/N2 at 0.1/1/10 bar, H2O at RH 5/15 %,
+  # 313 K) + 4 framework-charge statistics, standardised.
+  mof_features: data/processed/adsorption_v3/mof_features.parquet
   intermediate_dir: data/intermediate
   mofx_db_dir: data/raw/mofx_db
   processed_dir: data/processed
@@ -56,6 +60,8 @@ experiment:
   - humid_flue_gas
   - co2_capture
 model:
+  # run_014: number of per-framework input features (data.mof_features); 0 = off
+  n_mof_features: 12
   cutoff: 5.0
   emb_dim: 48
   dropout: 0.05
@@ -179,10 +185,19 @@ training:
     adaptive_weights: false
     lambda_competition: 0.0
     lambda_gibbs_duhem: 0.0
-    lambda_henry: 0.02
+    # run_013: Henry penalty OFF. Its coefficient-of-variation form divides
+    # by the mean predicted K_H, so while predictions are near zero its
+    # gradient dwarfs the data term and Adam follows it alone: in an
+    # ablation (24 training MOFs, free embeddings, 200 steps) the full loss
+    # learned nothing (CO2 MAE 1.54, water 0) while the same loss without it
+    # reached CO2 MAE 0.21 and water at 59 % of the labels. It also treated
+    # humid water (f < 0.1 bar) as dilute although those isotherms are
+    # non-linear. Henry behaviour is checked after training instead
+    # (validation: check_henry_region).
+    lambda_henry: 0.0
     lambda_hessian: 0.0
     # run_009: monotonicity and Maxwell symmetry are exact by construction,
-    # so their penalties are off. Henry now uses ln f = mu/RT per (MOF, T).
+    # so their penalties are off.
     lambda_monotonic: 0.0
     lambda_nll: 1.0          # trains the variance head (stop-gradient NLL)
     lambda_negative: 1.0     # penalises negative predicted loadings

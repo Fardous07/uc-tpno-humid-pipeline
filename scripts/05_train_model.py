@@ -226,6 +226,10 @@ def main() -> None:
     parser.add_argument("--patience",     type=int,   default=None)
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--grad-accum",   type=int,   default=None)
+    # Learning curve: train on a nested random subset of the training
+    # frameworks (validation and test sets unchanged).
+    parser.add_argument("--train-fraction", type=float, default=1.0)
+    parser.add_argument("--subset-seed",    type=int,   default=0)
     args = parser.parse_args()
 
     configure_logging(args.verbose_batches)
@@ -272,12 +276,23 @@ def main() -> None:
     print("\n=== Loading Data ===")
 
     # FIX: lazy_loading parameter was removed from AdsorptionDataset
+    # Optional per-framework features (Stage 1 GCMC + charges); the model's
+    # n_mof_features must match the number of f_* columns.
+    n_mof_features = int(model_cfg.get("n_mof_features", 0) or 0)
+    feature_path = data_cfg.get("mof_features") if n_mof_features else None
     dataset = AdsorptionDataset(
         registry_path=args.registry,
         adsorption_path=args.adsorption_data,
         graph_dir=args.graph_dir,
+        feature_path=feature_path,
         # condition_columns / target_columns use sensible defaults
     )
+    if n_mof_features and len(dataset.feature_names) != n_mof_features:
+        raise RuntimeError(
+            f"model.n_mof_features={n_mof_features} but {feature_path} has "
+            f"{len(dataset.feature_names)} feature columns")
+    if n_mof_features:
+        print(f"  MOF input features  : {n_mof_features} from {feature_path}")
 
     if len(dataset) == 0:
         raise RuntimeError(
@@ -306,6 +321,15 @@ def main() -> None:
             dataset.mof_ids, train_idx, val_idx, test_idx,
             str(out_dir / "splits.json"),
         )
+
+    if args.train_fraction < 1.0:
+        # nested subsets: one fixed permutation, take the first k frameworks,
+        # so the 25 % set is contained in the 50 % set and so on
+        perm = np.random.RandomState(args.subset_seed).permutation(len(train_idx))
+        k = max(1, int(round(args.train_fraction * len(train_idx))))
+        train_idx = [train_idx[j] for j in sorted(perm[:k])]
+        print(f"  Learning curve: training on {k} frameworks "
+              f"({args.train_fraction:.0%}, subset seed {args.subset_seed})")
 
     if len(train_idx) == 0 or len(val_idx) == 0:
         raise RuntimeError(
@@ -345,6 +369,7 @@ def main() -> None:
         "use_pbc":   model_cfg.get("use_pbc",          True),
         "use_charges": model_cfg.get("use_charges", False),
         "avg_num_neighbours": model_cfg.get("avg_num_neighbours", 15.0),
+        "n_extra_features": n_mof_features,
     }
     encoder = EncoderAdapter.from_config(
         encoder_config,

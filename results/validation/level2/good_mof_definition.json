@@ -1,0 +1,8 @@
+{
+  "fixed_on": "2026-10-13T15:03:29+02:00",
+  "fixed_before_test_set_evaluation": true,
+  "conditions": {"temperature_K": 313.15, "pressure_bar": 1.0, "co2_n2_ratio": "15:85", "rh": 0.15},
+  "good_if": {"co2_humid_molkg_min": 1.0, "co2_retention_humid_over_dry_min": 0.9},
+  "basis": "about 15 % of the 387 training MOFs qualify; thresholds chosen from training data only",
+  "model": "run_014 best_model.pt (epoch 275, val MAE 0.0499)"
+}

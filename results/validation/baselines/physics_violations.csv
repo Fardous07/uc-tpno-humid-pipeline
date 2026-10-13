@@ -1,0 +1,7 @@
+split,model,n,CO2 falls with P %,N2 falls with P %,negative %
+test,UC-TPNO,2160,0.0,0.0,4.98
+test,gbt,2160,0.0,1.1,5.74
+test,ridge,2160,2.14,8.56,16.7
+level3,UC-TPNO,1350,0.0,0.09,6.62
+level3,gbt,1350,0.0,0.83,4.17
+level3,ridge,1350,1.39,6.11,17.73

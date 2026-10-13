@@ -115,20 +115,30 @@ def error_bar_weights(
     """
     Inverse-variance weights from the GCMC error bars, expressed in the
     loss's normalised space: z = (T(n) − m)/s, so σ_z = σ_n · T'(n) / s with
-    T'(n) = 1/(1+n) for log1p. w = 1/(σ_z² + floor²); the floor stops points
-    with a (near-)zero error bar (e.g. water at 0 % RH) from dominating.
-    Unknown errors get the median weight. Weights are scaled to mean 1.
+    T'(n) = 1/(1+n) for log1p. w = 1/(σ_z² + floor²).
+
+    Weights only re-rank points *within* a component: they are scaled to
+    mean 1 separately for each component, so every adsorbate keeps an equal
+    share of the loss whatever its typical error bar. A zero error bar is not
+    information about precision -- it occurs where the loading is exactly 0
+    (water at 0 % RH, 32 % of all water labels) -- so such points, like those
+    with unknown errors, get the component's median weight. Previously these
+    trivial zeros received the maximum weight 1/floor² and, with one global
+    normalisation, pulled weight away from the informative humid water points.
     """
     deriv = 1.0 / (1.0 + targets.clamp(min=0.0)) if log1p else torch.ones_like(targets)
     sigma_z = target_err * deriv / q_std
     w = 1.0 / (sigma_z.pow(2) + floor ** 2)
-    valid = torch.isfinite(w)
-    if mask is not None:
-        valid = valid & mask.unsqueeze(-1).expand_as(w)
-    fill = w[valid].median() if valid.any() else torch.tensor(1.0, device=w.device)
-    w = torch.where(torch.isfinite(w), w, fill)
+    w = torch.where(target_err > 0, w, torch.full_like(w, float("nan")))
     sel = mask.unsqueeze(-1).expand_as(w) if mask is not None else torch.ones_like(w, dtype=torch.bool)
-    return w / w[sel].mean().clamp(min=1e-12)
+    out = torch.empty_like(w)
+    for c in range(w.shape[-1]):
+        wc, sc = w[..., c], sel[..., c]
+        valid = torch.isfinite(wc) & sc
+        fill = wc[valid].median() if valid.any() else torch.tensor(1.0, device=w.device)
+        wc = torch.where(torch.isfinite(wc), wc, fill)
+        out[..., c] = wc / wc[sc].mean().clamp(min=1e-12) if sc.any() else wc
+    return out
 
 
 def data_loss_nll(

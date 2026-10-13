@@ -48,11 +48,26 @@ class AdsorptionDataset(Dataset):
         condition_columns: Optional[List[str]] = None,
         target_columns: Optional[List[str]] = None,
         transform: Optional[Callable] = None,
+        feature_path: Optional[Union[str, Path]] = None,
     ):
         import pandas as pd
 
         self.graph_dir = Path(graph_dir)
         self.transform = transform
+
+        # Optional per-framework input features (scripts/build_mof_features.py:
+        # Stage 1 single-component GCMC + charge statistics, columns f_*).
+        # Attached to each graph as ``mof_feat`` [1, F]; PyG batching
+        # concatenates them to [B, F] for the encoder.
+        self.mof_features: Optional[Dict[str, torch.Tensor]] = None
+        if feature_path is not None:
+            fdf = pd.read_parquet(feature_path)
+            cols = [c for c in fdf.columns if c.startswith("f_")]
+            self.feature_names = cols
+            self.mof_features = {
+                m: torch.tensor(v, dtype=torch.float32)
+                for m, v in zip(fdf["mof_id"], fdf[cols].to_numpy())
+            }
 
         if condition_columns is None:
             condition_columns = ["mu_CO2", "mu_N2", "mu_H2O", "T"]
@@ -132,6 +147,10 @@ class AdsorptionDataset(Dataset):
         graph = torch.load(str(graph_path), weights_only=False)
         if self.transform is not None:
             graph = self.transform(graph)
+        if self.mof_features is not None:
+            if mof_id not in self.mof_features:
+                raise KeyError(f"No input features for {mof_id} -- rerun scripts/build_mof_features.py")
+            graph.mof_feat = self.mof_features[mof_id].unsqueeze(0)   # [1, F]
 
         # Slice adsorption rows (positional — safe after reset_index)
         rows = self._mof_to_rows[mof_id]
@@ -262,9 +281,30 @@ class AdsorptionDataset(Dataset):
         elif target_transform not in ("identity", None):
             raise ValueError(f"Unknown target_transform: {target_transform!r}")
 
+        # Chemical-potential standardisation from physically present species
+        # only. A species that is absent (water at 0 % RH) is simulated with a
+        # trace mole fraction (y = 1e-10), i.e. an arbitrary μ ~ -60 kJ/mol far
+        # below every real condition. Including those rows set σ(μ_H2O) to
+        # 22.3 kJ/mol while all humid conditions lie within ~2 kJ/mol, so
+        # RH 5 % and 15 % were 0.13 σ apart and n_H2O = (c/σ)·∂Φ/∂μ̃ needed ~5x
+        # larger gradients than CO2 -- the model then predicted water ~6x too
+        # small. Rows with fugacity < 1e-6 bar (μ/RT < ln 1e-6) are excluded
+        # from the μ statistics; standardisation is affine, so n = c·∂Φ/∂μ and
+        # the thermodynamic guarantees are unchanged. The last column is T.
+        mu_mean = cond_cat.mean(0).clone()
+        mu_std = cond_cat.std(0).clone()
+        if cond_cat.shape[1] >= 2:
+            R = 8.314462618e-3  # kJ/(mol K); μ is in kJ/mol relative to 1 bar
+            T = cond_cat[:, -1:].clamp(min=1.0)
+            present = cond_cat[:, :-1] / (R * T) > torch.log(torch.tensor(1e-6))
+            for j in range(cond_cat.shape[1] - 1):
+                col = cond_cat[present[:, j], j]
+                if col.numel() > 1:
+                    mu_mean[j], mu_std[j] = col.mean(), col.std()
+
         return {
-            "mu_mean": cond_cat.mean(0),
-            "mu_std":  cond_cat.std(0).clamp(min=1e-6),
+            "mu_mean": mu_mean,
+            "mu_std":  mu_std.clamp(min=1e-6),
             "q_mean":  load_cat.mean(0),
             "q_std":   load_cat.std(0).clamp(min=1e-6),
         }
