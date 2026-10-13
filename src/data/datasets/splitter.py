@@ -167,12 +167,8 @@ class DataSplitter:
         test set.  The training dry set is then split into train / val
         where val is ``self.val_size`` fraction of the **total** dataset.
 
-        FIX: original code used
-            n_val = int(len(dry_arr) * self.val_size / (1 - self.test_size))
-        which divides by the *configured* test_size, not the actual humid
-        fraction.  In the humidity split the test set is all humid samples,
-        so self.test_size is irrelevant and gave a wrong n_val.
-        Correct: n_val = int(n_total * self.val_size), capped to dry set.
+        n_val = int(n_total * val_size), capped to the dry set (the test set is
+        all humid samples, so test_size plays no role here).
         """
         if metadata is None or "humidity" not in metadata.columns:
             raise ValueError("Humidity split requires metadata with 'humidity' column.")
@@ -194,8 +190,6 @@ class DataSplitter:
         test_idx = humid_idx
 
         # val = self.val_size fraction of total, taken from dry set
-        # FIX: was int(len(dry_arr) * self.val_size / (1 - self.test_size))
-        #      — wrong denominator; self.test_size has no meaning here
         dry_arr = np.array(dry_idx)
         rng.shuffle(dry_arr)
         n_val = max(1, min(int(n_total * self.val_size), len(dry_arr) - 1))

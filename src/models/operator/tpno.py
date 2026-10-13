@@ -25,20 +25,19 @@ class TPNOConfig:
     convex_constraint: str = "softplus"   # "softplus" | "exp" | "clamp"
     film_conditioning: bool = True        # required: T enters through FiLM
     dropout: float = 0.1
-    # run_009: the potential network must be convex in mu. That needs a
-    # convex, non-decreasing activation (softplus / relu) and NO LayerNorm
-    # on the hidden-state path (Amos et al., ICML 2017). swish + LayerNorm,
-    # the old defaults, made Phi non-convex in practice.
+    # the potential network must be convex in mu. That needs a convex,
+    # non-decreasing activation (softplus / relu) and NO LayerNorm on the
+    # hidden-state path (Amos et al., ICML 2017).
     use_layer_norm: bool = False
     activation: str = "softplus"
     min_potential: float = 1e-6
-    # --- run_007: target transform ---------------------------------------
+    # --- target transform -------------------------------------------------
     # "log1p"    : train on log1p(loading); predictions are expm1'd back to
     #              real mol/kg. Compresses the heavy CO2 loading tail and
     #              rebalances the per-gas scale (helps CO2 + H2O). The
     #              normalization stats (q_mean/q_std) MUST be computed on
     #              log1p(loadings) — see AdsorptionDataset.compute_normalization_stats.
-    # "identity" : original linear standardization (run_005/run_006 behaviour).
+    # "identity" : linear standardization of raw loadings.
     target_transform: str = "log1p"
 
 
@@ -69,19 +68,9 @@ def _make_activation(name: str) -> nn.Module:
 # ---------------------------------------------------------------------------
 # ICNN  (Input Convex Neural Network)
 #
-# FIX: Replaced project_weights() + .data assignment with reparameterisation.
-#
-# OLD approach (broken gradient flow):
-#   - Stored raw weights W, projected them with softplus in torch.no_grad()
-#     by assigning to W.data inside forward().
-#   - Backward pass saw the projected values but NOT the softplus Jacobian,
-#     so the effective learning rate was wrong by a factor of softplus'(w-5).
-#
-# NEW approach (correct gradient flow):
-#   - Store raw (unconstrained) parameters.
-#   - Apply the non-negativity constraint inside the forward pass via
-#     _pos(raw_weight), so autograd differentiates through softplus correctly.
-#   - project_weights() is gone entirely.
+# Raw (unconstrained) parameters are stored; the non-negativity constraint is
+# applied in the forward pass via _pos(raw_weight), so autograd differentiates
+# through softplus.
 # ---------------------------------------------------------------------------
 
 class ICNN(nn.Module):
@@ -277,8 +266,8 @@ class ThermodynamicPotentialNO(nn.Module):
     """
     Thermodynamic Potential Neural Operator.
 
-    Architecture (run_009)
-    ----------------------
+    Architecture
+    ------------
     encoder(graph)          → h ∈ ℝ^{emb_dim}           (MOF embedding)
     FiLM([h, T̃])            → (γ, β)                     (MOF- and T-specific modulation)
     ICNN(μ̃; γ, β)           → Φ = −Ω ≥ 0, convex in μ̃   (pressure-like potential, pV)
@@ -291,25 +280,14 @@ class ThermodynamicPotentialNO(nn.Module):
     c is a constant (mean of the μ standard deviations), so these hold in
     physical units, not just in normalised ones.
 
-    run_009 fixes: the previous version used n = −∂Ω/∂μ with Ω convex,
-    which forces ∂n_i/∂μ_i ≤ 0 (wrong sign; physically Ω is CONCAVE in μ),
-    and its swish + LayerNorm ICNN was not convex anyway. Loadings were also
-    produced through a per-component log/standardisation transform, which
-    breaks Maxwell symmetry in physical units; the transform now lives only
-    in the loss (normalize_q).
+    Ω is concave in μ, so Φ = −Ω is convex and ∂n_i/∂μ_i ≥ 0. Loadings are
+    produced directly in physical units (a per-component transform would
+    break Maxwell symmetry); the log/standardisation transform lives only in
+    the loss (normalize_q).
 
-    Fixes vs. previous version
-    --------------------------
-    1. ICNN uses reparameterisation instead of project_weights() so that
-       gradients flow correctly through the non-negativity constraint.
-    2. Hessian is computed from the FIRST autograd.grad call (no second
-       ICNN forward pass needed), cutting hessian computation cost in half.
-    3. Hessian cache removed — it was unreliable (id() reuse, non-unique
-       sum keys) and wrong to cache across training batches.
-
-    run_007
-    -------
-    The normalization now composes an optional target transform
+    Normalization
+    -------------
+    The normalization composes an optional target transform
     (config.target_transform) with standardization:
         normalize_q(q)   :  real → (T(q) - q_mean) / q_std      (for the loss)
         denormalize_q(z) :  z → T^{-1}(z * q_std + q_mean)      (→ real mol/kg)
@@ -355,15 +333,14 @@ class ThermodynamicPotentialNO(nn.Module):
             nn.Linear(config.hidden_dim // 2, config.n_components),
         )
         # Init: σ_z = 1 (log σ² = 0), the scale of early residuals in the
-        # standardised target space (run_009; was -5 → σ ≈ 0.08, giving a
-        # huge initial NLL).
+        # standardised target space.
         nn.init.zeros_(self.log_var_net[-1].weight)
         nn.init.zeros_(self.log_var_net[-1].bias)
 
         # Auxiliary direct head: [h, mu_norm] -> q_norm.
         # Provides a FIRST-ORDER gradient path to the encoder (the ICNN
         # path only reaches the encoder via a mixed second derivative,
-        # which caused encoder collapse in run_003).
+        # which can make the encoder collapse).
         self.aux_head = nn.Sequential(
             nn.Linear(config.emb_dim + config.n_conditions, config.hidden_dim),
             nn.SiLU(),
@@ -373,7 +350,7 @@ class ThermodynamicPotentialNO(nn.Module):
         )
 
         # Normalization buffers (set by set_normalization before training).
-        # run_007: q_mean / q_std are stats of the TRANSFORMED target
+        # q_mean / q_std are stats of the TRANSFORMED target
         # (e.g. log1p(loading)) when config.target_transform == "log1p".
         self.register_buffer("mu_mean", torch.zeros(config.n_conditions))
         self.register_buffer("mu_std",  torch.ones(config.n_conditions))
@@ -405,7 +382,7 @@ class ThermodynamicPotentialNO(nn.Module):
     def normalize_mu(self, mu: torch.Tensor) -> torch.Tensor:
         return (mu - self.mu_mean) / (self.mu_std + 1e-8)
 
-    # --- run_007: composable target transform T and its inverse ----------
+    # --- composable target transform T and its inverse ----------
 
     def _fwd_transform(self, q: torch.Tensor) -> torch.Tensor:
         """Real loading → transform space T(q)."""
@@ -527,8 +504,7 @@ class ThermodynamicPotentialNO(nn.Module):
             output["hessian"] = hess_flat.reshape(B, P, n_comp, n_comp)
 
         if return_uncertainty:
-            # Per-condition aleatoric uncertainty (previously averaged over
-            # all conditions of a MOF, so σ could not vary with P, T or RH).
+            # Per-condition aleatoric uncertainty (σ varies with P, T and RH).
             # h is detached: the variance head is fitted ON TOP of the
             # embedding and cannot pull the encoder (its NLL is large early
             # in training and would otherwise distort the representation).
@@ -701,15 +677,10 @@ class TPNOEnsemble(nn.Module):
     - Each ensemble member's ICNN + FiLM are independent.
     - ~M× speedup in encoder inference vs. running all M models separately.
 
-    FIX: when share_encoder=True, the shared encoder is stored as a plain
-    Python attribute (not a registered nn.Module submodule) to prevent the
-    same parameters appearing in self.parameters() multiple times — once via
-    self._shared_encoder and once via each model.encoder.  In PyTorch < 2.0
-    there is no automatic deduplication, so the optimizer would apply the
-    encoder update n_models+1 times per step.  Storing it outside the module
-    registry avoids double-registration while keeping gradients flowing
-    correctly (the encoder IS registered inside each model in self.models,
-    and all models share the SAME encoder object, so it IS trained).
+    With share_encoder=True the shared encoder is kept as a plain attribute
+    (not a registered submodule) so its parameters appear only once in
+    self.parameters(); it is still trained through self.models, which all
+    hold the same encoder object.
     """
 
     def __init__(
@@ -724,8 +695,8 @@ class TPNOEnsemble(nn.Module):
         self.share_encoder = share_encoder
 
         if share_encoder:
-            # FIX: store as plain attribute, NOT as a registered submodule,
-            # to avoid duplicate parameter registration in self.parameters().
+            # plain attribute, NOT a registered submodule, to avoid
+            # duplicate parameter registration in self.parameters().
             # The encoder IS still registered inside self.models[0].encoder
             # (all models share the same object), so it will be trained.
             self._shared_encoder_ref: Optional[nn.Module] = encoder
@@ -804,8 +775,7 @@ class TPNOEnsemble(nn.Module):
         mean_pred = pred_stack.mean(dim=0)          # [B, P, C]
         epistemic = pred_stack.std(dim=0)           # [B, P, C]  mol/kg
         aleatoric = sigma_stack.mean(dim=0)         # [B, P, C]  mol/kg (physical σ)
-        # run_009: both terms are now in mol/kg (σ used to be in normalised
-        # log units, so this sum mixed units).
+        # both terms in mol/kg
         total     = (epistemic.pow(2) + aleatoric.pow(2)).sqrt()
 
         result: Dict[str, torch.Tensor] = {
@@ -816,10 +786,9 @@ class TPNOEnsemble(nn.Module):
             "aleatoric":         aleatoric,
             "total_uncertainty": total,
         }
-        # run_009: per-member outputs are always returned so the loss can
-        # train every member on its OWN prediction (a deep ensemble). Training
-        # only the ensemble mean let the members co-adapt, which makes their
-        # spread meaningless as an epistemic uncertainty.
+        # per-member outputs are returned so the loss trains every member on
+        # its OWN prediction (a deep ensemble); training only the mean would
+        # let the members co-adapt and make their spread meaningless.
         result["all_predictions"] = pred_stack
         result["all_sigma"]       = sigma_stack
         if auxs:
@@ -938,19 +907,14 @@ class ThermodynamicValidator:
         """
         Verify Henry's law: q(P_high)/q(P_low) ≈ P_high/P_low.
         Only checks CO2 and N2 (H2O at very low μ is numerically unstable).
-
-        FIX: conditions tensor size now reads from model.config.n_conditions
-        instead of the previous hardcoded 4, so the validator works correctly
-        when the model is built with a non-default number of conditions.
         """
         device = next(model.parameters()).device
-        # FIX: μ in the model is RT·ln(f / 1 bar) in kJ/mol (src.utils.chemistry),
-        # not ln(p). Ideal-gas fugacity ≈ pressure at these dilute conditions.
+        # μ in the model is RT·ln(f / 1 bar) in kJ/mol (src.utils.chemistry).
+        # Ideal-gas fugacity ≈ pressure at these dilute conditions.
         RT = 8.314462618e-3 * T
         mu_lo  = RT * math.log(low_pressure)
         mu_hi  = RT * math.log(high_pressure)
 
-        # FIX: use model.config.n_conditions instead of hardcoded 4
         n_cond = model.config.n_conditions
         cond   = torch.zeros(2, n_cond, device=device)
         cond[0, :n_components] = mu_lo

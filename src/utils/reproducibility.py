@@ -28,26 +28,6 @@ evaluation pipeline:
     8.  **Context managers** — ``ReproducibleBlock`` for scoped seeding of
         isolated sub-computations without contaminating the global RNG state.
 
-Fixes vs previous version
-──────────────────────────
-1. ``from .constants import DEFAULT_SEED, PIPELINE_VERSION`` crashed at
-   import because constants.py contains CODATA physics constants only —
-   neither name was defined there.  Fixed: both are defined in this module.
-   PIPELINE_VERSION = "0.1.0", DEFAULT_SEED = 42.
-
-2. ExperimentManifest.load() did ``cls(**d)`` which raises TypeError if the
-   JSON has fields unknown to the current dataclass (e.g., from an older
-   or newer manifest format).  Fixed: filter to known fields before passing.
-
-3. worker_init_fn() seeded ``random`` and ``np.random`` but not
-   ``torch.random``.  Workers using torch augmentation got identical
-   sequences across all workers.  Fixed: added ``torch.manual_seed``.
-
-4. get_environment_fingerprint() used ``__import__(pkg)`` with PyPI names
-   (e.g. "scikit-learn") where the import name differs ("sklearn").
-   __import__("scikit-learn") raises ModuleNotFoundError.
-   Fixed: explicit import-name mapping.
-
 Project : UC-TPNO — Uncertainty-Calibrated Thermodynamic Potential
           Neural Operator for Humid Flue-Gas CO₂ Capture in MOFs
 License : MIT
@@ -74,8 +54,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 
-# FIX 1: define these here — they do NOT exist in constants.py (which
-# contains CODATA physics constants only).
+# defined here; constants.py holds physics constants only
 DEFAULT_SEED:     int = 42
 PIPELINE_VERSION: str = "0.1.0"
 
@@ -273,9 +252,7 @@ def worker_init_fn(worker_id: int) -> None:
 
         worker_seed = torch.initial_seed() % 2**32 + worker_id
 
-    FIX: now also calls ``torch.manual_seed()`` — previous version only
-    seeded ``random`` and ``np.random``, so workers using torch
-    augmentation (e.g. ``torch.randn``) got identical sequences.
+    Seeds ``random``, ``np.random`` and ``torch`` for each worker.
 
     Pass to ``DataLoader(worker_init_fn=worker_init_fn)``.
     """
@@ -373,9 +350,7 @@ def is_git_clean() -> bool:
 # 6.  ENVIRONMENT FINGERPRINT
 # ═══════════════════════════════════════════════════════════════════════
 
-# FIX 4: map PyPI package names → actual Python import names.
-# __import__("scikit-learn") raises ModuleNotFoundError because the
-# importable name is "sklearn", not "scikit-learn".
+# PyPI package name → Python import name (e.g. scikit-learn → sklearn)
 _PKG_IMPORT_NAMES: Dict[str, str] = {
     "scikit-learn": "sklearn",
     "torch_geometric": "torch_geometric",
@@ -566,10 +541,7 @@ class ExperimentManifest:
         """
         Load a manifest from JSON.
 
-        FIX: previous version did ``cls(**d)`` which raises TypeError
-        if the JSON contains fields unknown to the current dataclass
-        (e.g. a manifest from a different codebase version).
-        Now filters to known fields before passing.
+        Unknown fields (e.g. from a different code version) are ignored.
         """
         with open(path, "r", encoding="utf-8") as f:
             d = json.load(f)

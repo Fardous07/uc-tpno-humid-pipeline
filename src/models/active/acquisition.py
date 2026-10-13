@@ -14,29 +14,8 @@ Dependencies
 * Optional  : ``botorch``, ``gpytorch`` — lazy-imported; falls back to
               heuristics when absent.
 
-Fixes vs. original
-------------------
-1. BUG FIXED: @torch.no_grad() on UncertaintyAcquisition.__call__.
-   TPNO derives loadings via autograd.grad(omega, mu).  Under no_grad,
-   requires_grad_(True) is silently ignored → RuntimeError.  Decorator
-   removed; model.eval() is sufficient.
-
-2. BUG FIXED: with torch.no_grad() in score_candidates_simple.
-   Same root cause — model call inside a no_grad context crashes TPNO.
-   Removed; the caller is responsible for gradient context.
-
-3. BUG FIXED: entropy_acquisition called ensemble members inside
-   torch.no_grad() without re-enabling gradients.  The outer no_grad
-   block has been removed; model.eval() handles dropout/BN correctly.
-
-4. BUG FIXED: qEHVI acquisition missing required partitioning argument.
-   Since BoTorch 0.6, qExpectedHypervolumeImprovement requires a
-   NondominatedPartitioning object.  Added.
-
-5. BUG FIXED: Manual Adam GP-fitting loop passed 2D train_Y directly
-   to self._mll(), which fails for single-output models that expect a
-   1D target.  Replaced with BoTorch's fit_gpytorch_mll() which handles
-   all model/output-transform combinations correctly.
+No acquisition wraps the model in torch.no_grad(): TPNO derives loadings
+via autograd.grad(Φ, μ); model.eval() already disables dropout.
 
 References
 ──────────
@@ -221,10 +200,6 @@ def entropy_acquisition(
     """
     Entropy-based acquisition using MC dropout or ensemble.
 
-    FIX: original wrapped ensemble model calls inside torch.no_grad(),
-    which prevents TPNO from computing loadings via autograd.grad.
-    Removed the outer no_grad block; model.eval() handles BN/dropout.
-
     Parameters
     ----------
     model      : nn.Module (TPNO or ensemble)
@@ -232,8 +207,7 @@ def entropy_acquisition(
     conditions : [B, P, D]
     n_samples  : MC-dropout samples (ignored for ensembles)
     """
-    # FIX: model.eval() is sufficient — NO torch.no_grad() wrapper here
-    # because TPNO internally calls autograd.grad(omega, mu).
+    # no torch.no_grad(): TPNO calls autograd.grad internally
     model.eval()
 
     ensemble_obj = getattr(model, "ensemble", None) or getattr(model, "models", None)
@@ -285,9 +259,6 @@ class UncertaintyAcquisition:
 
     Score = w_epi · σ_epi + w_conf · width_conf + w_sel · selectivity
 
-    FIX: original had @torch.no_grad() decorator which prevents TPNO
-    from computing loadings via autograd.grad(omega, mu).  Removed;
-    model.eval() is sufficient.
     """
 
     def __init__(
@@ -304,8 +275,7 @@ class UncertaintyAcquisition:
         self.w_conf = w_conformal
         self.w_sel  = w_selectivity
 
-    # FIX: @torch.no_grad() REMOVED — autograd.grad inside TPNO requires
-    # gradients to be enabled.  model.eval() disables dropout/BN only.
+    # no torch.no_grad(): TPNO calls autograd.grad internally
     def __call__(
         self,
         graphs:     Any,
@@ -446,9 +416,7 @@ class MultiFidelityBO:
         """
         Fit (or refit) the GP surrogate on current observations.
 
-        FIX: original used a manual Adam loop that passed 2D train_Y to
-        self._mll(), failing for single-output models.  Now uses
-        fit_gpytorch_mll() which handles all output-transform variants.
+        Uses fit_gpytorch_mll(), which handles all output-transform variants.
         """
         if not _import_botorch():
             logger.warning(
@@ -496,7 +464,6 @@ class MultiFidelityBO:
             self._model.likelihood, self._model
         )
 
-        # FIX: use fit_gpytorch_mll instead of a fragile manual Adam loop
         try:
             fit_gpytorch_mll(self._mll)
         except Exception as e:
@@ -532,8 +499,7 @@ class MultiFidelityBO:
             )
 
         if acq_name == "qehvi":
-            # FIX: NondominatedPartitioning is required since BoTorch 0.6.
-            # The original call without partitioning raises TypeError.
+            # NondominatedPartitioning is required since BoTorch 0.6
             from botorch.acquisition.multi_objective import (
                 qExpectedHypervolumeImprovement,
             )
@@ -835,10 +801,6 @@ def score_candidates_simple(
     """
     Simple acquisition function wrapper for the active learning loop.
 
-    FIX: original wrapped the model call in torch.no_grad() which
-    prevents TPNO from computing loadings via autograd.grad(omega, mu).
-    Removed; model.eval() is sufficient.
-
     Parameters
     ----------
     model       : ThermodynamicPotentialNO or TPNOEnsemble.
@@ -848,7 +810,7 @@ def score_candidates_simple(
     beta        : UCB exploration weight.
     return_all  : If True, return dict with all intermediate scores.
     """
-    # FIX: NO torch.no_grad() — TPNO uses autograd.grad internally.
+    # no torch.no_grad(): TPNO calls autograd.grad internally
     model.eval()
 
     out    = model(candidates, conditions)

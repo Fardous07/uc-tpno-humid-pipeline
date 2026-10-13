@@ -112,22 +112,10 @@ def parse_raspa_output(
         logger.warning("No RASPA output files in %s — returning empty result.", out_dir)
         return {"loadings": {}, "converged": False}
 
-    # BUG FIX: mol/kg and molecules/unit-cell readings used to share one
-    # accumulator list per species. Real RASPA output always prints the
-    # "[molecules/unit cell]" line BEFORE "[mol/kg framework]" for each
-    # component, so the old `current_species not in accumulated` guard was
-    # always true on that first line and silently seeded the accumulator
-    # with a raw molecules/unit-cell count -- then the correct mol/kg value
-    # for the same component was appended to the SAME list, and
-    # np.mean() averaged two numbers in different units together
-    # (verified: this produced 7.898 instead of the correct 3.456 mol/kg on
-    # authentic RASPA-format output -- a genuine, silent unit-mixing bug
-    # that would have corrupted every loading value parsed through this
-    # function, e.g. every GCMC job run via
-    # scripts/08_active_learning_loop.py's active-learning loop). Track the
-    # two units in separate accumulators and only fall back to the
-    # molecules/unit-cell proxy for a species that never got a real mol/kg
-    # reading.
+    # RASPA prints the [molecules/unit cell] line BEFORE [mol/kg framework] for
+    # each component, so the two units are kept in separate accumulators; the
+    # molecules/unit-cell value is only a fallback for a species that never got
+    # a mol/kg reading.
     mol_kg_accum: Dict[str, List[float]] = {}
     moluc_accum: Dict[str, List[float]] = {}
 

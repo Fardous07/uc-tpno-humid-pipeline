@@ -11,13 +11,13 @@ objects containing the fields that our E(3)-equivariant encoders
     pbc        : ``[3]``    bool  — periodic boundary conditions
     edge_index : ``[2, E]`` long  — neighbour list
     edge_attr  : ``[E, D]`` float — edge features (length, unit vector)
-    q          : ``[N]``    float — per-atom partial charge (run_008)
+    q          : ``[N]``    float — per-atom partial charge
 
 Supports:
 *  Radius-based neighbour list (with PBC).
 *  k-nearest-neighbours (kNN) graph.
 *  Pre-computed edge features (distance + unit displacement vector).
-*  Per-atom partial charge as a node feature (run_008).
+*  Per-atom partial charge as a node feature.
 *  Batch processing of entire directories.
 *  Loading back from saved ``.pt`` files.
 
@@ -70,7 +70,7 @@ class GraphConfig:
 # 2.  CORE CONVERSION
 # ═══════════════════════════════════════════════════════════════════════
 
-# run_008: per-atom charges are parsed by the shared, torch-free reader so
+# per-atom charges are parsed by the shared, torch-free reader so
 # GCMC labels (04_run_simulations.py) and graph node features use identical charges.
 from src.utils.cif_charges import read_site_charges as _read_site_charges_from_cif  # noqa: E402
 
@@ -113,7 +113,7 @@ def cif_to_graph(
     # Periodic boundary conditions
     pbc = torch.tensor(atoms.get_pbc(), dtype=torch.bool)
 
-    # run_008: per-atom partial charge.
+    # per-atom partial charge.
     # Primary: ASE (aligned to atom order). Fallback: parse the CIF text
     # directly if ASE reports all-zero (some ASE versions ignore the
     # _atom_site_charge tag). 0.0 where charges are genuinely absent.
@@ -160,7 +160,7 @@ def cif_to_graph(
         cell=cell.unsqueeze(0),    # [1, 3, 3] for batching
         pbc=pbc,
         edge_index=edge_index,
-        q=q,                       # [N] per-atom partial charge (run_008)
+        q=q,                       # [N] per-atom partial charge
         num_nodes=len(z),
     )
 

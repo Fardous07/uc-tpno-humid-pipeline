@@ -9,13 +9,6 @@ NOTE on project layout
 In this project the conventional names are swapped:
     gctmmc/parser.py  → GCTMMCConfig / generate_tmmc_input / GCTMMCRunner (RUNNER)
     gctmmc/runner.py  → parse_tmmc_output / collection_matrix_to_ln_pi … (PARSER)
-
-Fixes applied
-─────────────
-1. parse_tmmc_output bridge: signature was (job_dir, temperature) but test calls
-   parse_tmmc_output(tmp_path, T=313.15) → TypeError.  Fixed: accept **T** kwarg.
-2. Re-export synthetic_collection_matrix, collection_matrix_to_ln_pi,
-   ln_pi_to_isotherm from runner.py so test imports from gctmmc.parser work.
 """
 
 from __future__ import annotations
@@ -144,14 +137,8 @@ TMC_BiasUpdate                {bias_update}
 TMC_CollectionMatrix          yes
 """
 
-# FIX: these used to name folders that don't exist in a real RASPA2
-# install ("TraPPE", and "TIP4P/2005" -- which additionally contains a
-# literal "/", so it was read as two nested directories "TIP4P/2005/",
-# not a label). Verified against an actual RASPA2 build: CO2.def, N2.def,
-# and H2O.def (added for this project's humid GCMC) all live directly
-# under molecules/ExampleDefinitions/. Confirmed this was silently
-# failing 100% of GC-TMMC jobs (54/54 in a real test run) with
-# "Cannot open .../molecules/TraPPE/CO2.def" before this fix.
+# CO2.def, N2.def and H2O.def live directly under
+# molecules/ExampleDefinitions/ in a RASPA2 install.
 _MOLECULE_DEFS: Dict[str, str] = {
     "CO2": "ExampleDefinitions",
     "N2":  "ExampleDefinitions",
@@ -201,15 +188,11 @@ def generate_tmmc_input(
 
 # ═══════════════════════════════════════════════════════════════════════
 # 4. PARSER BRIDGE + re-exports
-# FIX: accept T kwarg (was 'temperature') to match test call:
-#      parse_tmmc_output(tmp_path, T=313.15)
-# FIX: re-export synthetic_collection_matrix, collection_matrix_to_ln_pi,
-#      ln_pi_to_isotherm from runner.py so test imports from gctmmc.parser work.
 # ═══════════════════════════════════════════════════════════════════════
 
 def parse_tmmc_output(
     job_dir: Union[str, Path],
-    T: float = 313.15,           # FIX: renamed from temperature
+    T: float = 313.15,
     pressures=None,
 ) -> Dict[str, Any]:
     """Bridge to the actual parser in gctmmc/runner.py."""
@@ -364,15 +347,9 @@ class GCTMMCRunner:
         return hashlib.md5(raw.encode("utf-8")).hexdigest()[:12]
 
 
-# FIX: this MUST come after GCTMMCRunner is fully defined above -- runner.py's
-# own module-level `from .parser import (..., GCTMMCRunner)` needs
-# GCTMMCRunner to already exist in this module's namespace by the time it
-# runs. Placing this import earlier (as it was) triggered runner.py mid-way
-# through this file's execution, before GCTMMCRunner existed, causing
-# "ImportError: cannot import name 'GCTMMCRunner' from partially initialized
-# module" on every single caller (verified: this broke every GCTMMC test in
-# tests/test_simulation/test_gcmc.py, and would have made
-# run_stage1_isotherms_gctmmc() in 04_run_simulations.py fail immediately).
+# must come after GCTMMCRunner is defined: runner.py imports GCTMMCRunner
+# from this module, so an earlier import would hit a partially initialised
+# module.
 from .runner import (           # noqa: E402
     synthetic_collection_matrix,
     collection_matrix_to_ln_pi,

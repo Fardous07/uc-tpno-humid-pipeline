@@ -31,15 +31,9 @@ def find_worker_parquets(worker_dir: Path) -> list[Path]:
     """
     Find each worker's own final adsorption_training.parquet.
 
-    FIX: this used to glob("*.parquet") inside each worker_* subdirectory,
-    which also picks up gcmc_adsorption.parquet (pre-dedup, same rows as
-    adsorption_training.parquet but not cleaned) and gcmc_failures.parquet
-    (a completely different schema: mof_id/temperature_k/pressure_bar/rh/
-    returncode/error_tail, no loading columns at all). Concatenating all
-    three together per worker silently produced a merged file mixing rows
-    from three different, incompatible tables. Now only collects each
-    worker's adsorption_training.parquet -- the one clean, deduplicated
-    file 04_run_simulations.py's build_training_dataset() actually writes.
+    Only each worker's adsorption_training.parquet is collected (the
+    cleaned, deduplicated file build_training_dataset() writes); the other
+    parquet files in a worker directory have different contents or schemas.
     """
     files: list[Path] = []
 
@@ -124,7 +118,7 @@ def merge(worker_dir: Path, output_path: Path) -> None:
     merged = pd.concat(dfs, ignore_index=True)
     logger.info("Merged: %d rows total", len(merged))
 
-    # ADDED: drop structural duplicates. duplicate_resolution.csv (written
+    # drop structural duplicates. duplicate_resolution.csv (written
     # after a pymatgen StructureMatcher check of the selected MOFs) lists,
     # for each group of identical frameworks, the one copy to keep; the
     # other copies are removed so the same structure cannot end up in both
@@ -138,12 +132,7 @@ def merge(worker_dir: Path, output_path: Path) -> None:
                     n_before - len(merged), len(removed), dup_file.name)
 
     # Deduplication — same MOF + conditions should not appear twice
-    # FIX: was ["mof_id", "temperature", "pressure", "relative_humidity"],
-    # but the actual columns 04_run_simulations.py writes are
-    # temperature_k/pressure_bar/rh -- none of those three matched, so
-    # id_cols silently fell back to just ["mof_id"] and drop_duplicates
-    # collapsed all 45 conditions per MOF down to 1 row per MOF (verified:
-    # a 4-MOF/45-condition test run merged to 4 rows total instead of 180).
+    # condition columns as written by 04_run_simulations.py
     id_cols = [c for c in ["mof_id", "temperature_k", "pressure_bar", "rh"]
                if c in merged.columns]
     if id_cols:
@@ -184,20 +173,12 @@ def merge(worker_dir: Path, output_path: Path) -> None:
         print("\nRows per MOF (first 10):")
         counts = merged.groupby("mof_id").size().sort_values(ascending=False)
         print(counts.head(10).to_string())
-        # FIX: was hardcoded to 36 (3T x 4P x 3RH), stale for the actual
-        # condition grid this pipeline uses (3T x 5P x 3RH = 45, and this
-        # script has no way to know the exact grid a given run used
-        # anyway). Detect the expected per-MOF count dynamically instead
-        # of hardcoding a number that silently drifts out of sync with
-        # whatever --temperatures/--pressures/--rhs were actually passed.
+        # expected per-MOF count detected from the data (the grid can vary)
         full_count = int(counts.max()) if not counts.empty else 0
         n_complete = (counts >= full_count).sum()
         print(f"\nMOFs with all {full_count} conditions complete (detected from data): "
               f"{n_complete}/{counts.shape[0]}")
 
-    # FIX: this used to hardcode the OLD data/processed/adsorption path
-    # regardless of --output, silently pointing users at stale/wrong data
-    # whenever --output was actually used (as the parallel launcher does).
     print("\nNext step:")
     print("  python scripts/05_train_model.py \\")
     print("    --registry data/mof_registry.parquet \\")

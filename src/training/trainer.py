@@ -351,9 +351,8 @@ class TPNOTrainer:
         """
         Call the loss module with the arguments its signature accepts.
 
-        run_009: dispatch on the signature instead of retrying on
-        TypeError, which also swallowed genuine TypeErrors raised INSIDE
-        the loss and silently re-called it without mask / error bars.
+        Dispatches on the signature rather than retrying on TypeError, so
+        genuine TypeErrors raised inside the loss are not swallowed.
         """
         import inspect
         try:

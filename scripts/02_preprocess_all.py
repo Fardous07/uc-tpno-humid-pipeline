@@ -17,7 +17,7 @@ Why this version is safer for a flexible pipeline
 9. Avoids filename collisions in the sanitised directory.
 10. Saves a detailed sanitisation report.
 11. Supports resume mode.
-12. ADDED: WS24 water-stability filter. core_mof_2019 CIFs whose refcode
+12. WS24 water-stability filter. core_mof_2019 CIFs whose refcode
     has a WS24 Burtch label <= 2 (unstable / low kinetic stability) are
     excluded before the --max-core limit is applied, since simulating a
     MOF that decomposes in water is scientifically meaningless for a
@@ -112,14 +112,9 @@ def load_ws24_stability(raw_dir: Path) -> Dict[str, int]:
     at the time of writing), so this keeps working if the archive is
     re-extracted differently.
 
-    FIX: the WS24 archive also contains a sibling WS14s/labels.csv with a
-    completely different schema (columns "filename"/"stability_label", no
-    "refcode" or Burtch label at all). rglob("labels.csv") finds both, and
-    alphabetical sorting picked WS14s/labels.csv first (a real bug caught
-    by testing against the actual data -- it silently returned {} because
-    that file has neither expected column). Now tries every candidate and
-    picks by SCHEMA (has both a "refcode" and a "Burtch label ..." column),
-    not by path/sort order.
+    The WS24 archive also contains WS14s/labels.csv with a different schema,
+    so the labels file is chosen by schema (has a "refcode" and a "Burtch
+    label ..." column), not by path.
 
     Returns {} (filter becomes a no-op, not a hard failure) if no
     candidate with the expected schema can be found or parsed.
@@ -168,17 +163,15 @@ def collect_limited_cifs(
 
     limit = 0 means "all".
 
-    ADDED: stability_filter, when given, drops CIFs whose CCDC refcode
+    stability_filter, when given, drops CIFs whose CCDC refcode
     matches a WS24 refcode with Burtch label < min_stability_label, BEFORE
     the limit is applied (so --max-core selects from among water-stable
     candidates, not water-stable survivors of an already-truncated list).
     Unlabeled CIFs are kept unless exclude_unlabeled.
 
-    FIX: core_mof_2019 CIF filenames aren't bare refcodes -- they append a
-    processing suffix (e.g. "ESOROV_freeONLY.cif", "BUCTUQ_clean.cif").
-    Matching on the full stem against WS24 found ZERO matches out of
-    19,081 CIFs (verified). The refcode is the token before the first
-    underscore; matching on that found 729 real matches instead.
+    core_mof_2019 filenames append a processing suffix (e.g.
+    "ESOROV_freeONLY.cif"); the refcode is the token before the first
+    underscore.
     """
     discovered: List[Dict[str, str]] = []
 
@@ -259,7 +252,7 @@ def discover_cifs(
     """
     Discover a limited number of CIFs recursively and preserve their source.
 
-    ADDED: ws24_stability, when given, filters "core" (core_mof_2019)
+    ws24_stability, when given, filters "core" (core_mof_2019)
     candidates by WS24 water-stability label before --max-core is applied.
     Deliberately NOT applied to "arc" (arc_mof_charges): its naming scheme
     doesn't correspond to WS24's CCDC refcodes at all, so there is no
@@ -594,7 +587,7 @@ def main() -> None:
         help="Shuffle each source before taking the top N CIFs.",
     )
 
-    # ADDED: WS24 water-stability filter (core_mof_2019 only -- see
+    # WS24 water-stability filter (core_mof_2019 only -- see
     # discover_cifs()/collect_limited_cifs() docstrings for why this
     # can't apply to arc_mof_charges).
     parser.add_argument(

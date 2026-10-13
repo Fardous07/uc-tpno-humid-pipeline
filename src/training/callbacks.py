@@ -2,20 +2,15 @@
 """
 Composable callback system for the UC-TPNO training loop.
 
-Fixes vs previous version
-──────────────────────────
-1. MetricLogger._write_csv — DictWriter with fixed fieldnames crashes when
-   new keys (e.g. eta_s) appear in later epochs.  Fixed: track all seen
-   keys, rewrite header lazily, use extrasaction='ignore'.
-2. default_callbacks() — included LRScheduler + WarmupCallback alongside
-   TPNOTrainer's built-in scheduling, causing double LR updates every epoch.
-   Fixed: removed both from default stack; trainer owns scheduling.
-3. GradientMonitor — on_batch_end is never called by TPNOTrainer (which
-   uses an internal loop without a callback runner).  Fixed: moved gradient
-   norm computation into on_epoch_end using a hook-free approach, and added
-   a note explaining the limitation.
-4. Added PhysicsLossMonitor — tracks physics loss weights and convexity
-   violation rate; essential for diagnosing UC-TPNO training quality.
+Notes
+─────
+* MetricLogger tracks all keys seen so far, so metrics that first appear in
+  later epochs (e.g. eta_s) are written without breaking the CSV header.
+* TPNOTrainer owns learning-rate scheduling; default_callbacks() therefore
+  contains no scheduler callbacks.
+* GradientMonitor computes the gradient norm in on_epoch_end, because the
+  trainer's inner loop does not call on_batch_end.
+* PhysicsLossMonitor tracks physics loss weights and convexity violations.
 
 Project : UC-TPNO — Uncertainty-Calibrated Thermodynamic Potential
           Neural Operator for Humid Flue-Gas CO₂ Capture in MOFs
@@ -298,7 +293,7 @@ class LRScheduler(Callback):
             return
         if self._base_lr is None:
             return
-        # FIX: skip if the trainer already has a scheduler to avoid double update
+        # skip if the trainer already has a scheduler to avoid a double update
         if self.skip_if_trainer_has_scheduler:
             if (
                 hasattr(trainer, "scheduler")
@@ -491,10 +486,8 @@ class MetricLogger(Callback):
     """
     Log metrics to console and optionally to CSV.
 
-    FIX: previous version created DictWriter with fieldnames from epoch 0.
-    When new keys appeared (e.g. eta_s from TimingCallback at epoch 1),
-    csv.DictWriter raised ValueError.  Fixed by tracking all seen keys
-    and using extrasaction='ignore' with a union-fieldname approach.
+    Tracks all keys seen so far (union of fieldnames, extrasaction='ignore')
+    so keys that first appear in later epochs do not break the CSV.
     """
 
     def __init__(
@@ -641,7 +634,7 @@ class GradientMonitor(Callback):
             }
             self._batch_norms.clear()
         else:
-            # FIX: fall back to last-batch norm measured at epoch end
+            # fall back to the last-batch norm measured at epoch end
             norm = self._compute_grad_norm(trainer.model)
             if norm is None:
                 return
@@ -717,14 +710,6 @@ class PhysicsLossMonitor(Callback):
         train/physics_competition
         train/physics_gibbs_duhem
         convexity_violation_rate       (from ThermodynamicValidator)
-
-    FIX: this used to watch train/physics_hessian_symmetry,
-    train/physics_monotonicity, train/physics_henry_law -- none of which
-    trainer.py ever actually produces (only train/physics_competition
-    happened to match). Those three terms silently never appeared in
-    self.history or the periodic log line, and the "warmup complete"
-    check was the only part of this callback that still worked correctly
-    (it only depends on the epoch number, not these keys).
     """
 
     def __init__(
@@ -741,7 +726,7 @@ class PhysicsLossMonitor(Callback):
         self._warmup_logged = False
 
     # Physics metric keys to watch (must match trainer.py's actual
-    # train/physics_{k} keys -- see the FIX note above)
+    # train/physics_{k} keys)
     _PHYSICS_KEYS = (
         "train/physics_hessian",
         "train/physics_monotonic",

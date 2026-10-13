@@ -23,23 +23,6 @@ class ThermodynamicSanityChecks:
     6. Convexity of grand potential
     7. Cross-species competition
 
-    Fixes vs. original
-    ------------------
-    1. BUG FIXED: check_convexity allocated idx1/idx2/lam/c_interp/o1/o2 and
-       then ignored all of them.  The actual computation simplified to checking
-       whether omega is increasing — not convexity.  Replaced with the correct
-       discrete second-difference test: Ω[i+1] - 2Ω[i] + Ω[i-1] ≥ 0.
-    2. BUG FIXED: check_gibbs_duhem used relu(-integral), which only fires when
-       the path integral is negative.  For standard adsorption (positive
-       loadings, dμ > 0 sweep), this is always ≥ 0, so the violation rate is
-       permanently 0.  Replaced with the absolute-value residual.
-    3. BUG FIXED: check_henry_region called K_H.std(dim=0) with only 1 point,
-       returning NaN (Bessel-corrected std).  Added guard for n < 2.
-    4. BUG FIXED: check_competition accumulated pair_viol.mean() (a magnitude)
-       in a scalar, then divided by pair count — giving a scaled magnitude, not
-       a rate in [0, 1].  Now computes the actual fraction of violating points
-       per pair and averages the per-pair rates.
-
     References
     ----------
     [1] Myers & Prausnitz (1965). Thermodynamics of Mixed-Gas Adsorption.
@@ -74,9 +57,7 @@ class ThermodynamicSanityChecks:
         A perfectly consistent model has this equal to |ΔΩ|; large
         deviations indicate thermodynamic inconsistency.
 
-        FIX: original used relu(-integral), which never fires for normal
-        adsorption (positive loadings swept from low to high μ).  Now uses
-        the absolute residual so that inconsistency in either direction is
+        Uses the absolute residual, so inconsistency in either direction is
         detected.
 
         Parameters
@@ -114,9 +95,8 @@ class ThermodynamicSanityChecks:
         """
         Verify Henry's law in dilute limit: q ∝ P.
 
-        FIX: original called K_H.std(dim=0) with n=1, returning NaN.
-        Now returns henry_valid=True (trivially) when fewer than 2 Henry
-        points are available.
+        Returns henry_valid=True (trivially) when fewer than 2 Henry points are
+        available.
 
         Parameters
         ----------
@@ -139,7 +119,7 @@ class ThermodynamicSanityChecks:
 
         K_H = q_low / (P_low.unsqueeze(-1) + 1e-8)  # [K, C]
 
-        # FIX: guard n < 2 to avoid NaN from Bessel-corrected std
+        # guard n < 2 (Bessel-corrected std would be NaN)
         if K_H.shape[0] < 2:
             return {
                 "henry_mean_error": 0.0,
@@ -276,11 +256,6 @@ class ThermodynamicSanityChecks:
         """
         Verify Ω is convex along the provided grid.
 
-        FIX: original allocated idx1/idx2/lam/c1/c2/o1/o2 and then
-        ignored all of them.  The actual violation line simplified to
-        (omega[:,1:] - omega[:,:-1]) / 2 — which just tests whether omega
-        is increasing, not convexity.
-
         Correct discrete test: second difference ≥ 0.
             Ω[i+1] - 2·Ω[i] + Ω[i-1] ≥ 0   (valid for uniform μ-grids)
 
@@ -331,11 +306,8 @@ class ThermodynamicSanityChecks:
         """
         Verify ∂qⱼ/∂μᵢ ≤ 0 for i ≠ j.
 
-        FIX: original accumulated pair_viol.mean() (mean violation
-        magnitude) in a scalar `violations`, then divided by pair count —
-        giving a scaled magnitude, not a rate in [0, 1].
-        Now computes fraction of violating points per pair and averages
-        those fractions.
+        Computes the fraction of violating points per pair and averages the
+        per-pair rates (a rate in [0, 1]).
 
         Parameters
         ----------

@@ -162,10 +162,8 @@ def _extract_q_pred(predictions: Dict[str, Any]) -> torch.Tensor:
     """
     Robustly extract the loading tensor from model output.
 
-    FIX: The original code used ``out["q_pred"]`` directly, which raises
-    KeyError when the model returns a different key (e.g. "loadings" or
-    "mean").  This function tries all known keys in priority order before
-    falling back to the first tensor value in the dict.
+    Tries all known keys in priority order before falling back to the first
+    tensor value in the dict.
     """
     if not isinstance(predictions, dict):
         # Model returned a bare tensor
@@ -205,7 +203,6 @@ def collect_predictions(
                 return_hessian=False,
             )
 
-            # FIX: use robust extractor instead of out["q_pred"] directly
             q_pred = _extract_q_pred(out)
             y_std  = (out.get("sigma") if isinstance(out, dict) else None)
 
@@ -372,15 +369,9 @@ def run_nist_validation(
          real mol/kg by the model's own denormalize_q())
       6. Accumulate MAE / RMSE
 
-    FIX: this used to pre-normalize the condition vector with mu_mean/mu_std
-    and then re-denormalize the model's output with q_std/q_mean. Both
-    steps were wrong: TPNOEnsemble.forward() already normalizes mu
-    internally (own registered buffers) and already returns q_pred
-    denormalized to real mol/kg (via denormalize_q()) -- so this was
-    double-normalizing the input and double-denormalizing the output for
-    every single NIST comparison point. The `normalization` parameter is
-    unused now (kept for call-site/signature stability); mu_mean/mu_std/
-    q_mean/q_std are no longer needed here.
+    The model normalises mu internally and returns q_pred in real mol/kg, so
+    raw conditions go in and predictions come out unchanged. The
+    `normalization` parameter is unused (kept for signature stability).
     """
     nist_dir = Path(nist_dir)
     out_dir  = Path(out_dir)
@@ -472,14 +463,7 @@ def run_nist_validation(
                 mu_raw[comp_idx] = math.log(p_bar + eps)
                 mu_raw[3]        = float(temperature)
 
-                # FIX: this used to pre-normalize mu_raw with mu_mean/mu_std
-                # before calling the model. But TPNOEnsemble.forward() (and
-                # ThermodynamicPotentialNO.forward()) normalizes mu
-                # INTERNALLY via their own registered mu_mean/mu_std buffers
-                # (tpno.py: normalize_mu()) -- exactly like collect_predictions()
-                # above correctly passes raw batch["conditions"] straight
-                # through. Pre-normalizing here double-normalized every NIST
-                # comparison point, corrupting what the model actually saw.
+                # raw mu: the model normalises internally (normalize_mu)
                 cond_t = torch.tensor(
                     mu_raw[np.newaxis, np.newaxis, :],
                     dtype=torch.float32, device=device,
@@ -493,16 +477,8 @@ def run_nist_validation(
                         return_hessian=False,
                     )
 
-                # FIX: use robust extractor instead of out["q_pred"] directly
                 q_tensor = _extract_q_pred(out)
-                # FIX: q_tensor is already denormalized to real mol/kg by the
-                # model's own denormalize_q() (tpno.py:475) before forward()
-                # returns it -- exactly like collect_predictions() above uses
-                # model output directly with no further transform. Applying
-                # `* q_std + q_mean` again here re-denormalized an already
-                # denormalized value, compounding with the input-side bug
-                # above to produce doubly-wrong predictions for every NIST
-                # comparison point.
+                # q_tensor is already in real mol/kg (denormalize_q inside the model)
                 q_pred = max(float(q_tensor[0, 0, comp_idx].detach().cpu().numpy()), 0.0)
 
                 all_rows.append({

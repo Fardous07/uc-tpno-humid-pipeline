@@ -209,13 +209,11 @@ def _collect_warnings(job_dir: Path) -> List[str]:
 
 # ═══════════════════════════════════════════════════════════════════════
 # 4. ISOTHERM CONSTRUCTION
-# FIX: parameter renamed temperature → T to match test call signature:
-#      ln_pi_to_isotherm(ln_pi, T=313.15, pressures=pressures)
 # ═══════════════════════════════════════════════════════════════════════
 
 def ln_pi_to_isotherm(
     ln_pi: np.ndarray,
-    T: float,                           # FIX: was temperature
+    T: float,
     pressures: Optional[np.ndarray] = None,
     n_pressures: int = 50,
     P_min: float = 1e-3,
@@ -264,13 +262,11 @@ def ln_pi_to_isotherm(
 
 # ═══════════════════════════════════════════════════════════════════════
 # 5. TOP-LEVEL PARSER
-# FIX: parameter renamed temperature → T to match test call signature:
-#      parse_tmmc_output(tmp_path, T=313.15)
 # ═══════════════════════════════════════════════════════════════════════
 
 def parse_tmmc_output(
     job_dir: Union[str, Path],
-    T: float = 313.15,                  # FIX: was temperature
+    T: float = 313.15,
     pressures: Optional[np.ndarray] = None,
 ) -> Dict[str, Any]:
     """

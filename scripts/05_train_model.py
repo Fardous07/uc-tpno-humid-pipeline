@@ -2,17 +2,6 @@
 """
 05_train_model.py — Train the UC-TPNO model.
 
-Fixes vs. original
-------------------
-1. BUG FIXED: lazy_loading parameter removed from AdsorptionDataset call
-   (we removed that parameter in the dataset fix).
-2. BUG FIXED: compute_normalization_stats now applies the mask so padded
-   zero-positions are excluded from mean/std computation.  Uses the method
-   we added to AdsorptionDataset instead of a duplicated standalone function.
-3. BUG FIXED: physics_cfg now reads from train_cfg.get("physics_loss", {})
-   instead of cfg.get("physics_loss", {}).  The YAML nests physics weights
-   under training.physics_loss, not at the top level.
-
 Usage
 -----
 python scripts/05_train_model.py \\
@@ -148,14 +137,8 @@ def compute_normalization_stats(
     train_indices: Sequence[int],
 ) -> Dict[str, torch.Tensor]:
     """
-    Delegate to dataset.compute_normalization_stats() which correctly
-    excludes padded positions using the per-sample row lookup.
-
-    FIX vs. original standalone function:
-    - Original accumulated full collate batches which include padded zeros,
-      corrupting mu_mean / q_mean / q_std with fake zero-valued samples.
-    - This version uses the item-level access in compute_normalization_stats
-      so only real (unpadded) data points are included.
+    Normalisation statistics from the training MOFs only, computed per
+    sample so padded positions never enter the mean/std.
     """
     if len(train_indices) == 0:
         raise RuntimeError("Training subset is empty — cannot compute normalization stats.")
@@ -246,7 +229,6 @@ def main() -> None:
     train_cfg  = dict(cfg.get("training", {}))
     data_cfg   = dict(cfg.get("data",     {}))
 
-    # FIX: physics_loss is nested under training in pipeline.yaml
     physics_cfg = dict(train_cfg.get("physics_loss", {}))
 
     # CLI overrides
@@ -275,7 +257,6 @@ def main() -> None:
     # ── Data ─────────────────────────────────────────────────────────────────
     print("\n=== Loading Data ===")
 
-    # FIX: lazy_loading parameter was removed from AdsorptionDataset
     # Optional per-framework features (Stage 1 GCMC + charges); the model's
     # n_mof_features must match the number of f_* columns.
     n_mof_features = int(model_cfg.get("n_mof_features", 0) or 0)
@@ -414,8 +395,6 @@ def main() -> None:
     # ── Normalization ─────────────────────────────────────────────────────────
     print("\n=== Computing Normalization Stats ===")
 
-    # FIX: uses dataset.compute_normalization_stats which correctly excludes
-    # padded positions — the standalone function in the original script did not.
     norm_stats = compute_normalization_stats(dataset, train_idx)
 
     model.set_normalization(
@@ -432,7 +411,6 @@ def main() -> None:
     # ── Loss ──────────────────────────────────────────────────────────────────
     print("\n=== Building Loss ===")
 
-    # FIX: physics_cfg comes from train_cfg.get("physics_loss") not cfg root
     lambda_hessian     = float(physics_cfg.get("lambda_hessian",     0.01))
     lambda_monotonic   = float(physics_cfg.get("lambda_monotonic",   0.05))
     lambda_henry       = float(physics_cfg.get("lambda_henry",       0.005))
@@ -449,7 +427,7 @@ def main() -> None:
         henry_mu_threshold=float(physics_cfg.get("henry_mu_threshold",
                                  train_cfg.get("henry_mu_threshold", -2.3))),
         use_nll=bool(train_cfg.get("use_nll", True)),
-        # run_009: σ-head NLL (stop-gradient), negative-loading penalty and
+        # σ-head NLL (stop-gradient), negative-loading penalty and
         # GCMC error-bar weighting -- see LossConfig.
         lambda_nll=float(physics_cfg.get("lambda_nll", 1.0)),
         lambda_negative=float(physics_cfg.get("lambda_negative", 1.0)),

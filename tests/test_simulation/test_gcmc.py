@@ -3,22 +3,6 @@ Tests for src/simulation/ (GCMC runner/parser, GC-TMMC runner/parser).
 
 These test configuration, input generation, and output parsing
 without requiring RASPA2 to be installed.
-
-Fixes vs previous version
-──────────────────────────
-1. fake_raspa_output fixture wrote a made-up format that no realistic
-   parser regex would match.  Fixed: now writes authentic RASPA output
-   with "Component N [X]" headers and "Average loading absolute [mol/kg
-   framework]" lines that match the actual parser regexes.
-
-2. _estimate_unit_cells is now explicitly exported from runner.py so
-   the direct import in TestGCMCInput works without accessing private API.
-
-3. All four src.simulation.{gcmc,gctmmc}.{runner,parser} modules were
-   missing entirely — every import would have raised ModuleNotFoundError.
-   The companion implementation files (gcmc_runner.py, gcmc_parser.py,
-   gctmmc_runner.py, gctmmc_parser.py) in this outputs directory provide
-   those modules.
 """
 
 import tempfile
@@ -36,8 +20,7 @@ class TestGCMCConfig:
     def test_defaults(self):
         from src.simulation.gcmc.runner import GCMCConfig
         cfg = GCMCConfig()
-        # FIX: test assumed a charge-less generic FF default (UFF/DREIDING);
-        # the actual, current default is RASPA's bundled example forcefield.
+        # default is RASPA's bundled example forcefield
         assert cfg.forcefield == "ExampleMOFsForceField"
         assert cfg.cutoff_vdw > 0
         assert cfg.n_cycles > 0
@@ -51,8 +34,7 @@ class TestGCMCConfig:
 
 class TestGCMCInput:
     def test_dry_input(self):
-        # FIX: generate_input()'s real parameter is mof_cif (a CIF path,
-        # whose .stem becomes the framework name), not mof_name.
+        # mof_cif is a CIF path whose .stem becomes the framework name
         from src.simulation.gcmc.runner import generate_input, GCMCConfig
         cfg = GCMCConfig()
         text = generate_input(
@@ -79,10 +61,8 @@ class TestGCMCInput:
         assert "H2O" in text  # humid — includes water
 
     def test_unit_cell_estimation(self, tmp_path):
-        # FIX: the real function is the private _estimate_unit_cells, and it
-        # takes a CIF PATH (it reads _cell_length_a/b/c from the file) --
-        # not three raw float lengths. Build a minimal CIF so this exercises
-        # the actual implementation instead of an API that doesn't exist.
+        # _estimate_unit_cells reads _cell_length_a/b/c from a CIF path, so build
+        # a minimal CIF
         from src.simulation.gcmc.runner import _estimate_unit_cells
 
         def _write_cif(path, a, b, c):
@@ -139,10 +119,8 @@ class TestGCMCParser:
         """
         Create a minimal RASPA output directory.
 
-        FIX: previous fixture wrote a made-up tabular format that no
-        realistic parser regex would match.  Now writes authentic RASPA
-        output with Component headers and 'Average loading absolute'
-        lines that match the parser's _RE_MOL_KG / _RE_MOLEC_UC patterns.
+        Authentic RASPA output with Component headers and 'Average loading
+        absolute' lines (matches the parser's _RE_MOL_KG / _RE_MOLEC_UC).
         """
         out_dir = tmp_path / "Output" / "System_0"
         out_dir.mkdir(parents=True)
@@ -212,7 +190,6 @@ class TestGCTMMCConfig:
 
 class TestGCTMMCInput:
     def test_tmmc_input_generation(self):
-        # FIX: generate_tmmc_input()'s real parameter is mof_cif, not mof_name.
         from src.simulation.gctmmc.runner import generate_tmmc_input, GCTMMCConfig
         cfg = GCTMMCConfig(N_max=100)
         text = generate_tmmc_input(

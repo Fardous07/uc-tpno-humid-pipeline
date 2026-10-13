@@ -4,15 +4,8 @@ set -euo pipefail
 # ═══════════════════════════════════════════════════════════════════════
 # run_parallel_gcmc.sh — Two-phase parallel launcher for 04_run_simulations.py
 #
-# Rewritten from the previous version, which parallelized by splitting the
-# WHOLE CIF library into N independent chunks, each running its own full
-# Stage1->2->3 pipeline. That silently broke Stage 2's water-aware Pareto
-# selection: selection needs to rank MOFs against each other across the
-# WHOLE candidate pool, not N separate small pools ranked independently.
-# It also pointed at a nonexistent RASPA install and the old output dir,
-# and never passed --stage1-method/--gcmc-budget/--stage3-n-cycles at all.
-#
-# This version instead:
+# Stage 2 selection must rank MOFs across the WHOLE candidate pool, so the
+# work is split in two phases:
 #   Phase A (single process, sequential): run Stage 1 (screening, cheap)
 #     + Stage 2 (selection) ONCE globally over the whole CIF library,
 #     producing gcmc_selected_mofs.txt -- the real "best N" MOF list.
@@ -67,24 +60,14 @@ STAGE1_CYCLES=1000
 STAGE3_CYCLES=2000  # was 4000; halved 2026-09-27 (charged high-P jobs took 2-6 h each)
 GCMC_BUDGET=500
 MAX_MOFS=0
-# FIX: "gctmmc" doesn't actually work with real RASPA2 -- verified by
-# grepping RASPA2's own C source (input.c and everything else) for the
-# keywords generate_tmmc_input() sends it (TMC_Method, TMC_CollectionMatrix,
-# TMC_BiasUpdate): they appear NOWHERE. RASPA silently ignores them and
-# runs a normal simulation that never writes a collection matrix, so every
-# GC-TMMC job fails 100% of the time regardless of cycle count (confirmed
-# in two separate real test runs). Falling back to plain GCMC, which is
-# proven to work end-to-end (same code path validated by the water-model
-# test in this session).
+# plain GCMC for Stage 1: RASPA2 does not implement the TMC_* keywords that
+# generate_tmmc_input() writes, so GC-TMMC jobs never produce a collection
+# matrix.
 STAGE1_METHOD="gcmc"
 TEMPERATURES="298.15,313.15,333.15"
 PRESSURES="0.1,0.5,1.0,5.0,10.0"
-# ADDED: select_mofs_for_gcmc() only ever reads Stage 1's lowest pressure
-# point (Henry constant) and interpolates between min/max pressure
-# (working capacity) at ONE temperature -- the rest of a full 3x5 sweep is
-# wasted. A separate, smaller Stage 1 grid (1 temp x 3 pressures x 3
-# components = 9 jobs/MOF) gets the cheap-screening benefit GC-TMMC would
-# have given, using the plain GCMC method that actually works.
+# Stage 2 only needs Stage 1's Henry point and min/max pressure at one
+# temperature, so Stage 1 runs on a small grid (1 T x 3 P x 3 components).
 STAGE1_TEMPERATURES="313.15"
 STAGE1_PRESSURES="0.1,1.0,10.0"
 RHS="0.0,0.05,0.15"
@@ -108,7 +91,7 @@ S1_OUT_ROOT="${OUT_DIR}/stage1_chunks"
 PHASE_A_LOG="${LOG_DIR}/phase_a.log"
 
 if [[ "$ACTION" == "--status" ]]; then
-    # ADDED: Stage 1 (Phase A) progress -- the chunks run inside tmux
+    # Stage 1 (Phase A) progress -- the chunks run inside tmux
     # session gcmc_stage1, started by --selection-only.
     if [[ -d "${S1_CIF_ROOT}" ]]; then
         n_p=$(echo "${STAGE1_PRESSURES}" | tr ',' '\n' | grep -c .)
@@ -147,10 +130,7 @@ if [[ "$ACTION" == "--status" ]]; then
     echo "STAGE 3 WORKER STATUS"
     echo "========================================"
     if [[ -f "${SELECTED_MOFS_FILE}" ]]; then
-        # FIX: wc -l counts newline CHARACTERS. gcmc_selected_mofs.txt is
-        # written via "\n".join(ids) with no trailing newline, so a 4-MOF
-        # selection has only 3 newlines -- wc -l silently undercounted by
-        # one (verified: reported 3 MOFs for an actual 4-MOF selection).
+        # grep -c . counts lines without needing a trailing newline
         n_selected=$(grep -c . "${SELECTED_MOFS_FILE}")
         echo "  Global selection: ${n_selected} MOFs (${SELECTED_MOFS_FILE})"
     else
@@ -169,12 +149,7 @@ if [[ "$ACTION" == "--status" ]]; then
         if [[ -f "${worker_out}/adsorption_training.parquet" ]]; then
             done_rows="complete"
         elif [[ -f "$log" ]]; then
-            # FIX: was anchored to the start of the line ("^\[..."), but the
-            # actual log format is "TIME | LEVEL |   [job/total] MOF | T=...
-            # P=... RH=...", so the "[" is never at position 0 -- this never
-            # matched anything, always reporting progress~0 while real work
-            # was happening (verified: log had real "[16/45] ... T=... P=...
-            # RH=..." lines that this pattern silently missed).
+            # log lines look like "TIME | LEVEL |   [job/total] MOF | T=... P=... RH=..."
             done_rows=$(grep -cE "\[[0-9]+/[0-9]+\].*T=.*P=.*RH=" "$log" 2>/dev/null || true)
         fi
         if kill -0 "$pid" 2>/dev/null; then
@@ -236,7 +211,7 @@ if [[ "$ACTION" == "--selection-only" ]]; then
     SELECTION_ONLY=true
     shift
     ACTION="${1:-launch}"
-    # ADDED: run Phase A inside a detached tmux session, so closing the
+    # run Phase A inside a detached tmux session, so closing the
     # terminal doesn't kill it. Re-invokes this script inside tmux.
     if [[ -z "${GCMC_IN_TMUX:-}" ]]; then
         if tmux has-session -t "${S1_SESSION}" 2>/dev/null; then
@@ -278,8 +253,6 @@ if [[ -f "${SELECTED_MOFS_FILE}" ]] && [[ "${REDO_SELECTION}" == "false" ]]; the
     echo "  Pass --redo-selection to force a fresh Stage 1+2 run."
     echo "========================================"
 else
-    # FIX: Stage 1 used to run as ONE process over all ~1000 CIFs (~47 h on
-    # one core while the rest idled, and nothing saved until the end). Now:
     # split the CIFs round-robin into N_S1 chunks, run Stage 1 on each chunk
     # in parallel (each checkpoints per job and resumes), merge, then run
     # Stage 2 once globally on the merged isotherms.

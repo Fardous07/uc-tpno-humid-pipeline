@@ -83,8 +83,7 @@ class PVSAParameters:
         """
         Check parameter sanity.
 
-        FIX: replaced assert with ValueError so checks survive
-        ``python -O`` (which strips assert statements).
+        Raises ValueError (not assert), so checks survive ``python -O``.
         """
         if not (self.P_feed > self.P_blow >= self.P_vac > 0):
             raise ValueError(
@@ -254,12 +253,7 @@ class PVSASimulator:
         """
         Compute energy consumption [kJ/mol CO₂].
 
-        FIX: n_evac now uses p.P_vac (suction pressure) instead of
-        p.P_blow.  The vacuum pump suction is at P_vac — that is the
-        pressure of the gas being pumped — so n_evac must be computed
-        at P_vac.  Using P_blow overestimated the moles by a factor of
-        P_blow/P_vac (e.g. 0.1/0.03 ≈ 3.3×), hence overestimated
-        vacuum-pump work by the same factor.
+        n_evac is computed at the vacuum-pump suction pressure P_vac.
         """
         p = self.params
         col = self.column
@@ -271,7 +265,6 @@ class PVSASimulator:
         ratio = gamma / (gamma - 1.0)
 
         # Moles in void at END of evacuation (suction-side pressure = P_vac)
-        # FIX: was p.P_blow; must be p.P_vac
         n_evac = (col.volume * col.total_void * p.P_vac * 1e5
                   / (R_GAS * p.T_feed))
 
@@ -291,8 +284,7 @@ class PVSASimulator:
         """
         Sweep evacuation pressure and return results.
 
-        FIX: use try/finally so P_vac is always restored even if
-        run_cycle() raises an exception.
+        P_vac is restored (try/finally) even if run_cycle() raises.
         """
         results = []
         original = self.params.P_vac
@@ -310,7 +302,7 @@ class PVSASimulator:
         """
         Sweep CO₂ feed fraction (adjusting N₂ accordingly).
 
-        FIX: use try/finally so composition is always restored.
+        The composition is restored (try/finally) even on errors.
         """
         results = []
         orig_co2, orig_n2 = self.params.y_CO2, self.params.y_N2

@@ -32,20 +32,6 @@ class ExperimentalValidator:
     >>> metrics = validator.validate_predictions(predictions_df)
     >>> print(f"MAE: {metrics['mae']:.4f} mol/kg")
 
-    Fixes vs. original
-    ------------------
-    1. BUG FIXED: validate_by_temperature / validate_by_pressure did
-       predictions["temperature"] before renaming "T" → "temperature", raising
-       KeyError.  Now renames consistently before filtering.
-    2. BUG FIXED: pd.cut emits NaN bins for values outside the range.
-       Iterating over unique() includes NaN; NaN.left raises AttributeError.
-       Fixed with .dropna() on unique bin labels.
-    3. BUG FIXED: Three sites mutated self.exp_db without try/finally.  If
-       validate_predictions raised an exception, self.exp_db stayed as the
-       filtered subset permanently, corrupting all future calls.
-    4. BUG FIXED: compute_rank_correlation default metric="loading" does not
-       match model output columns (co2_loading_molkg etc.), causing KeyError.
-       Default changed to "co2_loading_molkg".
     """
 
     def __init__(
@@ -160,7 +146,7 @@ class ExperimentalValidator:
         if predictions is None or len(predictions) == 0:
             return {"error": "No predictions provided"}
 
-        # FIX 1: rename "T" → "temperature" before any merge/filter
+        # rename "T" → "temperature" before any merge/filter
         pred_df = self._normalise_temperature(predictions)
 
         merge_on = merge_on or ["mof_id", "temperature", "pressure"]
@@ -320,7 +306,7 @@ class ExperimentalValidator:
         if temperature_bins is None:
             temperature_bins = [273.15, 298.15, 313.15, 333.15, 373.15]
 
-        # FIX 1: normalise column name before filtering
+        # normalise column name before filtering
         pred_norm = self._normalise_temperature(predictions)
 
         exp_copy = self.exp_db.copy()
@@ -332,13 +318,12 @@ class ExperimentalValidator:
 
         results: Dict[str, Any] = {}
 
-        # FIX 2: dropna() skips NaN bins produced by pd.cut for out-of-range values
+        # dropna() skips NaN bins produced by pd.cut for out-of-range values
         for bin_label in exp_copy["temp_bin"].dropna().unique():
             bin_exp = exp_copy[exp_copy["temp_bin"] == bin_label].drop(
                 columns=["temp_bin"]
             )
 
-            # FIX 1 (continued): filter on renamed column
             if "temperature" not in pred_norm.columns:
                 continue
             pred_filtered = pred_norm[
@@ -348,7 +333,7 @@ class ExperimentalValidator:
             if len(pred_filtered) == 0 or len(bin_exp) == 0:
                 continue
 
-            # FIX 3: try/finally so self.exp_db is always restored
+            # try/finally so self.exp_db is always restored
             original_db = self.exp_db
             try:
                 self.exp_db = bin_exp
@@ -385,7 +370,7 @@ class ExperimentalValidator:
         if pressure_bins is None:
             pressure_bins = [0, 0.1, 0.5, 1.0, 5.0, 10.0, 50.0]
 
-        # FIX 1: normalise temperature column (predictions may use "T")
+        # normalise temperature column (predictions may use "T")
         pred_norm = self._normalise_temperature(predictions)
 
         exp_copy = self.exp_db.copy()
@@ -397,7 +382,7 @@ class ExperimentalValidator:
 
         results: Dict[str, Any] = {}
 
-        # FIX 2: dropna() avoids AttributeError on NaN bin labels
+        # dropna() avoids AttributeError on NaN bin labels
         for bin_label in exp_copy["press_bin"].dropna().unique():
             bin_exp = exp_copy[exp_copy["press_bin"] == bin_label].drop(
                 columns=["press_bin"]
@@ -412,7 +397,7 @@ class ExperimentalValidator:
             if len(pred_filtered) == 0 or len(bin_exp) == 0:
                 continue
 
-            # FIX 3: try/finally
+            # try/finally so self.exp_db is always restored
             original_db = self.exp_db
             try:
                 self.exp_db = bin_exp
@@ -431,8 +416,6 @@ class ExperimentalValidator:
     def compute_rank_correlation(
         self,
         predictions: pd.DataFrame,
-        # FIX 4: default changed from "loading" (doesn't exist in model output)
-        # to "co2_loading_molkg" which matches ThermodynamicPotentialNO output.
         metric: str = "co2_loading_molkg",
     ) -> Dict[str, Any]:
         """
@@ -530,7 +513,7 @@ class ExperimentalValidator:
             if len(pred_mof) < 3:
                 continue
 
-            # FIX 3: try/finally so self.exp_db is always restored
+            # try/finally so self.exp_db is always restored
             original_db = self.exp_db
             try:
                 self.exp_db = mof_exp

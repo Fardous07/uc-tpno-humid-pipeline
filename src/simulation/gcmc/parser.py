@@ -445,15 +445,8 @@ class GCMCRunner:
         return hashlib.md5(raw.encode("utf-8")).hexdigest()[:12]
 
 
-# FIX: this MUST come after GCMCRunner is fully defined above. runner.py's
-# own module-level `from .parser import (..., GCMCRunner)` needs GCMCRunner
-# to already exist in this module's namespace by the time it runs -- placing
-# this import earlier (as it was) triggered runner.py mid-way through this
-# file's execution, before GCMCRunner existed, causing
-# "ImportError: cannot import name 'GCMCRunner' from partially initialized
-# module" on every single caller (verified: this broke every test in
-# tests/test_simulation/test_gcmc.py and would have broken
-# 08_active_learning_loop.py the moment it actually ran).
+# must come after GCMCRunner is defined: runner.py imports GCMCRunner from
+# this module, so an earlier import would hit a partially initialised module.
 from .runner import results_to_arrays   # noqa: E402
 
 

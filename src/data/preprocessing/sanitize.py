@@ -11,7 +11,7 @@ Main goals
 3. Support charges from either:
       - _atom_site_charge
       - separate _atom_type_symbol / _atom_type_partial_charge loop
-      - _atom_type_partial_charge as a column INSIDE the atom_site loop  (run_008; ARC layout)
+      - _atom_type_partial_charge as a column INSIDE the atom_site loop  (ARC layout)
 4. Fall back to ASE when direct parsing is not enough
 5. Write a minimal P1 CIF for downstream use
 6. Match RASPA's CIF examples more closely:
@@ -192,10 +192,8 @@ def _guess_cell_setting(cell: Dict[str, float]) -> str:
 # 2. ATOM EXTRACTION
 # ═══════════════════════════════════════════════════════════════════════
 
-# run_008: charge columns that may appear INSIDE the atom_site loop.
-# ARC MOF CIFs store per-site charges under _atom_type_partial_charge, which
-# the previous code did not recognise (it only looked for _atom_site_charge),
-# so every charge was silently written as 0.0.
+# Charge columns that may appear INSIDE the atom_site loop (ARC MOF CIFs
+# store per-site charges under _atom_type_partial_charge).
 _ATOM_SITE_CHARGE_COLUMNS = (
     "_atom_site_charge",
     "_atom_type_partial_charge",
@@ -267,7 +265,7 @@ def _extract_atom_rows_from_text(text: str) -> List[Dict[str, Any]]:
         idx = {h: i for i, h in enumerate(headers)}
 
         has_symbol = "_atom_site_type_symbol" in idx
-        # run_008: accept per-site charges stored INSIDE the atom_site loop
+        # accept per-site charges stored INSIDE the atom_site loop
         # under a non-standard column name (ARC uses _atom_type_partial_charge).
         charge_col = None
         for _cand in _ATOM_SITE_CHARGE_COLUMNS:
@@ -362,7 +360,7 @@ def _extract_atom_rows_with_ase(
     scaled = atoms.get_scaled_positions(wrap=True)
     syms = atoms.get_chemical_symbols()
 
-    # run_008: preserve ASE-read charges if present (0.0 otherwise).
+    # preserve ASE-read charges if present (0.0 otherwise).
     try:
         ase_charges = atoms.get_initial_charges()
     except Exception:
@@ -475,16 +473,9 @@ def _remove_overlaps_with_ase(
       - remove very close duplicate/overlapping atoms
       - return cleaned scaled positions
 
-    FIX: now also returns the per-input-atom ``keep`` mask (all-True when
-    no overlap removal happens at all, e.g. the len(atoms) < 2 branch).
-    Every returned row's "charge" is a placeholder 0.0 -- real charges
-    live only in the caller's original atom_rows -- and previously the
-    caller could only restore them when the atom COUNT was unchanged
-    (``len(ase_rows2) == len(atom_rows)``), so as soon as this function
-    actually dropped even one overlapping atom, EVERY remaining atom in
-    that MOF silently kept charge=0.0 with no warning. The keep mask lets
-    the caller align surviving atoms to their real original charges even
-    when atoms were removed.
+    Also returns the per-input-atom ``keep`` mask (all-True when no overlap
+    removal happens). Returned rows carry a placeholder charge of 0.0; the mask
+    lets the caller align surviving atoms with their original charges.
     """
     if not _ASE_AVAILABLE:
         return None, [], []
@@ -683,13 +674,7 @@ class CIFSanitizer:
                 )
 
                 if ase_cell2 is not None and len(ase_rows2) >= self.min_atoms:
-                    # FIX: previously only restored real charges when the
-                    # atom count was unchanged (no overlaps removed) --
-                    # any MOF where even one overlapping atom got dropped
-                    # silently kept charge=0.0 for every remaining atom,
-                    # with no warning. Use the keep mask to align
-                    # surviving atoms to their real original charges even
-                    # when atoms were removed.
+                    # align surviving atoms with their original charges via the keep mask
                     if len(keep_mask) == len(atom_rows):
                         surviving_charges = [
                             atom_rows[i].get("charge", 0.0)

@@ -6,13 +6,7 @@ This module serves as the single source of truth for all physical and
 chemical parameters used throughout the pipeline.  Every value carries
 a reference so that reviewers can trace it back to primary literature.
 
-Fixes vs previous version
-──────────────────────────
-• SOFTPLUS_BETA, TORR_TO_PA, KPA_TO_BAR, PSI_TO_BAR, ATM_TO_PA,
-  NM_TO_ANGSTROM, AMU_TO_KG, CM1_TO_EV, J_TO_EV, KJ_TO_KCAL,
-  HARTREE_TO_EV, ANGSTROM_TO_BOHR, BOHR_TO_ANGSTROM, ANGSTROM_TO_M
-  were all defined but missing from __all__.  Added.
-• No physics values changed — all verified against CODATA 2018.
+All values follow CODATA 2018.
 
 Project : UC-TPNO — Uncertainty-Calibrated Thermodynamic Potential
           Neural Operator for Humid Flue-Gas CO₂ Capture in MOFs
@@ -608,7 +602,7 @@ __all__ = [
 
     # ── Numerical safety ─────────────────────────────────────────
     "EPS", "LOG_EPS",
-    "SOFTPLUS_BETA",           # FIX: was missing from __all__
+    "SOFTPLUS_BETA",
     "MAX_LOG_VAR", "MIN_SIGMA",
 
     # ── Element properties ───────────────────────────────────────

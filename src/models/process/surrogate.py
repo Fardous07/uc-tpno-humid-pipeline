@@ -534,13 +534,6 @@ class NeuralSurrogate:
         -------
         Dict with ``"final_loss"`` and ``"n_train"``.
 
-        FIX: removed dead ``loss_and_grad`` function that was defined
-        but never passed to ``optimize.minimize`` (which used
-        ``_loss_only`` with ``jac=False`` instead).  The dead code
-        also called ``optimize.approx_fprime`` internally, which would
-        have made gradient evaluation O(n_params) × slower than
-        needed.  The optimizer now explicitly uses ``jac=False`` and
-        scipy's built-in finite-difference gradient.
         """
         X = np.asarray(X, dtype=np.float64)
         Y = np.asarray(Y, dtype=np.float64)
@@ -577,8 +570,7 @@ class NeuralSurrogate:
         wd = self.config.weight_decay
         x0 = self._pack_params()
 
-        # FIX: removed the dead loss_and_grad() function that was never
-        # called.  Using _loss_only with jac=False (scipy finite-diff gradient).
+        # _loss_only with jac=False (scipy finite-difference gradient)
         result = optimize.minimize(
             lambda p: self._loss_only(p, Xn, Yn, layer_dims, wd),
             x0,

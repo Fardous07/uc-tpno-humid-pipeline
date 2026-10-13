@@ -2,21 +2,6 @@
 """
 08_active_learning_loop.py — Practical active learning loop for UC-TPNO.
 
-Fixes vs. original
-------------------
-1. BUG FIXED: @torch.no_grad() on score_candidates_with_model crashes at
-   runtime.  The ICNN derives loadings via autograd.grad(omega, mu); inside
-   torch.no_grad() requires_grad_(True) on mu is silently ignored, so
-   autograd.grad raises RuntimeError.  Removed the decorator — model.eval()
-   already gates dropout/batchnorm correctly.
-
-2. BUG FIXED: physics_cfg in train_model_once() read from cfg root
-   (cfg.get("physics_loss", {})) instead of from training section
-   (train_cfg.get("physics_loss", {})).  Physics weights were always {}.
-
-3. BUG FIXED: Wrong import path for GCMCRunner/GCMCConfig.
-   parser.py is the RASPA output parser; the runner lives in runner.py.
-
 Usage
 -----
 python scripts/08_active_learning_loop.py \\
@@ -54,7 +39,6 @@ from src.models.operator.losses import (
     PhysicsLossScheduler,
 )
 
-# FIX: GCMCRunner/GCMCConfig live in runner.py, not parser.py
 from src.simulation.gcmc.runner import GCMCRunner, GCMCConfig
 
 from src.training.trainer import TPNOTrainer, TrainConfig
@@ -161,14 +145,8 @@ def load_checkpoint_into_model(model, checkpoint_path, device):
 # ---------------------------------------------------------------------------
 # Chemistry helpers
 # ---------------------------------------------------------------------------
-# FIX: this module used to define its own local water_saturation_pressure_antoine(),
-# relative_humidity_to_mole_fraction(), and mixture_pressure_to_chemical_potentials()
-# — the last one an ideal-gas approximation that happened to share its name with
-# src.utils.chemistry's Peng-Robinson mixture-EOS version, but silently computed
-# different mu values. New GCMC rows appended by this active-learning loop would
-# have used different thermodynamics than the bulk Stage 3 training set generated
-# by scripts/04_run_simulations.py. Now importing the single canonical
-# implementation from chemistry.py so every part of the pipeline agrees.
+# single canonical thermodynamics (Peng-Robinson mixture EOS), shared with
+# scripts/04_run_simulations.py so new labels match the training set
 from src.utils.chemistry import (
     water_saturation_pressure_antoine,
     relative_humidity_to_mole_fraction,
@@ -286,10 +264,8 @@ def _unpack_model_output(
     )
 
 
-# FIX: @torch.no_grad() REMOVED.
-# The ICNN derives loadings via autograd.grad(omega, mu).  Inside
-# torch.no_grad(), requires_grad_(True) on mu is silently ignored and
-# autograd.grad raises RuntimeError.  model.eval() is sufficient.
+# no torch.no_grad(): loadings come from autograd.grad(Φ, μ), which needs
+# gradients; model.eval() already disables dropout.
 def score_candidates_with_model(
     model:                ThermodynamicPotentialNO,
     candidate_cifs:       List[Path],
@@ -519,7 +495,6 @@ def train_model_once(
     cfg        = load_yaml_config(config_path)
     model_cfg  = dict(cfg.get("model",    {}))
     train_cfg  = dict(cfg.get("training", {}))
-    # FIX: physics_loss is nested under training, not at the top level
     physics_cfg = dict(train_cfg.get("physics_loss", {}))
 
     pin_memory = device.type == "cuda"
@@ -574,7 +549,7 @@ def train_model_once(
             train_cfg.get("henry_mu_threshold", -2.3))
         ),
         use_nll=bool(train_cfg.get("use_nll", True)),
-        # run_009: σ-head NLL (stop-gradient), negative-loading penalty and
+        # σ-head NLL (stop-gradient), negative-loading penalty and
         # GCMC error-bar weighting -- see LossConfig.
         lambda_nll=float(physics_cfg.get("lambda_nll", 1.0)),
         lambda_negative=float(physics_cfg.get("lambda_negative", 1.0)),

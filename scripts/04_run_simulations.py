@@ -18,20 +18,14 @@ Stage 3  Run multicomponent GCMC (CO2 + N2 + H2O) at all humid conditions
          → data/processed/adsorption/gcmc_adsorption.parquet
          → data/processed/adsorption/adsorption_training.parquet
 
-Fixes vs. earlier version
---------------------------
-1.  BUG FIXED: retry logic now checks returncode (subprocess.run with no
-    check=True never raises CalledProcessError — the old code never retried).
-2.  BUG FIXED: run_low_fidelity_isotherms now sweeps all pressures for
-    each (MOF, component, temperature) so that we get a real isotherm to
-    compute selectivity and working capacity from, not a single point.
-3.  ADDED: select_mofs_for_gcmc() implements a Pareto-front + diversity
-    strategy to pick the best K MOFs from Stage 1 for expensive GCMC.
-4.  ADDED: build_training_dataset() merges GCMC rows and saves them in the
-    column layout expected by AdsorptionDataset.
-5.  CIF syntax error fixed: determine_unit_cells now calls cif_path correctly.
-6.  Molecule-definition lookup now falls through to any available match so
-    the script works with both TraPPE and ExampleMOFsForceField layouts.
+Notes
+-----
+* Stage 1 sweeps all pressures per (MOF, component, T), so Stage 2 can
+  compute selectivity and working capacity.
+* select_mofs_for_gcmc() picks the Stage 3 MOFs (water filter, Pareto
+  front + diversity).
+* build_training_dataset() writes the column layout AdsorptionDataset
+  expects.
 """
 from __future__ import annotations
 
@@ -57,11 +51,8 @@ except Exception:
     ase_read = None
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-# FIX: this script used to compute mu via a local, ideal-gas-only
-# mu_ideal_gas() that silently disagreed with src.utils.chemistry's
-# Peng-Robinson mixture EOS (the version 09_benchmark.py already queries the
-# model with). Standardizing on chemistry.py so training labels and
-# inference-time conditions use identical thermodynamics.
+# chemical potentials come from src.utils.chemistry (Peng-Robinson mixture
+# EOS), the same code used at inference, so labels and model inputs agree.
 from src.utils.chemistry import (
     mixture_pressure_to_chemical_potentials,
     water_saturation_pressure_antoine,
@@ -74,14 +65,9 @@ REPO_FORCEFIELD_DIR = Path(__file__).resolve().parent.parent / "forcefields"
 DEFAULT_FORCEFIELD = "UFF_TIP4P2005"
 
 # Wall-clock limit per RASPA job (set from --job-timeout-hours in main()).
-# FIX: was a hard-coded 7200 s. With framework charges, high-pressure humid
-# jobs on large MOFs take 2-6 h, so they were killed at 2 h and retried from
-# scratch up to 3x (~6 h wasted per job) before being recorded as failures.
+# With framework charges, high-pressure humid jobs on large MOFs take 2-6 h.
 RASPA_TIMEOUT_S = 48 * 3600
 
-# ADDED: GC-TMMC existed in src/simulation/gctmmc/ but nothing in this
-# pipeline ever drove it -- Stage 1 only ever ran ordinary GCMC pressure
-# sweeps. See run_stage1_isotherms_gctmmc() below and --stage1-method.
 from src.simulation.gctmmc.parser import GCTMMCConfig, GCTMMCRunner
 
 # ---------------------------------------------------------------------------
@@ -140,11 +126,8 @@ def append_checkpoint(path: Path, row: Dict) -> None:
     """
     Append one result row to a checkpoint CSV, keeping columns aligned.
 
-    ADDED: a plain to_csv(mode="a", header=False) silently shifts values
-    into the wrong columns if the row's columns differ from the file's
-    header -- e.g. a unit started before the *_err columns existed and
-    resumed after. Rows are written in the header's order; if the row
-    brings new columns, the file is rewritten once with the union.
+    Rows are written in the header's column order; if a row brings new
+    columns, the file is rewritten once with the union.
     """
     if not path.exists() or path.stat().st_size == 0:
         pd.DataFrame([row]).to_csv(path, index=False)
@@ -249,7 +232,7 @@ def read_cell_lengths(cif_path: Path) -> Optional[Tuple[float, float, float]]:
 
 def determine_unit_cells(cif_path: Path, cutoff_angstrom: float) -> Tuple[int, int, int]:
     """Minimum integer replication so every dimension ≥ 2×cutoff."""
-    lengths = read_cell_lengths(cif_path)   # BUG WAS HERE: was cif_ <path>
+    lengths = read_cell_lengths(cif_path)
     if lengths is None:
         logger.warning(f"Could not read cell for {cif_path.name}; defaulting to 2×2×2")
         return (2, 2, 2)
@@ -273,14 +256,9 @@ def canonicalize_cif(input_cif: Path, output_cif: Path, with_charges: bool = Tru
     """
     Write a minimal P1 CIF that RASPA can always parse.
 
-    FIX: this used to write positions only. ASE never returns the CIF's
-    _atom_site_charge values (get_initial_charges() is all zeros for every
-    sanitised CIF), and the charge column was not written at all, so RASPA
-    ran with UseChargesFromCIFFile yes against a CIF with no charges and set
-    every framework charge to 0 -- no host-guest electrostatics in any
-    simulation, which is why water uptake was ~0 in all 476 MOFs. Charges
-    are now read with the same reader the graph builder uses (file order ==
-    ASE atom order for the P1 sanitised CIFs) and written back out.
+    ASE does not return the CIF's _atom_site_charge values, so charges are
+    read with the same reader the graph builder uses (file order == ASE atom
+    order for the P1 sanitised CIFs) and written into the RASPA CIF.
     """
     atoms = _read_atoms(input_cif)
     cl  = atoms.cell.lengths()
@@ -323,10 +301,9 @@ def canonicalize_cif(input_cif: Path, output_cif: Path, with_charges: bool = Tru
     output_cif.write_text("\n".join(lines), encoding="utf-8")
 
 
-# ADDED: pre-flight checks, run once per MOF before any RASPA job. Every
-# failure here used to be silent -- RASPA happily simulates an uncharged
-# framework, an element with no LJ parameters, or a disordered CIF with
-# atoms 0.1 A apart, and returns plausible-looking but meaningless numbers.
+# Pre-flight checks, run once per MOF before any RASPA job. RASPA would
+# otherwise simulate an uncharged framework, an element with no LJ
+# parameters, or overlapping atoms without complaint.
 MIN_ATOM_DISTANCE_A = 0.7   # below any real bond (O-H 0.96, C-H 1.08 A): overlapping/disordered sites
 MAX_NET_CHARGE_E    = 0.05  # per unit cell; ARC REPEAT and PACMAN charges are neutral to ~1e-5
 
@@ -411,10 +388,8 @@ def resolve_forcefield(raspa_share: Path, requested: str) -> str:
     lower = {n.lower(): n for n in available}
     if requested.lower() in lower:
         return lower[requested.lower()]
-    # FIX: a missing "GenericMOFs" used to fall back silently to RASPA's
-    # ExampleMOFsForceField, whose "C" (TraPPE alkane) entry and "_" prefix
-    # wildcards mis-typed framework carbon and ~30 other elements (see
-    # scripts/build_raspa_forcefield.py). A missing force field is now an error.
+    # a missing force field is an error (no silent fallback to RASPA's
+    # ExampleMOFsForceField, which mis-types framework atoms).
     raise FileNotFoundError(
         f"Forcefield '{requested}' not found. Available: {available}"
     )
@@ -472,15 +447,8 @@ def prepare_runtime(output_dir: Path, raspa_share: Path) -> Tuple[Path, Path, Pa
 
 def check_ff_assets(runtime_share: Path, ff_name: str) -> None:
     """
-    FIX: force_field.def used to be required, but it's genuinely optional
-    in RASPA2 -- it only holds explicit pairwise overrides beyond the
-    general mixing rule. Verified directly: a real, official RASPA2 build's
-    bundled ExampleMOFsForceField has no force_field.def at all (only
-    pseudo_atoms.def + force_field_mixing_rules.def); RASPA logs
-    "'force_field.def' file not found and therefore not used" and runs a
-    complete GCMC simulation correctly without it. Requiring it here would
-    have made check_ff_assets() raise FileNotFoundError on the very first
-    real invocation of this script against a standard RASPA2 install.
+    force_field.def is optional in RASPA2 (it only holds explicit pairwise
+    overrides beyond the mixing rule), so it is not required here.
     """
     ff_dir = runtime_share / "forcefield" / ff_name
     if not ff_dir.exists():
@@ -584,7 +552,7 @@ def build_multicomponent_input(
 
 
 # ---------------------------------------------------------------------------
-# RASPA runner  ← CRITICAL BUG FIXED HERE
+# RASPA runner
 # ---------------------------------------------------------------------------
 def _collect_output_files(workdir: Path) -> str:
     pieces: List[str] = []
@@ -612,11 +580,8 @@ def _run_once(
 
     workspace.mkdir(parents=True, exist_ok=True)
     (workspace / f"{name}.canonical.cif").write_bytes(runtime_cif.read_bytes())
-    # FIX: RASPA2 builds the framework path in a fixed 256-char buffer. The
-    # runtime-share path + a long MOF id reached 251 chars in production and
-    # crashed ("*** buffer overflow detected ***", rc=-6) at 259 in a test
-    # dir. RASPA checks the working directory first, so a copy here keeps the
-    # path short regardless of where the output dir lives.
+    # RASPA2 builds the framework path in a fixed 256-char buffer and checks
+    # the working directory first, so a local copy keeps the path short.
     (workspace / f"{name}.cif").write_bytes(runtime_cif.read_bytes())
     (workspace / "simulation.input").write_text(input_text, encoding="utf-8")
 
@@ -658,9 +623,7 @@ def run_raspa_job(
     """
     Run a RASPA job with retry on failure.
 
-    FIX: Previous version caught CalledProcessError which subprocess.run
-    (without check=True) never raises.  We now check result.ok and retry
-    on any non-zero returncode or timeout.
+    Retries on a non-zero return code (timeouts are not retried).
     """
     last: Optional[RASPAResult] = None
     for attempt in range(max_retries):
@@ -709,8 +672,8 @@ def _parse_component(text: str, molecule: str) -> Dict[str, Optional[float]]:
         "loading_molkg": _extract_float(
             r"Average loading absolute \[mol/kg framework\]\s+"
             r"([+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)", block),
-        # ADDED: RASPA's block-average error bar ("value +/- err") -- was
-        # parsed away. Lets training weight labels by statistical reliability.
+        # RASPA's block-average error bar ("value +/- err"), used to weight
+        # labels by statistical reliability.
         "loading_molkg_err": _extract_float(
             r"Average loading absolute \[mol/kg framework\]\s+\S+\s+\+/-\s+"
             r"([+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)", block),
@@ -773,24 +736,16 @@ def run_stage1_isotherms(
     """
     Run single-component RASPA at every (MOF, component, T, P) point.
 
-    FIX: H2O used to be swept over the same total pressures as CO2/N2
-    (0.1/1/10 bar), all ABOVE water's saturation pressure (0.074 bar at
-    313 K) -- pure supersaturated water that condenses in the pores once
-    framework charges are on, giving a meaningless "Henry constant" for the
-    Stage 2 water filter and extremely slow jobs. H2O now runs at the
-    Stage 3 relative humidities instead: p = RH * p_sat(T).
+    H2O runs at the Stage 3 relative humidities, p = RH * p_sat(T), since
+    0.1-10 bar would be far above water's saturation pressure.
 
-    FIX: Previous version only ran at max(pressures_bar) — a single point
-    per isotherm — which cannot compute working capacity.  We now sweep ALL
-    pressures so that Stage 2 can compute ΔN = N(P_high) − N(P_low).
+    All pressures are swept so Stage 2 can compute the working capacity
+    ΔN = N(P_high) − N(P_low).
 
-    FIX: previous version only screened CO2 and N2 here, so the Stage 2 MOF
-    selection that determines which MOFs even get the expensive humid
-    multicomponent GCMC in Stage 3 was blind to water. H2O is now included
-    as a third single-component isotherm so Stage 2 can filter on CO2-vs-H2O
-    affinity (see select_mofs_for_gcmc), following the water-aware screening
-    funnel used on this same CoRE-MOF-2019 database in Kancharlapalli &
-    Snurr, ACS Appl. Mater. Interfaces 2023, 15, 28084-28092.
+    H2O is screened as a third single-component isotherm so Stage 2 can
+    filter on CO2-vs-H2O affinity (see select_mofs_for_gcmc), following the
+    water-aware screening of CoRE-MOF-2019 in Kancharlapalli & Snurr, ACS
+    Appl. Mater. Interfaces 2023, 15, 28084-28092.
     """
     rows: List[Dict] = []
     ws_root = ensure_dir(output_dir / "stage1_workspace")
@@ -803,9 +758,7 @@ def run_stage1_isotherms(
     total = len(cif_paths) * sum(len(_pressures(m, t)) for m, _ in components for t in temperatures_k)
     job = 0
 
-    # ADDED: per-job checkpoint, same scheme as Stage 3 -- Stage 1 used to
-    # keep everything in memory until the very end (~47 h single-process for
-    # 998 MOFs), so any crash or shutdown lost all of it.
+    # per-job checkpoint (same scheme as Stage 3) so a crash loses nothing
     checkpoint_path = output_dir / "stage1_isotherms.checkpoint.csv"
     done_keys: set = set()
     if checkpoint_path.exists() and checkpoint_path.stat().st_size > 0:
@@ -856,15 +809,9 @@ def run_stage1_isotherms(
 # ---------------------------------------------------------------------------
 # Stage 1 (alternative) — real GC-TMMC single-component screening
 # ---------------------------------------------------------------------------
-# ADDED: this project's docstring always called Stage 1 a "low-fidelity TMMC
-# proxy", but nothing ever actually drove src/simulation/gctmmc/ -- Stage 1
-# was ordinary GCMC repeated at each pressure. GC-TMMC gets a MOF's full
-# isotherm from ONE simulation (via the collection matrix), instead of one
-# GCMC run per pressure point, so it is genuinely cheaper for screening the
-# whole library. This is single-component only (GCTMMCRunner has no
-# multicomponent mode in this codebase) -- Stage 3's humid multicomponent
-# GCMC is unaffected either way and remains the source of real training
-# labels.
+# GC-TMMC gets a MOF's full single-component isotherm from ONE simulation
+# (via the collection matrix) instead of one GCMC run per pressure point.
+# Stage 3's humid multicomponent GCMC is unaffected.
 def run_stage1_isotherms_gctmmc(
     cif_paths: Sequence[Path], output_dir: Path,
     runtime_root: Path, raspa_path: Path,
@@ -889,16 +836,8 @@ def run_stage1_isotherms_gctmmc(
     job = 0
 
     ws_root = ensure_dir(output_dir / "stage1_gctmmc_workspace")
-    # FIX: GCTMMCConfig.n_init defaults to 50,000 (src/simulation/gctmmc/
-    # parser.py) and was never overridden here, so EVERY GC-TMMC job ran
-    # 50,000+ initialization cycles regardless of --n-cycles -- confirmed
-    # in a real test: a "--n-cycles 200" run generated
-    # "NumberOfInitializationCycles 50000" in the actual RASPA input file,
-    # making a single test job (meant to be near-instant) take 30+ minutes.
-    # At production scale (998 MOFs x 9 jobs) this would have made Stage 1
-    # "screening" many times more expensive than Stage 3. Scale n_init with
-    # n_cycles, matching the convention _common_header() already uses for
-    # regular GCMC elsewhere in this file.
+    # scale initialisation cycles with n_cycles (GCTMMCConfig.n_init defaults
+    # to 50,000), as _common_header() does for regular GCMC.
     config = GCTMMCConfig(
         raspa_path=str(raspa_path),
         raspa_data_dir=str(runtime_root),
@@ -1001,7 +940,7 @@ def select_mofs_for_gcmc(
       co2_h2o_selectivity  = KH_CO2 / KH_H2O
                            (water-competition indicator)
 
-    ADDED (water-aware screening): before the Pareto step, MOFs whose water
+    Water-aware screening: before the Pareto step, MOFs whose water
     Henry constant exceeds their CO2 Henry constant (KH_H2O > KH_CO2, i.e.
     water outcompetes CO2 for adsorption sites) are filtered out, matching
     the "stronger CO2 interaction than H2O/N2" filter used to screen this
@@ -1014,9 +953,6 @@ def select_mofs_for_gcmc(
         Li, S.; Chung, Y. G.; Snurr, R. Q. "High-Throughput Screening of
         Metal-Organic Frameworks for CO2 Capture in the Presence of Water."
         Langmuir 2016, 32(40), 10368-10376. DOI: 10.1021/acs.langmuir.6b02803
-    Previously this function only ever saw CO2/N2 data, so the MOFs handed
-    to the expensive humid Stage 3 GCMC were selected with zero regard for
-    water competition — the whole point of this "humid" pipeline.
 
     From the water-filtered survivors we then find the Pareto front over
     (selectivity, working_capacity), fill remaining budget with the
@@ -1036,14 +972,8 @@ def select_mofs_for_gcmc(
                               before Pareto selection (set False to disable
                               if H2O Stage 1 data is unavailable/incomplete)
     """
-    # FIX: if every single Stage 1 job failed, stage1_df is a completely
-    # empty, columnless DataFrame (pd.DataFrame([]) with no successful
-    # rows to infer columns from), and the .between() filter below used
-    # to raise an opaque "KeyError: 'temperature_k'" instead of pointing
-    # at the real problem. Caught in testing: this happened when
-    # GC-TMMC's molecule definitions pointed at a folder that doesn't
-    # exist, silently failing 100% of jobs -- the crash three lines later
-    # gave no hint why. Fail immediately with a clear, actionable message.
+    # fail with a clear message if every Stage 1 job failed (stage1_df is then
+    # empty and columnless).
     if stage1_df.empty or "temperature_k" not in stage1_df.columns:
         raise RuntimeError(
             "Stage 1 produced ZERO successful simulation results (every "
@@ -1117,9 +1047,8 @@ def select_mofs_for_gcmc(
     kpi_df = pd.DataFrame(records)
     n_before_filter = len(kpi_df)
 
-    # ADDED: water-competition filter (Kancharlapalli & Snurr 2023 /
-    # Li, Chung & Snurr 2016 precedent) — drop MOFs where water outcompetes
-    # CO2 at the Henry-constant level, before spending GCMC budget on them.
+    # water-competition filter (Kancharlapalli & Snurr 2023; Li, Chung & Snurr
+    # 2016): drop MOFs where water outcompetes CO2 at the Henry-constant level.
     if require_co2_over_h2o and kpi_df["has_h2o_data"].any():
         survives = (~kpi_df["has_h2o_data"]) | (kpi_df["kh_co2"] > kpi_df["kh_h2o"])
         filtered_df = kpi_df[survives]
@@ -1133,11 +1062,10 @@ def select_mofs_for_gcmc(
                 f"[Stage 2] Water-competition filter: {len(filtered_df)}/{n_before_filter} "
                 f"MOFs retained (KH_CO2 > KH_H2O)"
             )
-            # FIX: with real framework charges most MOFs have KH_H2O > KH_CO2,
-            # so a hard filter can leave far fewer MOFs than the budget (it
-            # removed every MOF in a 2-MOF test). Survivors now get priority;
-            # the budget is topped up with the removed MOFs that bind water
-            # least strongly relative to CO2.
+            # with framework charges most MOFs have KH_H2O > KH_CO2, so the filter can
+            # leave fewer MOFs than the budget. Survivors get priority; the budget is
+            # topped up with the removed MOFs that bind water least strongly relative
+            # to CO2.
             if len(filtered_df) < gcmc_budget:
                 n_top_up = min(gcmc_budget - len(filtered_df), len(kpi_df) - len(filtered_df))
                 top_up = (kpi_df[~survives]
@@ -1205,15 +1133,8 @@ def run_stage3_gcmc(
     total = len(cif_paths) * len(conditions)
     job = 0
 
-    # FIX: results used to live only in memory (`rows`) and hit disk once,
-    # in a single gcmc_adsorption.parquet write, after the *entire* loop
-    # finished. A crash/reboot partway through a worker's run (happened for
-    # real: a hard reboot mid-run lost 100% of a 15-worker Stage 3 run,
-    # hours of compute, not just the in-flight job) lost everything because
-    # nothing was ever written incrementally. Now each successful job is
-    # appended to a checkpoint CSV immediately, and a restart reloads it
-    # and skips already-completed (mof, condition) pairs instead of
-    # redoing them.
+    # each successful job is appended to a checkpoint CSV; a restart reloads it
+    # and skips completed (mof, condition) pairs.
     checkpoint_path = output_dir / "gcmc_adsorption.checkpoint.csv"
     rows: List[Dict] = []
     done_keys: set = set()
@@ -1342,10 +1263,8 @@ def main() -> None:
     p.add_argument("--gcmc-budget", type=int, default=500, help="MOFs to label with GCMC")
     p.add_argument("--exploration-fraction", type=float, default=0.2,
                    help="Fraction of GCMC budget for diversity exploration")
-    # ADDED: the KH_CO2 > KH_H2O filter was a no-op while frameworks were
-    # uncharged (water barely adsorbed). With real charges it can remove
-    # most hydrophilic MOFs -- and with them most of the humidity effect a
-    # model is supposed to learn -- and leave fewer than --gcmc-budget MOFs.
+    # with framework charges the KH_CO2 > KH_H2O filter can remove most
+    # hydrophilic MOFs (and with them most of the humidity effect).
     p.add_argument("--water-filter", action=argparse.BooleanOptionalAction, default=True,
                    help="Stage 2: drop MOFs whose H2O Henry constant exceeds CO2's "
                         "(default on; --no-water-filter keeps them for a more diverse dataset).")
@@ -1353,11 +1272,8 @@ def main() -> None:
     # Simulation parameters
     p.add_argument("--n-cycles",    type=int,   default=5000,
                    help="Cycles for Stage 1 (GCMC or GC-TMMC screening).")
-    # ADDED: separate cycle count for Stage 3 -- screening (Stage 1) only
-    # needs to rank MOFs relatively, so it can run cheap; Stage 3 produces
-    # the actual training labels, where noisier/under-converged loadings
-    # directly become noisier training data. None (default) reuses
-    # --n-cycles, so existing invocations are unaffected.
+    # separate cycle count for Stage 3: screening only needs to rank MOFs,
+    # while Stage 3 produces the training labels. None reuses --n-cycles.
     p.add_argument("--stage3-n-cycles", type=int, default=None,
                    help="Cycles for Stage 3 (humid multicomponent GCMC, "
                         "the real training-label generator). Defaults to "
@@ -1366,15 +1282,9 @@ def main() -> None:
                    help="Stage 3 (real training data) temperature grid.")
     p.add_argument("--pressures",    default="0.1,0.5,1.0,5.0,10.0",
                    help="Stage 3 (real training data) pressure grid.")
-    # ADDED: select_mofs_for_gcmc() only ever reads ONE temperature
-    # (temps[0]) and only the lowest pressure point (Henry constant) plus
-    # min/max pressure (working-capacity interpolation) -- the rest of a
-    # full --temperatures x --pressures sweep is computed by Stage 1 and
-    # then silently never used. A separate, smaller Stage 1 grid gets the
-    # cheap-screening benefit GC-TMMC would have given (9 jobs/MOF at the
-    # defaults below: 1 temp x 3 pressures x 3 components) using the plain
-    # GCMC method that's actually proven to work, instead of GC-TMMC (which
-    # doesn't -- see --stage1-method's help).
+    # select_mofs_for_gcmc() reads only one temperature, the lowest pressure
+    # (Henry constant) and min/max pressure (working capacity), so Stage 1 runs
+    # on its own, smaller grid (default 1 T x 3 P x 3 components).
     p.add_argument("--stage1-temperatures", default=None,
                    help="Stage 1 (screening) temperature grid. Defaults to "
                         "just the first value in --temperatures if not given.")
@@ -1387,15 +1297,10 @@ def main() -> None:
     p.add_argument("--rhs",          default="0.0,0.05,0.15")
     p.add_argument("--dry-co2-frac", type=float, default=0.15)
     p.add_argument("--cutoff",       type=float, default=12.0)
-    # FIX: was "GenericMOFs", which isn't in a standard RASPA2 install and
-    # silently fell back to ExampleMOFsForceField (mis-typed framework atoms).
     p.add_argument("--forcefield",   default=DEFAULT_FORCEFIELD,
                    help=f"RASPA force field (default: {DEFAULT_FORCEFIELD}, shipped in forcefields/)")
-    # FIX: defaulted to False (no framework electrostatics) while the
-    # active-learning GCMCConfig/GCTMMCConfig defaulted use_charges=True and
-    # the model was trained with use_charges=True as an input feature — a
-    # three-way inconsistency. Now defaults on; pass
-    # --no-use-framework-charges to reproduce the old uncharged behaviour.
+    # framework charges on by default, consistent with the GCMC configs and the
+    # model input (use_charges).
     p.add_argument(
         "--use-framework-charges", action=argparse.BooleanOptionalAction, default=True,
         help="Use CIF partial charges for host-guest electrostatics in RASPA "
@@ -1423,23 +1328,18 @@ def main() -> None:
     # Stage control (useful for resuming)
     p.add_argument("--skip-stage1",  action="store_true", help="Load existing stage1 parquet")
     p.add_argument("--skip-stage2",  action="store_true", help="Run GCMC on all (skip selection)")
-    # ADDED: for a two-phase parallel setup -- run this once, globally, to
-    # do Stage 1 (screening) + Stage 2 (selection) only, producing
-    # gcmc_selected_mofs.txt, then exit before the expensive Stage 3. Then
-    # parallel workers each run with --skip-stage1 --skip-stage2 on their
-    # own pre-assigned subset of the selected MOFs for Stage 3 only.
-    # ADDED: lets run_parallel_gcmc.sh run Stage 1 on N CIF chunks in
-    # parallel, then merge them and run Stage 2 once globally.
+    # two-phase parallel setup: run Stage 1 on CIF chunks (--stop-after-stage1),
+    # then Stage 1+2 once globally (--stop-after-stage2) to produce
+    # gcmc_selected_mofs.txt; workers then run Stage 3 only with --skip-stage1
+    # --skip-stage2 on their share of the selected MOFs.
     p.add_argument("--stop-after-stage1", action="store_true",
                    help="Exit right after Stage 1 (parallel screening chunks).")
     p.add_argument("--stop-after-stage2", action="store_true",
                    help="Exit after Stage 2 selection, before Stage 3 (GCMC). "
                         "For running Stage 1+2 once globally before "
                         "parallelizing Stage 3 across workers.")
-    # ADDED: GC-TMMC existed in src/simulation/gctmmc/ but nothing ever drove
-    # it. 'gctmmc' gets a full isotherm per (MOF, component, T) from one
-    # simulation instead of one GCMC run per (MOF, component, T, P) --
-    # single-component screening only; Stage 3 is unaffected either way.
+    # 'gctmmc' gets a full isotherm per (MOF, component, T) from one simulation
+    # (single-component screening only; Stage 3 is unaffected).
     p.add_argument("--stage1-method", choices=["gcmc", "gctmmc"], default="gcmc",
                    help="Stage 1 single-component screening method (default: gcmc).")
 
@@ -1459,9 +1359,8 @@ def main() -> None:
             attr = key.replace("-", "_")
             if hasattr(args, attr):
                 setattr(args, attr, val)
-        # FIX: pipeline.yaml stores use_charges under simulation.gcmc, not as
-        # a top-level simulation key, so the generic loop above never applied
-        # it — --config's charge setting was silently ignored. Apply explicitly.
+        # pipeline.yaml stores use_charges under simulation.gcmc, not as a
+        # top-level simulation key, so apply it explicitly.
         gcmc_cfg = sim.get("gcmc", {})
         if "use_charges" in gcmc_cfg:
             args.use_framework_charges = bool(gcmc_cfg["use_charges"])
@@ -1554,11 +1453,8 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Stage 1 — single-component pressure sweep (ALL MOFs)
     # ------------------------------------------------------------------
-    # ADDED: when both stages are skipped (the "Stage 3 only" mode used by
-    # parallel workers that already received a pre-selected MOF list from a
-    # prior global Stage 1+2 run), Stage 1 output is never used for
-    # anything -- Stage 2 is also skipped, so nothing reads stage1_df
-    # except a row-count log line. Don't waste time recomputing it.
+    # Stage 3-only mode (both earlier stages skipped): Stage 1 output would be
+    # unused, so it is not recomputed.
     stage1_parquet = output_dir / "stage1_isotherms.parquet"
     if args.skip_stage1 and args.skip_stage2:
         logger.info("\n[Stage 1] Skipped entirely (Stage 3-only mode: Stage 2 is also skipped, "
@@ -1596,13 +1492,7 @@ def main() -> None:
         gcmc_cifs = all_cifs
         logger.info(f"\n[Stage 2] Skipped — using all {len(gcmc_cifs)} MOFs for GCMC")
     else:
-        # FIX: this used to reference Stage 3's temps/pressures (temps[0],
-        # max/min(pressures)) even though Stage 1 now runs its own,
-        # separate, smaller condition grid. If the two grids don't share
-        # a reference temperature, the "between(temperature_k +/- 1.0)"
-        # filter inside select_mofs_for_gcmc would match zero rows and
-        # (per the earlier fix) raise immediately instead of silently
-        # selecting nothing. Must reference Stage 1's own grid here.
+        # Stage 2 uses Stage 1's own condition grid, not Stage 3's.
         selected_ids = select_mofs_for_gcmc(
             stage1_df,
             gcmc_budget=args.gcmc_budget,

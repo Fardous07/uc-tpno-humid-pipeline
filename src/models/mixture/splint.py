@@ -224,15 +224,7 @@ class SPLINTModel:
     and provides a self-consistent RAST solver that iterates between
     computing γ_i and re-solving the IAST system with γ until convergence.
 
-    FIX in predict():
-    The original RAST loop computed
-        P0_modified[i] = y_i * P / (x_i * γ_i)
-        x_new[i]       = y_i * P / (γ_i * P0_modified[i])
-    which substitutes back to x_new[i] = x[i] identically — a circular
-    derivation.  dx = 0 on the first pass, so converged = True
-    immediately and x never changed.
-
-    Fix: after computing γ, re-solve the full IAST system with the
+    After computing γ, predict() re-solves the full IAST system with the
     modified sum constraint Σ (y_i * P / (γ_i * P_i⁰)) = 1 while
     keeping the equal-spreading-pressure condition unchanged.  This
     gives genuinely new P_i⁰ values, from which x_new = y * P / (γ * P⁰)
@@ -269,7 +261,7 @@ class SPLINTModel:
             )
 
     # ------------------------------------------------------------------
-    # FIX: helper to re-solve IAST with γ incorporated
+    # helper to re-solve IAST with γ incorporated
     # ------------------------------------------------------------------
 
     def _solve_rast(
@@ -377,10 +369,7 @@ class SPLINTModel:
 
             # Step 3: re-solve IAST with γ incorporated
             #
-            # FIX: previously P0 was recomputed as y_i*P/(x_i*γ_i) and then
-            # x_new = y_i*P/(γ_i*P0_modified) which trivially equals x_i.
-            # Now we actually solve the modified IAST system so P0 genuinely
-            # changes and x_new ≠ x.
+            # solve the modified IAST system for new P0 values
             P0_new = self._solve_rast(y, P_total, gamma_new, P0, active)
             if P0_new is None:
                 logger.warning(

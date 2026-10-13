@@ -22,26 +22,6 @@ single, composable API:
     6.  **Console formatters** — colour-coded severity levels, aligned
         metric columns, and optional ``rich`` integration.
 
-Fixes vs previous version
-──────────────────────────
-1. ``from .constants import PIPELINE_NAME, PIPELINE_VERSION`` crashed at
-   import because constants.py contains physics constants only — those
-   names were never defined.  Fixed: define them as module-level strings
-   here so the module is self-contained.
-
-2. MetricLogger.log() mutated the caller's metrics dict when prefix=""
-   (the default).  ``metrics["epoch"] = step`` and
-   ``metrics.setdefault("timestamp", …)`` modified the original object.
-   Fixed: always copy() before any mutation.
-
-3. CSVMetricSink._rewrite_with_new_columns() imported pandas for the
-   rare new-column case.  If pandas is not installed (lightweight
-   analysis scripts) this raised ImportError.  Fixed: rewrite using
-   stdlib csv reader/writer only.
-
-4. MetricTracker.best only iterated history[0].keys(), silently omitting
-   metrics that first appeared after epoch 0.  Fixed: union all keys.
-
 Project : UC-TPNO — Uncertainty-Calibrated Thermodynamic Potential
           Neural Operator for Humid Flue-Gas CO₂ Capture in MOFs
 License : MIT
@@ -65,8 +45,7 @@ from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
-# ── FIX 1: define pipeline identity here, not imported from constants ──
-# constants.py holds physics constants (R, K_B, …) — it never had these.
+# ── pipeline identity ──
 PIPELINE_NAME: str    = "uc_tpno"
 PIPELINE_VERSION: str = "0.1.0"
 
@@ -240,10 +219,8 @@ class MetricTracker:
         """
         Best (minimum) value seen for each metric across all epochs.
 
-        FIX: previous version only iterated history[0].keys(), which
-        silently omitted metrics that first appeared after epoch 0
-        (e.g. physics losses that activate after warmup).
-        Now unions all keys across the full history.
+        Unions keys across the full history, so metrics that first appear after
+        epoch 0 (e.g. physics losses after warmup) are included.
         """
         if not self.history:
             return {}
@@ -311,7 +288,6 @@ class CSVMetricSink:
 
         new_keys = sorted(set(metrics.keys()) - set(self._columns))
         if new_keys:
-            # FIX: rewrite using stdlib csv, not pandas
             self._columns = sorted(set(self._columns) | set(new_keys))
             self.close()
             self._rewrite_with_new_columns()
@@ -332,9 +308,8 @@ class CSVMetricSink:
         """
         Rewrite the CSV with the updated column set.
 
-        FIX: uses stdlib csv only — previous version imported pandas,
-        which crashed with ImportError in lightweight environments.
-        Falls back to the in-memory row cache if the file does not exist.
+        Uses stdlib csv only. Falls back to the in-memory row cache if the file
+        does not exist.
         """
         # Read existing file rows (if any) into memory
         existing_rows: List[Dict[str, str]] = []
@@ -571,10 +546,7 @@ class MetricLogger:
         """
         Log a dict of metrics to all sinks.
 
-        FIX: always works on a *copy* of metrics so the caller's dict is
-        never mutated.  Previous version did ``metrics["epoch"] = step``
-        and ``metrics.setdefault("timestamp", …)`` directly on the
-        original when prefix was empty.
+        Works on a copy of metrics, so the caller's dict is never mutated.
         """
         # Always copy to avoid mutating caller's dict
         m: Dict[str, Any] = (

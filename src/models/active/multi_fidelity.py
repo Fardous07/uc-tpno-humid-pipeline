@@ -193,10 +193,7 @@ class FidelityCorrelation:
         Store a pair with a canonical (low, high) key, swapping
         y values if the caller passed fids in the wrong order.
 
-        FIX: original code normalised the key but kept y values in
-        call order.  When fid_a > fid_b the y's were stored reversed
-        relative to the key, so correlation() and scaling_factor()
-        would regress in the wrong direction.
+        The y values are stored in the same order as the normalised key.
         """
         if fid_a <= fid_b:
             key = (fid_a, fid_b)
@@ -236,11 +233,8 @@ class FidelityCorrelation:
         Returns ``None`` if fewer than ``min_pairs`` observations or
         if either series has near-zero variance (correlation undefined).
 
-        FIX: original returned 1.0 for constant series.  If one series
-        is constant and the other is not, they are uncorrelated (not
-        perfectly correlated).  Returning 1.0 would cause the selector
-        to blindly trust a useless fidelity.  Return None instead so
-        the caller falls back to the highest fidelity.
+        Returns None for a constant series (no correlation information), so the
+        caller falls back to the highest fidelity.
         """
         key = (min(fid_low, fid_high), max(fid_low, fid_high))
         pairs = self._pairs.get(key, [])
@@ -391,10 +385,7 @@ class AutoRegressiveModel(nn.Module):
         -------
         ``[B, 1]`` predictions.
 
-        FIX: cast fidelities to long before comparison.
-        ``unique().tolist()`` on a float tensor returns Python floats;
-        comparing a float tensor with int(fid) works by accident in
-        PyTorch but is brittle.  Explicit .long() makes the intent clear.
+        Fidelities are cast to long before comparison.
         """
         fidelities = fidelities.long()
         unique_fids = fidelities.unique().tolist()
@@ -840,4 +831,4 @@ __all__ = [
     "FidelitySelector",
     "MultiFidelityDataset",
     "multi_fidelity_step",
-]
+]

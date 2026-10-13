@@ -21,16 +21,6 @@ Methods implemented:
 5. Stratified sampling         — ensure coverage across feature space
 6. Hybrid                      — mix of random + diverse
 
-Fix vs. original
-----------------
-BUG FIXED: ColdStartSelector.select had
-
-    return np.array([] if return_indices else [])[0]
-
-Both ternary branches produce [] so this always evaluates to
-np.array([])[0], raising IndexError (index 0 is out of bounds for an
-empty array) whenever k <= 0.  Removed the erroneous [0] subscript.
-
 References:
 [1] Gonzalez (1985). Clustering to Minimize the Maximum Intercluster Distance.
 [2] Kulesza & Taskar (2012). Determinantal Point Processes for Machine Learning.
@@ -509,9 +499,6 @@ class ColdStartSelector:
         """
         k = k if k is not None else self.k
 
-        # FIX: original had `np.array([] if return_indices else [])[0]`
-        # Both ternary branches produce [] so this always created
-        # np.array([])[0] → IndexError.  Removed the erroneous [0].
         if k <= 0:
             return np.array([], dtype=int) if return_indices else X[np.array([], dtype=int)]
 

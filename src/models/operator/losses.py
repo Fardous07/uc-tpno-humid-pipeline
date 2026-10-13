@@ -24,18 +24,18 @@ class LossConfig:
     lambda_competition: float = 0.05
     lambda_gibbs_duhem: float = 0.0
     lambda_aux:         float = 0.3
-    # run_009: threshold on ln(f / 1 bar) = μ/RT (was on raw μ in kJ/mol).
+    # threshold on ln(f / 1 bar) = μ/RT
     henry_mu_threshold: float = -2.3   # ln(0.1 bar): dilute region
     use_nll:            bool  = True
-    # --- run_006: robust data loss ---------------------------------------
+    # --- robust data loss ------------------------------------------------
     # Huber ("smooth L1") on the data term: quadratic for |resid| < delta,
     # linear beyond it. Since the data loss is computed in NORMALIZED units
-    # (std ≈ 1), delta = 1.0 caps the influence of >1σ outliers — this is
-    # the fix for the heavy CO2 error tail (kurtosis ~140, max_abs_err ~1.9).
+    # (std ≈ 1), delta = 1.0 caps the influence of >1σ outliers (heavy CO2
+    # error tail).
     # Ignored when use_nll is True and a sigma head is available.
     use_huber:          bool  = True
     huber_delta:        float = 1.0
-    # --- run_009 ----------------------------------------------------------
+    # --- uncertainty and sign ---------------------------------------------
     # Variance head: trained with a Gaussian NLL on a STOP-GRADIENT copy of
     # the prediction, so σ learns the residual scale without pulling the
     # mean away from the robust (Huber) fit. 0 disables.
@@ -122,9 +122,8 @@ def error_bar_weights(
     share of the loss whatever its typical error bar. A zero error bar is not
     information about precision -- it occurs where the loading is exactly 0
     (water at 0 % RH, 32 % of all water labels) -- so such points, like those
-    with unknown errors, get the component's median weight. Previously these
-    trivial zeros received the maximum weight 1/floor² and, with one global
-    normalisation, pulled weight away from the informative humid water points.
+    with unknown errors, get the component's median weight, so trivial zeros
+    do not receive the maximum weight 1/floor².
     """
     deriv = 1.0 / (1.0 + targets.clamp(min=0.0)) if log1p else torch.ones_like(targets)
     sigma_z = target_err * deriv / q_std
@@ -200,15 +199,8 @@ def monotonicity_loss(
         pos_mu = pos_mu * pair_mask.unsqueeze(-1)
 
     violations = F.relu(-q_diff) * pos_mu        # penalise q↓ when μ↑
-    # FIX: violations.mean() used to divide by the FULL padded tensor size
-    # (B*(P-1)*n_components) even when a mask zeroed out padded pairs, so
-    # the same physical violation rate produced a smaller loss/gradient the
-    # more a batch happened to be padded -- making lambda_monotonic
-    # effectively batch-composition-dependent instead of a fixed weight.
-    # (Currently latent: configs/pipeline.yaml trains at batch_size=1, where
-    # there is no padding at all -- but it would have silently under-
-    # weighted this term the moment batch_size was increased.) Divide by
-    # the actual valid-element count when a mask is given.
+    # divide by the valid-element count so the weight does not depend on
+    # how much of the batch is padding
     if pair_mask is not None:
         denom = pair_mask.sum() * n_components
         return violations.sum() / denom.clamp(min=1.0)
@@ -228,12 +220,9 @@ def henry_law_loss(
     src.utils.chemistry). K_H,i = n_i / f_i should therefore be constant
     across dilute points of the SAME MOF at the SAME temperature.
 
-    run_009 FIX: the previous version used exp(μ) (i.e. RT = 1 with μ in
-    kJ/mol -- wrong units) and pooled points at different temperatures,
-    although K_H depends on T. Now: f = exp(μ/RT), dilute = ln f < mu_threshold
-    (default ln 0.1 bar) for that component, trace species (f < 1e-8 bar,
-    e.g. water at 0 % RH) excluded, and the coefficient of variation of K_H
-    is penalised within each (MOF, T) group.
+    Dilute = ln f < mu_threshold (default ln 0.1 bar) for that component;
+    trace species (f < 1e-8 bar, e.g. water at 0 % RH) are excluded, and the
+    coefficient of variation of K_H is penalised within each (MOF, T) group.
 
     conditions : [B, P, D] with T in the last column.
     """
@@ -295,12 +284,7 @@ def competition_loss(
                 pos_mu_i = pos_mu_i * pair_mask
             # q_j should not increase when μ_i increases
             violations = F.relu(q_diff[..., j]) * pos_mu_i
-            # FIX: violations.mean() divided by the full B*(P-1) padded
-            # size even when pair_mask zeroed out padded pairs, diluting
-            # this term's magnitude by the batch's padding ratio (same
-            # class of bug as monotonicity_loss above; also currently
-            # latent at batch_size=1). Divide by the actual valid-pair
-            # count when a mask is given.
+            # divide by the valid-pair count (independent of padding)
             if pair_mask is not None:
                 denom = pair_mask.sum().clamp(min=1.0)
                 penalty = penalty + violations.sum() / denom
@@ -346,13 +330,12 @@ class ThermodynamicLoss(nn.Module):
     """
     Combined data + physics loss for UC-TPNO training.
 
-    FIX: forward() now accepts a mask [B, P] to exclude padded pressure
-    points from all loss computations.  Without this, the collate function's
-    zero-padding at μ=0,T=0 was silently included in every loss term.
+    forward() takes a mask [B, P] that excludes padded pressure points from
+    every loss term.
 
-    run_006: the data term (and the auxiliary-head term) use Huber loss by
-    default (config.use_huber) so a few high-error CO2 points can no longer
-    dominate training. Set config.use_huber = False to fall back to MSE.
+    The data term (and the auxiliary-head term) use Huber loss by default
+    (config.use_huber) so a few high-error CO2 points cannot dominate
+    training. Set config.use_huber = False to fall back to MSE.
     """
 
     def __init__(
@@ -491,7 +474,7 @@ class ThermodynamicLoss(nn.Module):
 
         q_pred = q_mean_pred
 
-        # --- Hessian symmetry (exact by construction since run_009; kept for ablations) ---
+        # --- Hessian symmetry (exact by construction; kept for ablations) ---
         if c.lambda_hessian > 0:
             hess  = model.get_hessian(graphs, conditions)
             h_loss = hessian_symmetry_loss(hess)
@@ -532,9 +515,8 @@ class AdaptiveLossWeighting:
     Automatically rescale physics loss weights so that no single term
     dominates.  Uses an exponential moving average of recent loss magnitudes.
 
-    FIX: denominator now uses len(mean_losses) (only keys that have data)
-    instead of len(self.weights) (all keys), which was wrong when some
-    physics losses are disabled or not yet logged.
+    The denominator counts only keys that have data, so disabled or not yet
+    logged physics losses do not change the balance.
     """
 
     def __init__(
@@ -572,7 +554,7 @@ class AdaptiveLossWeighting:
             }
             if mean_losses:
                 total = sum(mean_losses.values())
-                n     = len(mean_losses)         # FIX: only counted keys
+                n     = len(mean_losses)
                 for k in self.weights:
                     if k in mean_losses and total > 0:
                         new_w = total / (n * mean_losses[k])

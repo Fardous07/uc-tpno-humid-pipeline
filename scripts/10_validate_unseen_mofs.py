@@ -202,8 +202,7 @@ def main() -> None:
     model_cfg = cfg.get("model", {})
 
     # ------------------------------------------------------------------
-    # FIX-critical: charges must match Stage 3, or this whole exercise
-    # repeats the original mismatch in miniature.
+    # charges must match Stage 3
     # ------------------------------------------------------------------
     use_charges = bool(sim_cfg.get("gcmc", {}).get("use_charges", True))
     if bool(model_cfg.get("use_charges", False)) != use_charges:

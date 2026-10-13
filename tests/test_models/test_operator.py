@@ -24,7 +24,7 @@ class TestTPNOConfig:
         cfg = TPNOConfig()
         assert cfg.emb_dim > 0
         assert cfg.n_conditions > cfg.n_components > 0
-        # run_009: defaults must give a convex potential network
+        # defaults must give a convex potential network
         assert cfg.activation == "softplus"
         assert cfg.use_layer_norm is False
         assert cfg.film_conditioning is True

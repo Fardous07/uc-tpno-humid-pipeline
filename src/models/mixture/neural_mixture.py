@@ -221,14 +221,6 @@ class MixtureCorrectionLoss(nn.Module):
     *  ``sum_rule``  — MSE between adsorbed-phase mole fractions predicted by
                        the model and those derived from GCMC ground truth.
 
-                       FIX: original code computed
-                           x_corr = pred / pred.sum(dim=-1)
-                           loss   = (x_corr.sum(dim=-1) - 1)²
-                       which is identically 0 by construction (any vector
-                       divided by its own sum always sums to 1).  Replaced
-                       with MSE between corrected mole fractions and GCMC
-                       mole fractions, which is a meaningful constraint.
-
     *  ``monotone``  — weight reserved for monotonicity penalty (not yet
                        implemented; kept at w_monotone=0 by default).
     """
@@ -261,14 +253,7 @@ class MixtureCorrectionLoss(nn.Module):
         log_corr = torch.log(correction.clamp(min=1e-6))
         gamma_reg = log_corr.pow(2).mean()
 
-        # FIX: sum-rule — MSE between corrected adsorbed mole fractions and
-        # GCMC-derived mole fractions.
-        #
-        # Old code (always 0):
-        #   x_corr = pred / pred.sum(dim=-1, keepdim=True).clamp(min=1e-10)
-        #   sum_violation = (x_corr.sum(dim=-1) - 1.0).pow(2).mean()
-        #
-        # New code: compare mole-fraction distributions.
+        # sum rule: MSE between predicted and GCMC adsorbed mole fractions
         x_pred = pred.clamp(min=0.0)
         x_pred = x_pred / x_pred.sum(dim=-1, keepdim=True).clamp(min=1e-10)
 

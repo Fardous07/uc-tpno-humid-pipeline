@@ -186,7 +186,7 @@ class EncoderAdapter(nn.Module):
         # Global structural descriptors are concatenated to the GNN
         # embedding BEFORE projection.  They carry MOF identity at full
         # scale and bypass the pooling/normalisation washout that
-        # collapsed the pure-GNN embeddings (diagnosed in run_004).
+        # can collapse pure-GNN embeddings.
         self._n_desc = 12
         # Optional per-framework features supplied with the graph as
         # ``data.mof_feat`` [B, F] (Stage 1 GCMC + charge statistics).

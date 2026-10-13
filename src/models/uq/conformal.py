@@ -189,9 +189,8 @@ class DensityRatioEstimator:
 
     Supported classifiers: ``'gbm'`` (default), ``'rf'``, ``'logistic'``.
 
-    FIX: original code normalised weights BEFORE clipping, so clipping
-    destroyed the normalisation.  Correct order: clip first, then
-    normalise to mean 1 so that the weighted quantile is well-scaled.
+    Weights are clipped first, then normalised to mean 1, so the weighted
+    quantile is well-scaled.
     """
 
     def __init__(
@@ -242,9 +241,7 @@ class DensityRatioEstimator:
         proba = self._clf.predict_proba(X)
         p_src, p_tgt = proba[:, 0], proba[:, 1]
         w = p_tgt / (p_src + 1e-8)
-        # FIX: clip BEFORE normalising so the clipped weights still have
-        # mean 1 and the weighted quantile is correctly scaled.
-        # Original: normalise then clip → clipping broke normalisation.
+        # clip BEFORE normalising so the weights keep mean 1
         w = np.clip(w, self.clip[0], self.clip[1])
         w = w / w.mean()    # normalise to mean 1 after clipping
         return w
@@ -282,12 +279,9 @@ def _weighted_quantile(
     cumulative normalised weight of all calibration scores ≤ s
     exceeds ``(1−α)(1 + 1/n)``.
 
-    FIX: original used ``np.interp`` (linear interpolation between
-    scores), which can return a value strictly between two calibration
-    scores.  The conformal guarantee requires the *step-function*
-    quantile — the actual smallest calibration score that pushes
-    cumulative weight over the target level.  Fixed to use
-    ``np.searchsorted`` on the sorted cumulative weights.
+    Uses the step-function quantile (``np.searchsorted`` on the sorted
+    cumulative weights): the conformal guarantee needs an actual calibration
+    score, not an interpolated value.
     """
     n = len(scores)
     target = (1 - alpha) * (1 + 1.0 / n)

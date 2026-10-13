@@ -4,7 +4,7 @@ build_mof_features.py -- per-framework input features for the encoder.
 
 The crystal graph plus 12 composition descriptors let the model fit water on
 its training frameworks but not transfer water affinity to new ones
-(run_013: training-MOF water pred/true 0.76, validation Spearman 0.24).
+(validation water Spearman 0.24).
 Two physically targeted feature groups are added:
 
   Stage 1 single-component GCMC (313.15 K; already simulated for every

@@ -1,5 +1,5 @@
 """
-Physics guarantees of the UC-TPNO operator (run_009).
+Physics guarantees of the UC-TPNO operator.
 
 These are properties of the ARCHITECTURE, so they must hold for any
 parameter values, not just after training. Each test randomises the

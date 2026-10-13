@@ -21,17 +21,11 @@ Key capabilities
 •  Adsorption loading unit conversions (mmol/g, cm³(STP)/g, mg/g,
    molecules/uc, wt%).
 
-BUG FIX (this version)
-──────────────────────
-Previous version: build_condition_vector used mu_dict.get("H2O", 0.0).
-μ = 0 corresponds to f = 1 bar of water — physically wrong for dry
-conditions, which poisoned the grand-potential surface with a false
-"1 bar water" signal on every dry training point.
-
-Fix: when a species has zero or absent mole fraction, replace with
-TRACE_Y = 1e-10 before computing fugacities so the resulting μ is
-very negative (physically meaningful "essentially absent") rather than
-zero (physically "1 bar present").
+Absent species
+──────────────
+A species with zero or absent mole fraction is given TRACE_Y = 1e-10
+before computing fugacities, so its μ is very negative ("essentially
+absent") rather than zero (which would mean f = 1 bar).
 
 Project : UC-TPNO — Uncertainty-Calibrated Thermodynamic Potential
           Neural Operator for Humid Flue-Gas CO₂ Capture in MOFs
@@ -504,10 +498,8 @@ def build_condition_vector(
     Build the 4-D condition vector  [μ_CO₂, μ_N₂, μ_H₂O, T]  that the
     TPNO operator expects as input.
 
-    BUG FIX: previous version used mu_dict.get("H2O", 0.0), which gave
-    μ = 0 (≡ f = 1 bar) for dry conditions.  This version always computes
-    all three μ values using a trace mole fraction (_TRACE_Y = 1e-10) for
-    absent species, yielding a physically meaningful very-negative μ.
+    All three μ values are always computed; absent species use a trace mole
+    fraction (_TRACE_Y = 1e-10), giving a very negative μ.
 
     Parameters
     ----------

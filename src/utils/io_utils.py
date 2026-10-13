@@ -26,33 +26,6 @@ Key capabilities
 8.  **Pipeline directory layout** — canonical paths for raw / intermediate
     / processed / graph / checkpoint / results directories.
 
-Fixes vs previous version
-──────────────────────────
-1. cif_to_graph() — cell.unsqueeze(0) stored cell as (1,3,3) per graph.
-   PyG Batch.from_data_list() then produces (N,1,3,3) instead of (N,3,3),
-   breaking every downstream model that indexes batch.cell[i].
-   Fix: store cell as (3,3) without unsqueeze.
-
-2. save_graph(compress=True, path="x.pt") — wrote gzip bytes into a .pt
-   file whose suffix does not signal compression.  load_graph() checks
-   p.suffix == ".gz" to decide whether to decompress, so torch.load()
-   then hit a pickle error on the raw gzip stream.
-   Fix: auto-append ".gz" to path when compress=True and suffix is absent.
-
-3. parse_raspa_output() — _re_loading_abs compiled but never used (dead
-   regex).  Also, current_component reset to None between files but the
-   results dict accumulated across files, so the same component in a
-   second .data file silently overwrote the first.
-   Fix: removed dead regex; accumulate per-file then merge with averaging.
-
-4. iter_graphs() / load_graph_batch() — p.stem.replace(".pt", "") could
-   corrupt MOF IDs that contain the substring ".pt" (e.g. "apt_MOF").
-   Fix: strip known extensions from p.name instead of p.stem.
-
-5. apply_dot_overrides() — comment claimed yaml.safe_load() does not
-   handle scientific notation ("3e-4" → str).  In fact PyYAML 1.1 returns
-   float 0.0003.  Comment corrected; fallback kept as defensive code.
-
 Project : UC-TPNO — Uncertainty-Calibrated Thermodynamic Potential
           Neural Operator for Humid Flue-Gas CO₂ Capture in MOFs
 License : MIT
@@ -186,8 +159,7 @@ def _stem_without_graph_ext(p: Path) -> str:
     """
     Return the MOF ID (filename without graph extensions).
 
-    FIX: using p.stem.replace(".pt", "") corrupts MOF IDs that happen to
-    contain ".pt" (e.g. "apt_MOF" → "a_MOF").  Strip from p.name instead.
+    Strips the extension from p.name, so IDs containing ".pt" stay intact.
     """
     name = p.name
     for ext in (".pt.gz", ".pt"):
@@ -467,7 +439,7 @@ def cif_to_graph(
 
     z   = torch.tensor(atoms.get_atomic_numbers(), dtype=torch.long)
     pos = torch.tensor(atoms.get_positions(),       dtype=torch.float32)
-    # FIX: (3,3) not (1,3,3) — PyG batching stacks to (N,3,3)
+    # (3,3): PyG batching stacks to (N,3,3)
     cell = torch.tensor(np.array(atoms.get_cell()), dtype=torch.float32)
 
     # Neighbour list with periodic boundary conditions
@@ -540,9 +512,7 @@ def save_graph(data: Any, path: PathLike, compress: bool = False) -> Path:
     compress : If *True*, gzip the serialised bytes.
               If *path* does not already end with ``.gz``, it is
               appended automatically so that ``load_graph`` can detect
-              the format.  Previously, compress=True with a .pt path
-              wrote gzip bytes that load_graph() could not detect and
-              failed silently.
+              the format.
 
     Returns
     -------
@@ -552,7 +522,7 @@ def save_graph(data: Any, path: PathLike, compress: bool = False) -> Path:
 
     p = Path(path)
 
-    # FIX: ensure the extension signals compression so load_graph works
+    # the extension signals compression so load_graph can detect it
     if compress and not p.name.endswith(".gz"):
         p = p.with_name(p.name + ".gz")
 
@@ -619,7 +589,7 @@ def load_graph_batch(
                     break
     else:
         for p in glob_sorted(d, pattern):
-            mid = _stem_without_graph_ext(p)   # FIX: safe extension stripping
+            mid = _stem_without_graph_ext(p)
             result[mid] = load_graph(p)
 
     return result
@@ -634,7 +604,7 @@ def iter_graphs(
     tuples without loading everything into memory.
     """
     for p in glob_sorted(directory, pattern):
-        mid = _stem_without_graph_ext(p)       # FIX: safe extension stripping
+        mid = _stem_without_graph_ext(p)
         yield mid, load_graph(p)
 
 

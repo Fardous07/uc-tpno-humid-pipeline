@@ -18,26 +18,9 @@ class AdsorptionDataset(Dataset):
     Each sample is one MOF; __getitem__ returns all its (condition, loading)
     pairs padded to a common length by the collate function.
 
-    Fixes vs. original
-    ------------------
-    1. BUG FIXED: grouped.groups returns index LABELS, not positional integers.
-       iloc[labels] silently returns wrong rows when the DataFrame index is
-       non-contiguous (e.g. after dropna).  Now uses grouped.indices which
-       always gives positional integers.
-    2. BUG FIXED: NaN loadings from failed/partial GCMC runs are silently
-       propagated to tensors and corrupt training.  Rows with NaN in any
-       target column are dropped and the index is reset before building the
-       lookup table (which also guarantees contiguous integer positions).
-    3. Removed lazy_loading flag — both old branches did identical work at
-       init time (pre-computed all row indices), so the flag saved no memory.
-       One clean path is simpler and correct.
-
-    run_007
-    -------
-    __getitem__ still returns RAW loadings in mol/kg (unchanged), so eval /
-    process code is unaffected. Only compute_normalization_stats gains a
-    ``target_transform`` argument so the model's q_mean/q_std can be computed
-    on log1p(loading) — matching TPNOConfig.target_transform="log1p".
+    Rows with a NaN loading (failed GCMC points) are dropped. __getitem__
+    returns raw loadings in mol/kg; compute_normalization_stats takes a
+    ``target_transform`` so q_mean/q_std match TPNOConfig.target_transform.
     """
 
     def __init__(
@@ -76,7 +59,7 @@ class AdsorptionDataset(Dataset):
 
         self.condition_columns = condition_columns
         self.target_columns = target_columns
-        # run_009: GCMC error bars, e.g. co2_loading_molkg_err (NaN where a
+        # GCMC error bars, e.g. co2_loading_molkg_err (NaN where a
         # result predates error recording or the column is absent).
         self.error_columns = [f"{c}_err" for c in target_columns]
 
@@ -92,8 +75,8 @@ class AdsorptionDataset(Dataset):
             pd.read_parquet(ap) if ap.suffix == ".parquet" else pd.read_csv(ap)
         )
 
-        # FIX 2: drop rows where any loading is NaN (failed GCMC points)
-        # then reset_index so iloc positions == index labels (fixes FIX 1).
+        # drop rows with a NaN loading (failed GCMC points); reset_index so
+        # iloc positions equal index labels
         n_before = len(adsorption_raw)
         self.adsorption = (
             adsorption_raw
@@ -118,7 +101,7 @@ class AdsorptionDataset(Dataset):
                 f"Adsorption MOFs: {len(ads_mofs)}, Graph MOFs: {len(graph_mofs)}"
             )
 
-        # FIX 1: grouped.indices gives positional integers — safe with iloc.
+        # grouped.indices gives positional integers, safe with iloc
         grouped = self.adsorption.groupby("mof_id")
         self._mof_to_rows: Dict[str, np.ndarray] = {
             mof_id: grouped.indices[mof_id]
@@ -254,12 +237,10 @@ class AdsorptionDataset(Dataset):
             stats = dataset.compute_normalization_stats(train_indices)
             model.set_normalization(**stats)
 
-        run_007
-        -------
         ``target_transform`` MUST match TPNOConfig.target_transform:
           - "log1p"    : q stats are computed on log1p(loading) so they line
                          up with the model's normalize_q / denormalize_q.
-          - "identity" : q stats on raw loadings (run_005/run_006 behaviour).
+          - "identity" : q stats on raw loadings.
         The default is "log1p" to match the TPNOConfig default.
         """
         all_cond: List[torch.Tensor] = []
@@ -274,7 +255,7 @@ class AdsorptionDataset(Dataset):
         cond_cat = torch.cat(all_cond, dim=0)   # [N_total, D]
         load_cat = torch.cat(all_load, dim=0)   # [N_total, C]
 
-        # run_007: transform loadings BEFORE computing q stats so that
+        # transform loadings BEFORE computing q stats so that
         # (q_mean, q_std) live in the same space the model trains in.
         if target_transform == "log1p":
             load_cat = torch.log1p(load_cat.clamp(min=0.0))

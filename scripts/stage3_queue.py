@@ -311,9 +311,8 @@ def status() -> None:
             continue
         n = len(load_checkpoint(OUT_DIR / u["name"]).drop_duplicates(KEY))
         jobs_left += JOBS_PER_TEMP - n
-        # FIX: "active" used to mean "log written in the last 3 h", which
-        # hid units busy on one long (>3 h) high-pressure job. A unit's log
-        # is created when it starts, so started-but-unfinished == active.
+        # a unit's log is created when it starts, so started-but-unfinished ==
+        # active (even during one long high-pressure job).
         log = LOG_DIR / f"{u['name']}.log"
         if log.exists():
             idle_h = (time.time() - log.stat().st_mtime) / 3600

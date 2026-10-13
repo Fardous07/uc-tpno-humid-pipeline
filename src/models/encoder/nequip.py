@@ -8,8 +8,8 @@ adapted for periodic crystalline MOF structures.
 Architecture overview
 ─────────────────────
 1.  **Atom embedding** — learnable embedding table maps atomic numbers
-    to scalar features (``emb_dim × 0e`` irreps).  (run_008: optionally
-    mixes a per-atom partial charge into this scalar embedding.)
+    to scalar features (``emb_dim × 0e`` irreps), optionally
+    mixed with a per-atom partial charge.
 2.  **Radial basis** — Gaussian RBFs with a smooth polynomial cutoff
     envelope encode interatomic distances.
 3.  **Spherical harmonics** — unit edge vectors are expanded into SO(3)
@@ -123,7 +123,7 @@ class NequIPConfig:
                          for message normalisation (``1/sqrt(N)``).
     envelope_exponent  : Exponent *p* of the polynomial envelope.
     use_sc         : Use self-connection (equivariant skip) in each layer.
-    use_charges    : run_008 — mix a per-atom partial charge into the
+    use_charges    : mix a per-atom partial charge into the
                      scalar node embedding (requires graphs to carry ``q``).
     """
 
@@ -141,7 +141,7 @@ class NequIPConfig:
     avg_num_neighbours: float = 50.0
     envelope_exponent: int = 5
     use_sc: bool = True
-    use_charges: bool = False   # run_008: mix per-atom charge into node embedding
+    use_charges: bool = False   # mix per-atom charge into node embedding
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -438,7 +438,7 @@ class NequIPEncoder(nn.Module):
     n_rbf          : see :class:`NequIPConfig`
     cutoff         : see :class:`NequIPConfig`
     use_pbc        : see :class:`NequIPConfig`
-    use_charges    : see :class:`NequIPConfig` (run_008)
+    use_charges    : see :class:`NequIPConfig`
     config         : Alternatively, pass a :class:`NequIPConfig` directly.
 
     Accepted input formats
@@ -502,7 +502,7 @@ class NequIPEncoder(nn.Module):
         self.node_embedding = nn.Embedding(c.n_species, c.emb_dim)
         nn.init.uniform_(self.node_embedding.weight, -math.sqrt(3), math.sqrt(3))
 
-        # run_008: optional per-atom charge → embedding contribution.
+        # optional per-atom charge → embedding contribution.
         # Zero-init so the encoder starts identical to the no-charge model
         # and learns to use charge from there (safe, near-identity start).
         self.use_charges = c.use_charges
@@ -602,7 +602,7 @@ class NequIPEncoder(nn.Module):
         device: torch.device,
     ) -> torch.Tensor:
         """
-        run_008: return per-atom charge as ``[N, 1]``; zeros if the graph
+        Per-atom charge as ``[N, 1]``; zeros if the graph
         carries none (keeps the encoder well-defined for charge-less MOFs).
         """
         q = None
@@ -626,14 +626,11 @@ class NequIPEncoder(nn.Module):
         Edge vectors + lengths, preferring the exact periodic displacement
         vectors stored by graph_builder.py (edge_attr = [dist, unit_vec]).
 
-        FIX: the minimum-image reconstruction in _compute_edge_vectors() is
-        only exact when every perpendicular cell width is >= 2x the cutoff.
-        For smaller cells, several periodic images of the same (i, j) pair
-        are separate edges in the ASE neighbour list, and minimum-image maps
-        them all onto ONE (usually different) vector. Verified on the 500
-        selected MOFs: 185 have at least one wrong edge within 5 A (1.8 % of
-        all edges). ASE's neighbour list already stores the exact vectors,
-        so use them whenever they are present.
+        The minimum-image reconstruction in _compute_edge_vectors() is only
+        exact when every perpendicular cell width is >= 2x the cutoff; for
+        smaller cells several periodic images of one (i, j) pair are separate
+        edges. ASE's neighbour list stores the exact vectors, so they are
+        used whenever present.
         """
         edge_attr = getattr(data, "edge_attr", None) if not isinstance(data, dict) else data.get("edge_attr")
         if edge_attr is not None and edge_attr.dim() == 2 and edge_attr.shape[1] == 4 \
@@ -655,22 +652,9 @@ class NequIPEncoder(nn.Module):
         Compute edge vectors and lengths, applying minimum-image
         convention when ``use_pbc`` is True and a cell is provided.
 
-        FIX: cell is ``[n_graphs, 3, 3]`` -- graph_builder.py always emits
-        ``[1, 3, 3]`` per MOF, and PyG's default collation concatenates
-        that along dim 0, giving ``[B, 3, 3]`` for any real batch with
-        B > 1. The previous code did ``cell.squeeze()`` and only applied
-        the minimum-image correction when the result was exactly 2-D --
-        true for a lone graph (``[1,3,3]`` squeezes to ``[3,3]``) but
-        false the moment batch_size > 1 (``[B,3,3]`` has no size-1 dim to
-        squeeze away), which silently skipped PBC correction for the
-        *entire* batch with no warning. configs/pipeline.yaml currently
-        trains at batch_size=1, so this was latent -- but it would have
-        silently corrupted every periodic edge (bogus edge vectors,
-        artificially zeroed out once the resulting bogus lengths exceed
-        the cutoff envelope) the moment batch_size was increased for
-        throughput. Now indexes each edge's own graph's cell via
-        ``batch[src]``, which is correct for both a single graph and any
-        batch size.
+        ``cell`` is ``[n_graphs, 3, 3]`` (graph_builder.py emits ``[1, 3, 3]``
+        per MOF and PyG concatenates along dim 0). Each edge uses its own
+        graph's cell via ``batch[src]``, which is correct for any batch size.
 
         Returns ``(vec, lengths)`` each of shape ``[E, 3]`` and ``[E]``.
         """
