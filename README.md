@@ -86,6 +86,25 @@ Gradient boosting is as accurate as UC-TPNO for CO₂ on the test set. UC-TPNO i
 clearly better for water on the validation set and for N₂ on new MOFs, and it is
 the only model that is thermodynamically consistent by construction.
 
+### Learning curve
+
+Same model and settings trained on nested subsets of the training MOFs
+(error bars: 90 % bootstrap over test/validation MOFs).
+
+| Training MOFs | Test CO₂ MAE | Test N₂ MAE | Test H₂O MAE | Test CO₂ R² | Val H₂O R² |
+|---|---|---|---|---|---|
+| 97 (25 %) | 0.162 | 0.034 | 0.055 | 0.885 | 0.65 |
+| 194 (50 %) | 0.146 | 0.030 | 0.045 | 0.890 | 0.57 |
+| 290 (75 %) | 0.100 | 0.033 | 0.047 | 0.967 | 0.72 |
+| 387 (100 %) | 0.095 | 0.036 | 0.044 | 0.971 | 0.81 |
+
+CO₂ error falls by about 40 % from 97 to 387 MOFs and starts to level off; N₂
+is already accurate with 97 MOFs. Water error changes little within the
+uncertainty, consistent with water being limited by the range of water
+affinities in the training set rather than by the number of MOFs.
+
+![Learning curve](results/validation/learning_curve/learning_curve.png)
+
 ### Level 4: reference MOFs vs experiment
 
 For HKUST-1, Mg-MOF-74, UiO-66 and ZIF-8 (not in training) the model reproduces
