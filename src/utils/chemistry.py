@@ -80,7 +80,9 @@ _R_PR: float = 8.314462618e-2   # 0.08314… bar·L/(mol·K)
 
 # ── Binary interaction parameters k_ij ────────────────────────────────
 # Fitted to VLE data.  Symmetric: k_ij = k_ji, k_ii = 0.
-# Source: Poling et al. Table 8-1; Tsivintzelis et al. (2011) for H₂O pairs.
+# CO2–N2: Li & Yan, Appl. Energy 86 (2009) 826, Table 6.
+# H2O pairs: Søreide & Whitson, Fluid Phase Equilib. 77 (1992) 217, Table 5
+# (0.1896, 0.4778).
 _KIJ: Dict[Tuple[str, str], float] = {
     ("CO2", "N2"):  -0.017,
     ("CO2", "H2O"):  0.190,
