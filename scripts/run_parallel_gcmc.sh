@@ -57,7 +57,7 @@ SELECTED_MOFS_FILE="${OUT_DIR}/gcmc_selected_mofs.txt"
 # Stage 1 (screening) and Stage 3 (real training labels) settings --
 # matches what we've been using: cheap screening, more careful final labels.
 STAGE1_CYCLES=1000
-STAGE3_CYCLES=2000  # was 4000; halved 2026-09-27 (charged high-P jobs took 2-6 h each)
+STAGE3_CYCLES=2000  # production cycles per Stage 3 job
 GCMC_BUDGET=500
 MAX_MOFS=0
 # plain GCMC for Stage 1: RASPA2 does not implement the TMC_* keywords that

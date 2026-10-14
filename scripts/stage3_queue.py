@@ -70,7 +70,7 @@ RASPA_BIN = "/home/fardo/RASPA2-install/bin/simulate"
 RASPA_DATA = "/home/fardo/RASPA2-install"
 
 # Must match run_parallel_gcmc.sh so queued jobs use identical settings.
-STAGE3_CYCLES = 2000  # was 4000; halved 2026-09-27 (charged high-P jobs took 2-6 h each)
+STAGE3_CYCLES = 2000  # production cycles per Stage 3 job
 TEMPERATURES = [298.15, 313.15, 333.15]
 PRESSURES = "0.1,0.5,1.0,5.0,10.0"
 RHS = "0.0,0.05,0.15"
