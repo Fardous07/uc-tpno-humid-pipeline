@@ -3,7 +3,6 @@
 **Uncertainty-Calibrated Thermodynamic Potential Neural Operator** for CO₂/N₂/H₂O
 co-adsorption in metal–organic frameworks (MOFs) under humid flue-gas conditions.
 
-
 The pipeline screens MOFs with grand canonical Monte Carlo (GCMC) simulations and
 trains a neural operator that predicts mixture loadings of CO₂, N₂ and H₂O as a
 function of temperature, pressure and relative humidity. The model is
@@ -148,8 +147,8 @@ Against NIST experimental isotherms (298 K), the GCMC itself gives:
 ## Setup and usage
 
 ```bash
-python -m venv thesis_env
-source thesis_env/bin/activate
+python -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
