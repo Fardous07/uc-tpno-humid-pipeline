@@ -116,7 +116,7 @@ Against NIST experimental isotherms (298 K), the GCMC itself gives:
 
 - CO₂: within the experimental range for HKUST-1 and UiO-66; too low at low pressure for Mg-MOF-74 (open metal sites are not described by UFF).
 - N₂: within a factor of about 2.
-- **H₂O: 100–1000× below experiment** for HKUST-1 and UiO-66.
+- **H₂O: about 170–4,300× below experiment** for UiO-66 and HKUST-1.
 
 ![GCMC vs experiment](results/validation/level4/level4_gcmc_vs_experiment.png)
 
