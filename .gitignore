@@ -17,7 +17,8 @@ experiments/*/final_model.pt
 experiments/*/metrics.csv
 
 # Python environment
-thesis_env/
+.venv
+*_env/
 __pycache__/
 *.pyc
 *.pyo

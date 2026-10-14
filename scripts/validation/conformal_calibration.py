@@ -11,7 +11,7 @@ exchangeable data. Coverage is then measured on other prediction files.
 Because conditions of one framework are correlated, the quantile is also
 reported with a framework-level (block) calibration for comparison.
 
-    thesis_env/bin/python scripts/validation/conformal_calibration.py \
+    .venv/bin/python scripts/validation/conformal_calibration.py \
         --calib results/validation/level2/run_014_val_predictions.csv \
         --apply results/validation/level3/run_014_level3_predictions.csv \
         --out results/validation/uq/run_014

@@ -18,7 +18,7 @@ Each column is standardised over all frameworks in the table (input
 statistics only; no labels are used). Frameworks without Stage 1 results
 get NaN and are reported.
 
-    thesis_env/bin/python scripts/build_mof_features.py
+    .venv/bin/python scripts/build_mof_features.py
 Output: data/processed/adsorption_v3/mof_features.parquet
         (mof_id + 12 standardised columns f_*, raw values in r_*)
 
@@ -26,7 +26,7 @@ New frameworks (e.g. the Level 4 reference MOFs) are added without changing
 the training inputs: --reference standardises them with the mean/std of the
 reference table and writes reference + new rows to --out.
 
-    thesis_env/bin/python scripts/build_mof_features.py \
+    .venv/bin/python scripts/build_mof_features.py \
         --stage1 data/processed/validation_gcmc/level4_stage1/*/stage1_isotherms.parquet \
         --graph-dir data/processed/graphs_level4 \
         --reference data/processed/adsorption_v3/mof_features.parquet \

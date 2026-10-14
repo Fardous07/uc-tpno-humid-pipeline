@@ -11,7 +11,7 @@ reports:
   * self-response      dn_i/dmu_i >= 0
   * sign               fraction of negative predicted loadings
 
-    thesis_env/bin/python scripts/validation/physics_checks.py \
+    .venv/bin/python scripts/validation/physics_checks.py \
         --checkpoint experiments/run_014/checkpoints/best_model.pt \
         --splits experiments/run_014/splits.json --split val \
         --out results/validation/level2/run_014_physics.csv

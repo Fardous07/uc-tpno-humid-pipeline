@@ -12,7 +12,7 @@ Training frameworks = run_014 train split. Models:
 No thermodynamic structure is imposed, so the baselines are free to violate
 Maxwell symmetry or give negative loadings.
 
-    thesis_env/bin/python scripts/validation/baseline_models.py \
+    .venv/bin/python scripts/validation/baseline_models.py \
         --splits experiments/run_014/splits_with_level3.json --eval val level3
 Output: results/validation/baselines/{split}_{model}_predictions.csv +
         baseline_summary.csv (alongside UC-TPNO when its predictions exist)

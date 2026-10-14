@@ -13,7 +13,7 @@ themselves are physically sound and agree with independent published data.
       charges), interpolated from 298 and 323 K to 313.15 K.
   1d  IAST from Stage 1 pure-gas runs vs Stage 3 dry CO2/N2 mixture GCMC.
 
-Run:   thesis_env/bin/python scripts/validation/level1_data_validation.py
+Run:   .venv/bin/python scripts/validation/level1_data_validation.py
 Output (figures as PNG 300 dpi + PDF, numbers as CSV):
        results/validation/level1/
 """

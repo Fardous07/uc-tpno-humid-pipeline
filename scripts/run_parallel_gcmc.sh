@@ -40,7 +40,7 @@ set -euo pipefail
 # ═══════════════════════════════════════════════════════════════════════
 
 PROJECT_ROOT="/home/fardo/uc_tpno_humid_pipeline/uc_tpno_humid_pipeline"
-VENV="${PROJECT_ROOT}/thesis_env/bin/activate"
+VENV="${PROJECT_ROOT}/.venv/bin/activate"
 CIF_DIR="${PROJECT_ROOT}/data/intermediate/cifs_sanitized"
 # adsorption_v3: first run with framework charges + the UFF_TIP4P2005 force
 # field. adsorption_v2 (ExampleMOFsForceField, no framework charges) is invalid.
@@ -349,7 +349,7 @@ fi
 
 if [[ "${SELECTION_ONLY}" == "true" ]]; then
     echo "Selection ready: ${SELECTED_MOFS_FILE} ($(grep -c . "${SELECTED_MOFS_FILE}") MOFs)"
-    echo "Next: ${PROJECT_ROOT}/thesis_env/bin/python scripts/stage3_queue.py prepare-fresh"
+    echo "Next: ${PROJECT_ROOT}/.venv/bin/python scripts/stage3_queue.py prepare-fresh"
     echo "      bash scripts/stage3_queue.sh start"
     exit 0
 fi

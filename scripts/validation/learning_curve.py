@@ -11,7 +11,7 @@ Inputs (from predict_split.py):
     results/validation/learning_curve/f{f}_{split}_predictions.csv
     results/validation/level2/run_014_{split}_predictions.csv   (f = 1.0)
 
-    thesis_env/bin/python scripts/validation/learning_curve.py
+    .venv/bin/python scripts/validation/learning_curve.py
 Output: results/validation/learning_curve/learning_curve.{csv,png,pdf}
 """
 from __future__ import annotations

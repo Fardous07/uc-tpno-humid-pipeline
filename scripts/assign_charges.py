@@ -18,7 +18,7 @@ order, labels and coordinates are untouched), and every decision is logged
 to data/intermediate/charge_assignment.csv.
 
 PACMAN needs torch + pymatgen + setuptools<81, so run this from its own venv
-instead of thesis_env:
+instead of .venv:
     python3 -m venv charges_env
     charges_env/bin/pip install PACMAN-charge "setuptools<81" ase pandas
     charges_env/bin/python scripts/assign_charges.py [--only-selected] [--dry-run]

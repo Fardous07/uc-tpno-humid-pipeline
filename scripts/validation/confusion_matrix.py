@@ -8,7 +8,7 @@ a framework is good if humid CO2 uptake >= co2_humid_molkg_min AND
 CO2(RH 15 %)/CO2(dry) >= co2_retention_humid_over_dry_min. The class is
 computed once from GCMC (truth) and once from the predictions.
 
-    thesis_env/bin/python scripts/validation/confusion_matrix.py \
+    .venv/bin/python scripts/validation/confusion_matrix.py \
         --pred results/validation/level2/run_014_test_predictions.csv \
         --label "test set (48 MOFs)" --out results/validation/level2/run_014_test
 """

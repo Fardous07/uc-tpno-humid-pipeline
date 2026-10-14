@@ -10,7 +10,7 @@ was trained to reproduce, and the GCMC against measured isotherms.
 Inputs come from predict_split.py with --graph-dir data/processed/graphs_level4
 and --features data/processed/validation_gcmc/level4_mof_features.parquet.
 
-    thesis_env/bin/python scripts/validation/level4_model_comparison.py
+    .venv/bin/python scripts/validation/level4_model_comparison.py
 Output: results/validation/level4/level4_model_vs_gcmc.{csv,png,pdf}
 """
 from __future__ import annotations

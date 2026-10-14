@@ -6,7 +6,7 @@ Rebuilds the model exactly as scripts/05_train_model.py does (same config
 keys and defaults), loads the checkpoint strictly, and writes one row per
 (MOF, condition) with the GCMC labels and the ensemble prediction.
 
-    thesis_env/bin/python scripts/validation/predict_split.py \
+    .venv/bin/python scripts/validation/predict_split.py \
         --checkpoint experiments/run_010/checkpoints/best_model.pt \
         --splits experiments/run_010/splits.json --split val \
         --out results/validation/level2/run_010_val_predictions.csv

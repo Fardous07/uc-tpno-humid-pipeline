@@ -6,7 +6,7 @@
 set -euo pipefail
 
 PROJECT_ROOT="/home/fardo/uc_tpno_humid_pipeline/uc_tpno_humid_pipeline"
-PY="${PROJECT_ROOT}/thesis_env/bin/python"
+PY="${PROJECT_ROOT}/.venv/bin/python"
 QUEUE_PY="${PROJECT_ROOT}/scripts/stage3_queue.py"
 LOG="${PROJECT_ROOT}/data/processed/adsorption_v3/logs/stage3_queue.log"
 SESSION="gcmc_queue"

@@ -8,7 +8,7 @@ compared with every experimental isotherm in the NIST/ARPA-E Adsorption
 Database (ISODB) measured at 298 +- 3 K. Loadings are converted to mol/kg
 (mmol/g, mol/kg, mmol/kg, cm3(STP)/g, mg/g, wt%); other units are skipped.
 
-    thesis_env/bin/python scripts/validation/level4_nist_comparison.py
+    .venv/bin/python scripts/validation/level4_nist_comparison.py
 Output: results/validation/level4/  (figure + CSVs)
 """
 from __future__ import annotations

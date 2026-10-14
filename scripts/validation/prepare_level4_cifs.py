@@ -15,7 +15,7 @@ formula and its shortest interatomic distance:
                                                     RUBTAK04-09 overlapping sites)
 
 Then assign PACMAN-REPEAT charges, exactly as for the training CoRE MOFs:
-    thesis_env/bin/python  scripts/validation/prepare_level4_cifs.py
+    .venv/bin/python  scripts/validation/prepare_level4_cifs.py
     charges_env/bin/python scripts/assign_charges.py \
         --cif-dir data/intermediate/validation_cifs_level4 \
         --backup-dir data/intermediate/validation_cifs_level4_uncharged \

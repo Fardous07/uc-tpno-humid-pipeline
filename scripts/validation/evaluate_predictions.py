@@ -4,7 +4,7 @@ evaluate_predictions.py -- metrics and figures for a predictions CSV
 (from scripts/validation/predict_split.py), used for Level 2 (held-out
 validation/test frameworks) and Level 3 (unseen frameworks, fresh GCMC).
 
-    thesis_env/bin/python scripts/validation/evaluate_predictions.py \
+    .venv/bin/python scripts/validation/evaluate_predictions.py \
         --pred results/validation/level2/run_014_val_predictions.csv \
         --label "validation (48 MOFs)" --out results/validation/level2/run_014_val \
         [--metrics experiments/run_014/metrics_part1.csv experiments/run_014/metrics.csv]
