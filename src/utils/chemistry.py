@@ -83,6 +83,8 @@ _R_PR: float = 8.314462618e-2   # 0.08314… bar·L/(mol·K)
 # CO2–N2: Li & Yan, Appl. Energy 86 (2009) 826, Table 6.
 # H2O pairs: Søreide & Whitson, Fluid Phase Equilib. 77 (1992) 217, Table 5
 # (0.1896, 0.4778).
+# Used for the chemical potentials given to the model; RASPA receives T, P and
+# mole fractions and computes its own fugacities with k_ij = 0.
 _KIJ: Dict[Tuple[str, str], float] = {
     ("CO2", "N2"):  -0.017,
     ("CO2", "H2O"):  0.190,
